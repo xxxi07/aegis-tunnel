@@ -35,7 +35,7 @@ TEST_SRCS := tests/test_aegis.c tests/test_tunnel.c tests/e2e_test.c tests/bench
 
 .PHONY: all clean install uninstall cmake debug release test test-asymmetric
 
-all: aegis-tunnel aegis-tunnel-keygen test-aegis test-tunnel e2e-test bench-aegis
+all: aegis-tunnel aegis-tunnel-keygen test-aegis test-tunnel e2e-test bench-aegis test-asymmetric
 
 # ── Main executable ──
 aegis-tunnel: $(MAIN_OBJS)
@@ -66,18 +66,23 @@ aegis-tunnel-keygen: $(KEYGEN_SRCS)
 # ── Tests ──
 test-aegis: $(CRYPTO) $(SRC_DIR)/util/util.c tests/test_aegis.c
 	$(CC) $(CFLAGS) $(INC) -o $@ tests/test_aegis.c $(CRYPTO) $(SRC_DIR)/util/util.c -lssl -lcrypto
+	@echo "  → $@ built"
 
-test-tunnel: $(CRYPTO) $(UTIL) $(PROTOCOL) $(TUNNEL) tests/test_tunnel.c
+test-tunnel: $(CRYPTO) $(SRC_DIR)/util/util.c $(PROTOCOL) $(TUNNEL) tests/test_tunnel.c
 	$(CC) $(CFLAGS) $(INC) -o $@ tests/test_tunnel.c $(CRYPTO) $(SRC_DIR)/util/util.c $(PROTOCOL) $(TUNNEL) $(LDFLAGS)
+	@echo "  → $@ built"
 
-e2e-test: $(CRYPTO) $(UTIL) $(PROTOCOL) $(TUNNEL) tests/e2e_test.c
+e2e-test: $(CRYPTO) $(SRC_DIR)/util/util.c $(PROTOCOL) $(TUNNEL) tests/e2e_test.c
 	$(CC) $(CFLAGS) $(INC) -o $@ tests/e2e_test.c $(CRYPTO) $(SRC_DIR)/util/util.c $(PROTOCOL) $(TUNNEL) $(LDFLAGS)
+	@echo "  → $@ built"
 
 bench-aegis: $(CRYPTO) $(SRC_DIR)/util/util.c tests/bench_aegis.c
 	$(CC) $(CFLAGS) $(INC) -o $@ tests/bench_aegis.c $(CRYPTO) $(SRC_DIR)/util/util.c -lssl -lcrypto
+	@echo "  → $@ built"
 
-test-asymmetric: $(CRYPTO) $(PROTOCOL) $(SRC_DIR)/tunnel/tunnel.c $(SRC_DIR)/util/util.c tests/test_asymmetric.c
-	$(CC) $(CFLAGS) $(INC) -o $@ tests/test_asymmetric.c $(CRYPTO) $(PROTOCOL) $(SRC_DIR)/tunnel/tunnel.c $(SRC_DIR)/util/util.c $(LDFLAGS)
+test-asymmetric: $(CRYPTO) $(SRC_DIR)/util/util.c $(PROTOCOL) $(SRC_DIR)/tunnel/tunnel.c tests/test_asymmetric.c
+	$(CC) $(CFLAGS) $(INC) -o $@ tests/test_asymmetric.c $(CRYPTO) $(SRC_DIR)/util/util.c $(PROTOCOL) $(SRC_DIR)/tunnel/tunnel.c $(LDFLAGS)
+	@echo "  → $@ built"
 
 test: test-aegis test-tunnel e2e-test test-asymmetric
 	@echo "=== test-aegis ===" && ./test-aegis
