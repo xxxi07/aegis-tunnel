@@ -35,7 +35,7 @@ TEST_SRCS := tests/test_aegis.c tests/test_tunnel.c tests/e2e_test.c tests/bench
 
 .PHONY: all clean install uninstall cmake debug release test test-asymmetric
 
-all: aegis-tunnel
+all: aegis-tunnel aegis-tunnel-keygen test-aegis test-tunnel e2e-test bench-aegis
 
 # ── Main executable ──
 aegis-tunnel: $(MAIN_OBJS)
@@ -52,8 +52,12 @@ libaegis-tunnel.a: $(LIB_OBJS)
 	@echo "  → $@ built"
 
 # ── Key generation tool ──
-aegis-tunnel-keygen:
-	$(CC) $(CFLAGS) $(INC) -o $@ src/keygen.c src/protocol/ecdh.c src/protocol/keyfile.c src/util/util.c $(LDFLAGS)
+KEYGEN_SRCS := src/keygen.c src/protocol/ecdh.c src/protocol/keyfile.c src/util/util.c
+KEYGER_OBJS := $(KEYGEN_SRCS:.c=.o)
+
+aegis-tunnel-keygen: $(KEYGEN_SRCS)
+	$(CC) $(CFLAGS) $(INC) -o $@ $(KEYGEN_SRCS) $(LDFLAGS)
+	@echo "  → $@ built"
 
 # ── Object files ──
 %.o: %.c
@@ -110,5 +114,5 @@ uninstall:
 # ── Clean ──
 clean:
 	rm -f aegis-tunnel libaegis-tunnel.so libaegis-tunnel.a
-	rm -f test-aegis test-tunnel e2e-test bench-aegis test-asymmetric
+	rm -f aegis-tunnel-keygen test-aegis test-tunnel e2e-test bench-aegis test-asymmetric
 	find $(SRC_DIR) tests -name '*.o' -delete
