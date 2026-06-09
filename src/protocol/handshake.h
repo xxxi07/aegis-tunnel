@@ -30,6 +30,7 @@
 #define FRAME_CLOSE        0x04
 #define FRAME_KEYCONFIRM   0x05   /* post-handshake key confirmation */
 #define FRAME_REKEY        0x06   /* session re-keying (new ECDH pubkey) */
+#define FRAME_TOFU         0x07   /* TOFU static public key exchange */
 #define FLAG_NONE        0x00
 
 /* ─── Handshake constants ──────────────────────────────────────── */

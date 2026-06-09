@@ -22,6 +22,7 @@
 
 #include "protocol/handshake.h"
 #include "protocol/keyfile.h"
+#include "protocol/tofu.h"
 #include "tunnel/threadpool.h"
 #include "tunnel/tun.h"
 #include "tunnel/tunnel.h"
@@ -59,6 +60,13 @@ static int g_max_conns = DEFAULT_MAX_CONN;
 static int g_asym_mode = 0;
 static uint8_t g_asym_priv[32];
 static uint8_t g_asym_peer[32];
+static int g_tofu_mode = 0;
+static int g_tofu_peer_known = 0;
+static uint8_t g_tofu_our_priv[32];
+static uint8_t g_tofu_our_pub[32];
+static uint8_t g_tofu_peer_pub[32];
+static char g_remote_host[MAX_HOST_LEN];
+static int g_remote_port = 0;
 
 /* ─── Signal handlers ──────────────────────────────────────────── */
 
@@ -239,6 +247,7 @@ static void usage(const char *prog)
         "  -W <iface>      WAN interface for NAT (default: eth0)\n"
         "  -P <file>       Asymmetric mode: private key file (32 bytes)\n"
         "  -Q <file>       Asymmetric mode: peer public key file (32 bytes)\n"
+        "  -U              TOFU mode: auto-exchange pubkeys on first connect\n"
         "  -v              Verbose output (DEBUG level logging)\n"
         "  -h              Show this help\n"
         "\n"
@@ -258,7 +267,7 @@ static void usage(const char *prog)
 
 /* ─── Server main loop ─────────────────────────────────────────── */
 
-static int run_server(int listen_port, const char *remote_host, int remote_port,
+static int run_server(int listen_port, const char *g_remote_host, int remote_port,
                       const uint8_t *psk, size_t psk_len,
                       int hs_timeout, int keepalive)
 {
@@ -266,7 +275,7 @@ static int run_server(int listen_port, const char *remote_host, int remote_port,
     if (listen_fd < 0) return 1;
 
     log_info("server", "port %d → %s:%d (max %d connections)",
-             listen_port, remote_host, remote_port, g_max_conns);
+             listen_port, g_remote_host, remote_port, g_max_conns);
 
     while (g_running) {
         struct sockaddr_in client_addr;
@@ -324,7 +333,13 @@ static int run_server(int listen_port, const char *remote_host, int remote_port,
                 _exit(1);
             }
 
-            int remote_fd = connect_to_host(remote_host, remote_port);
+            /* TOFU: exchange static keys after PSK handshake */
+            if (g_tofu_mode && !g_tofu_peer_known) {
+                tofu_exchange_keys(client_fd, g_remote_host, remote_port,
+                                   g_tofu_our_pub, keys.enc_key, keys.dec_key, 1);
+            }
+
+            int remote_fd = connect_to_host(g_remote_host, remote_port);
             if (remote_fd < 0) {
                 close(client_fd);
                 _exit(1);
@@ -364,7 +379,7 @@ static int run_server(int listen_port, const char *remote_host, int remote_port,
 
 /* ─── Client main loop ─────────────────────────────────────────── */
 
-static int run_client(int local_port, const char *remote_host, int remote_port,
+static int run_client(int local_port, const char *g_remote_host, int remote_port,
                       const uint8_t *psk, size_t psk_len,
                       int hs_timeout, int keepalive)
 {
@@ -372,7 +387,7 @@ static int run_client(int local_port, const char *remote_host, int remote_port,
     if (listen_fd < 0) return 1;
 
     log_info("client", "port %d → %s:%d",
-            local_port, remote_host, remote_port);
+            local_port, g_remote_host, remote_port);
 
     while (g_running) {
         struct sockaddr_in local_addr;
@@ -391,7 +406,7 @@ static int run_client(int local_port, const char *remote_host, int remote_port,
             continue;
         }
 
-        int tunnel_fd = connect_to_host(remote_host, remote_port);
+        int tunnel_fd = connect_to_host(g_remote_host, remote_port);
         if (tunnel_fd < 0) {
             close(local_fd);
             continue;
@@ -416,6 +431,12 @@ static int run_client(int local_port, const char *remote_host, int remote_port,
             close(local_fd);
             close(tunnel_fd);
             continue;
+        }
+
+        /* TOFU: exchange static keys after PSK handshake */
+        if (g_tofu_mode && !g_tofu_peer_known) {
+            tofu_exchange_keys(tunnel_fd, g_remote_host, remote_port,
+                               g_tofu_our_pub, keys.enc_key, keys.dec_key, 0);
         }
 
         /*
@@ -473,7 +494,7 @@ int main(int argc, char **argv)
 
     /* ── Parse arguments ── */
     int opt;
-    while ((opt = getopt(argc, argv, "l:r:k:f:C:m:t:c:K:T:I:N:R:W:P:Q:vh")) != -1) {
+    while ((opt = getopt(argc, argv, "l:r:k:f:C:m:t:c:K:T:I:N:R:W:P:Q:Uvh")) != -1) {
         switch (opt) {
         case 'l': listen_port = atoi(optarg);           break;
         case 'r': remote_str  = optarg;                break;
@@ -492,6 +513,7 @@ int main(int argc, char **argv)
         case 'N': strncpy(tun_netmask, optarg, sizeof(tun_netmask)-1); break;
         case 'R': strncpy(tun_route, optarg, sizeof(tun_route)-1);   break;
         case 'W': strncpy(tun_nat_if, optarg, sizeof(tun_nat_if)-1); break;
+        case 'U': g_tofu_mode   = 1;                     break;
         case 'v': log_set_level(LOG_DEBUG);            break;
         case 'h':
             usage(argv[0]);
@@ -593,14 +615,36 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    /* ── Load keys (PSK or asymmetric) ── */
+    /* ── Load keys (PSK or asymmetric or TOFU) ── */
     uint8_t psk[MAX_PSK_BYTES];
     int psk_len = 0;
 
-    if (g_asym_mode) {
+    if (g_tofu_mode) {
+        /* TOFU: auto-generate local keypair, try loading peer key */
+        if (tofu_ensure_keypair(g_tofu_our_priv, g_tofu_our_pub) != 0) return 1;
+        g_tofu_peer_known = tofu_load_peer(g_remote_host, g_remote_port, g_tofu_peer_pub);
+        if (g_tofu_peer_known == 1) {
+            /* Peer key known → use asymmetric handshake */
+            memcpy(g_asym_priv, g_tofu_our_priv, 32);
+            memcpy(g_asym_peer, g_tofu_peer_pub, 32);
+            g_asym_mode = 1;
+            random_bytes(psk, 16); psk_len = 16;
+            log_info("main", "TOFU: peer key found, using asymmetric auth");
+        } else {
+            /* First connection → use PSK, exchange keys after handshake */
+            log_info("main", "TOFU: first connection, will exchange keys");
+            if (psk_file) {
+                psk_len = read_psk_file(psk, sizeof(psk), psk_file);
+            } else if (psk_hex) {
+                psk_len = parse_hex(psk, sizeof(psk), psk_hex);
+            } else {
+                random_bytes(psk, 16); psk_len = 16;
+                log_info("main", "TOFU: generated random bootstrap PSK");
+            }
+        }
+    } else if (g_asym_mode) {
         if (keyfile_load_private(g_asym_priv, privkey_file) != 0) return 1;
         if (keyfile_load_public(g_asym_peer, peerkey_file) != 0) return 1;
-        /* Generate a dummy PSK for re-keying and key confirmation */
         random_bytes(psk, 16); psk_len = 16;
     } else {
         if (psk_file) {
@@ -616,7 +660,7 @@ int main(int argc, char **argv)
     }
 
     /* ── Parse remote address ── */
-    char remote_host[MAX_HOST_LEN];
+    char g_remote_host[MAX_HOST_LEN];
     int  remote_port;
     char *host_ptr = NULL;
     char *addr_dup = strdup(remote_str);
@@ -628,8 +672,8 @@ int main(int argc, char **argv)
         free(addr_dup);
         return 1;
     }
-    strncpy(remote_host, host_ptr, sizeof(remote_host) - 1);
-    remote_host[sizeof(remote_host) - 1] = '\0';
+    strncpy(g_remote_host, host_ptr, sizeof(g_remote_host) - 1);
+    g_remote_host[sizeof(g_remote_host) - 1] = '\0';
     memset(addr_dup, 0, strlen(addr_dup));  /* erase the copy */
     free(addr_dup);
 
@@ -715,11 +759,11 @@ int main(int argc, char **argv)
             close(listen_fd);
             ret = 0;
         } else {
-            int tunnel_fd = connect_to_host(remote_host, remote_port);
+            int tunnel_fd = connect_to_host(g_remote_host, remote_port);
             if (tunnel_fd < 0) { secure_memzero(psk, sizeof(psk)); return 1; }
             log_info("tun-client", "%s (%s/%s) → %s:%d",
                      tun_name, tun_ip[0] ? tun_ip : "dhcp", tun_netmask,
-                     remote_host, remote_port);
+                     g_remote_host, remote_port);
 
             session_keys_t keys;
             if (g_asym_mode
@@ -736,10 +780,10 @@ int main(int argc, char **argv)
             close(tunnel_fd);
         }
     } else if (strcmp(mode, "server") == 0) {
-        ret = run_server(listen_port, remote_host, remote_port,
+        ret = run_server(listen_port, g_remote_host, remote_port,
                          psk, (size_t)psk_len, hs_timeout, keepalive);
     } else {
-        ret = run_client(listen_port, remote_host, remote_port,
+        ret = run_client(listen_port, g_remote_host, remote_port,
                          psk, (size_t)psk_len, hs_timeout, keepalive);
     }
 
