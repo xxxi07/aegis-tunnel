@@ -51,6 +51,10 @@ libaegis-tunnel.a: $(LIB_OBJS)
 	$(AR) rcs $@ $^
 	@echo "  → $@ built"
 
+# ── Key generation tool ──
+aegis-tunnel-keygen:
+	$(CC) $(CFLAGS) $(INC) -o $@ src/keygen.c src/protocol/ecdh.c src/protocol/keyfile.c src/util/util.c $(LDFLAGS)
+
 # ── Object files ──
 %.o: %.c
 	$(CC) $(CFLAGS) $(INC) -c $< -o $@

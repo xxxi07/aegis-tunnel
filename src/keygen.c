@@ -15,13 +15,64 @@
 #include "protocol/keyfile.h"
 #include "protocol/ecdh.h"
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+
+#ifndef __linux__  /* Linux mkdir takes mode; others may define elsewhere */
+#include <sys/stat.h>
+#endif
+
+/*
+ * Create directory at `path` with 0755 permissions, like mkdir -p.
+ * Returns 0 on success, -1 on error (reports to stderr).
+ */
+static int mkdir_p(const char *path)
+{
+    char tmp[512];
+    size_t len = strlen(path);
+    if (len >= sizeof(tmp) || len == 0) {
+        fprintf(stderr, "mkdir_p: path too long or empty\n");
+        return -1;
+    }
+    memcpy(tmp, path, len + 1);
+
+    for (size_t i = 0; i < len; i++) {
+        if (tmp[i] == '/') {
+            tmp[i] = '\0';
+            struct stat st;
+            if (stat(tmp, &st) != 0) {
+                if (mkdir(tmp, 0755) != 0 && errno != EEXIST) {
+                    fprintf(stderr, "mkdir: cannot create '%s': %s\n",
+                            tmp, strerror(errno));
+                    return -1;
+                }
+            }
+            tmp[i] = '/';
+        }
+    }
+    /* Final component */
+    struct stat st;
+    if (stat(path, &st) != 0) {
+        if (mkdir(path, 0755) != 0 && errno != EEXIST) {
+            fprintf(stderr, "mkdir: cannot create '%s': %s\n",
+                    path, strerror(errno));
+            return -1;
+        }
+    }
+    return 0;
+}
 
 int main(int argc, char **argv)
 {
     const char *dir = (argc > 1) ? argv[1] : ".";
+
+    /* Auto-create output directory if missing */
+    if (mkdir_p(dir) != 0) {
+        return 1;
+    }
 
     char priv_path[512], pub_path[512];
     snprintf(priv_path, sizeof(priv_path), "%s/private.key", dir);
