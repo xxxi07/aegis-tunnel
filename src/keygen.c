@@ -39,7 +39,7 @@ static int mkdir_p(const char *path)
     }
     memcpy(tmp, path, len + 1);
 
-    for (size_t i = 0; i < len; i++) {
+    for (size_t i = 1; i < len; i++) {  /* start at 1 to skip root '/' */
         if (tmp[i] == '/') {
             tmp[i] = '\0';
             struct stat st;
