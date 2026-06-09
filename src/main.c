@@ -21,6 +21,7 @@
  */
 
 #include "protocol/handshake.h"
+#include "protocol/keyfile.h"
 #include "tunnel/threadpool.h"
 #include "tunnel/tun.h"
 #include "tunnel/tunnel.h"
@@ -55,6 +56,9 @@
 static volatile sig_atomic_t g_active_conns = 0;
 static volatile sig_atomic_t g_running = 1;
 static int g_max_conns = DEFAULT_MAX_CONN;
+static int g_asym_mode = 0;
+static uint8_t g_asym_priv[32];
+static uint8_t g_asym_peer[32];
 
 /* ─── Signal handlers ──────────────────────────────────────────── */
 
@@ -233,6 +237,8 @@ static void usage(const char *prog)
         "  -N <mask>       TUN netmask (default: 255.255.255.0)\n"
         "  -R <net>        TUN route (e.g., -R 10.0.0.0/24)\n"
         "  -W <iface>      WAN interface for NAT (default: eth0)\n"
+        "  -P <file>       Asymmetric mode: private key file (32 bytes)\n"
+        "  -Q <file>       Asymmetric mode: peer public key file (32 bytes)\n"
         "  -v              Verbose output (DEBUG level logging)\n"
         "  -h              Show this help\n"
         "\n"
@@ -302,7 +308,9 @@ static int run_server(int listen_port, const char *remote_host, int remote_port,
             signal(SIGCHLD, SIG_DFL);  /* restore default in child */
 
             session_keys_t keys;
-            if (handshake_server(client_fd, psk, psk_len, hs_timeout, &keys) != 0) {
+            if (g_asym_mode
+                ? (handshake_asymmetric_server(client_fd, g_asym_priv, g_asym_peer, hs_timeout, &keys) != 0)
+                : (handshake_server(client_fd, psk, (size_t)psk_len, hs_timeout, &keys) != 0)) {
                 log_warn("server", "handshake failed");
                 close(client_fd);
                 _exit(1);
@@ -392,7 +400,9 @@ static int run_client(int local_port, const char *remote_host, int remote_port,
         set_socket_timeout(tunnel_fd, hs_timeout);
 
         session_keys_t keys;
-        if (handshake_client(tunnel_fd, psk, psk_len, hs_timeout, &keys) != 0) {
+        if (g_asym_mode
+            ? (handshake_asymmetric_client(tunnel_fd, g_asym_priv, g_asym_peer, hs_timeout, &keys) != 0)
+            : (handshake_client(tunnel_fd, psk, (size_t)psk_len, hs_timeout, &keys) != 0)) {
             log_warn("client", "handshake failed");
             close(local_fd);
             close(tunnel_fd);
@@ -446,6 +456,8 @@ int main(int argc, char **argv)
     char *remote_str     = NULL;
     char *psk_hex        = NULL;
     char *psk_file       = NULL;
+    char *privkey_file   = NULL;
+    char *peerkey_file   = NULL;
     char *config_file    = NULL;
     const char *mode     = "server";
     int  keepalive       = 0;
@@ -461,7 +473,7 @@ int main(int argc, char **argv)
 
     /* ── Parse arguments ── */
     int opt;
-    while ((opt = getopt(argc, argv, "l:r:k:f:C:m:t:c:K:T:I:N:R:W:vh")) != -1) {
+    while ((opt = getopt(argc, argv, "l:r:k:f:C:m:t:c:K:T:I:N:R:W:P:Q:vh")) != -1) {
         switch (opt) {
         case 'l': listen_port = atoi(optarg);           break;
         case 'r': remote_str  = optarg;                break;
@@ -471,6 +483,8 @@ int main(int argc, char **argv)
         case 't': hs_timeout  = atoi(optarg);           break;
         case 'c': g_max_conns = atoi(optarg);           break;
         case 'K': keepalive   = atoi(optarg);           break;
+        case 'P': privkey_file = optarg; g_asym_mode=1;  break;
+        case 'Q': peerkey_file = optarg; g_asym_mode=1;  break;
         case 'C': config_file = optarg;                break;
         case 'T': tun_mode    = 1;
                   strncpy(tun_name, optarg, sizeof(tun_name)-1); break;
@@ -552,9 +566,14 @@ int main(int argc, char **argv)
         usage(argv[0]);
         return 1;
     }
-    if (!psk_hex && !psk_file) {
-        fprintf(stderr, "Error: either -k <hex> or -f <file> is required\n\n");
+    /* Asymmetric mode requires -P and -Q, not a PSK */
+    if (!g_asym_mode && !psk_hex && !psk_file) {
+        fprintf(stderr, "Error: either (-k or -f) for PSK mode, or (-P and -Q) for asymmetric mode\n\n");
         usage(argv[0]);
+        return 1;
+    }
+    if (g_asym_mode && (!privkey_file || !peerkey_file)) {
+        fprintf(stderr, "Error: asymmetric mode requires both -P <private.key> and -Q <peer.pub>\n");
         return 1;
     }
     if (psk_hex && psk_file) {
@@ -574,20 +593,26 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    /* ── Read PSK ── */
+    /* ── Load keys (PSK or asymmetric) ── */
     uint8_t psk[MAX_PSK_BYTES];
-    int psk_len;
+    int psk_len = 0;
 
-    if (psk_file) {
-        psk_len = read_psk_file(psk, sizeof(psk), psk_file);
+    if (g_asym_mode) {
+        if (keyfile_load_private(g_asym_priv, privkey_file) != 0) return 1;
+        if (keyfile_load_public(g_asym_peer, peerkey_file) != 0) return 1;
+        /* Generate a dummy PSK for re-keying and key confirmation */
+        random_bytes(psk, 16); psk_len = 16;
     } else {
-        psk_len = parse_hex(psk, sizeof(psk), psk_hex);
-    }
-
-    if (psk_len < HANDSHAKE_PSK_MIN_LEN) {
-        fprintf(stderr, "Error: PSK must be at least %d bytes\n",
-                HANDSHAKE_PSK_MIN_LEN);
-        return 1;
+        if (psk_file) {
+            psk_len = read_psk_file(psk, sizeof(psk), psk_file);
+        } else {
+            psk_len = parse_hex(psk, sizeof(psk), psk_hex);
+        }
+        if (psk_len < HANDSHAKE_PSK_MIN_LEN) {
+            fprintf(stderr, "Error: PSK must be at least %d bytes\n",
+                    HANDSHAKE_PSK_MIN_LEN);
+            return 1;
+        }
     }
 
     /* ── Parse remote address ── */
@@ -672,7 +697,9 @@ int main(int argc, char **argv)
                 if (pid == 0) {
                     close(listen_fd);
                     session_keys_t keys;
-                    if (handshake_server(client_fd, psk, (size_t)psk_len, hs_timeout, &keys) != 0) {
+                    if (g_asym_mode
+                        ? (handshake_asymmetric_server(client_fd, g_asym_priv, g_asym_peer, hs_timeout, &keys) != 0)
+                        : (handshake_server(client_fd, psk, (size_t)psk_len, hs_timeout, &keys) != 0)) {
                         log_warn("tun-server", "handshake failed");
                         close(client_fd); _exit(1);
                     }
@@ -695,7 +722,9 @@ int main(int argc, char **argv)
                      remote_host, remote_port);
 
             session_keys_t keys;
-            if (handshake_client(tunnel_fd, psk, (size_t)psk_len, hs_timeout, &keys) != 0) {
+            if (g_asym_mode
+                ? (handshake_asymmetric_client(tunnel_fd, g_asym_priv, g_asym_peer, hs_timeout, &keys) != 0)
+                : (handshake_client(tunnel_fd, psk, (size_t)psk_len, hs_timeout, &keys) != 0)) {
                 log_warn("tun-client", "handshake failed");
                 close(tunnel_fd); secure_memzero(psk, sizeof(psk)); return 1;
             }
