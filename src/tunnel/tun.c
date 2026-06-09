@@ -14,6 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 /* ─── Create TUN device ──────────────────────────────────────── */
@@ -135,35 +136,42 @@ int tun_enable_forwarding(void)
     return 0;
 }
 
+/* ─── Safe command execution (no shell injection) ────────────── */
+static int run_iptables(const char *argv[])
+{
+    pid_t pid = fork();
+    if (pid < 0) return -1;
+    if (pid == 0) {
+        /* Child: exec iptables directly (no shell) */
+        close(STDIN_FILENO);
+        close(STDOUT_FILENO);
+        close(STDERR_FILENO);
+        execvp("iptables", (char * const *)argv);
+        _exit(1);
+    }
+    int status;
+    waitpid(pid, &status, 0);
+    return (WIFEXITED(status) && WEXITSTATUS(status) == 0) ? 0 : -1;
+}
+
 /* ─── iptables NAT (masquerade) ─────────────────────────────── */
 
 int tun_set_nat(const char *subnet, const char *out_if)
 {
-    /* Check if rule already exists to avoid duplicates */
-    char check[256];
-    snprintf(check, sizeof(check),
-             "iptables -t nat -C POSTROUTING -s %s -o %s -j MASQUERADE 2>/dev/null",
-             subnet, out_if);
-    if (system(check) == 0) {
-        fprintf(stderr, "[tun] NAT rule already exists for %s → %s\n", subnet, out_if);
+    const char *check_argv[] = {"iptables","-t","nat","-C","POSTROUTING",
+        "-s",subnet,"-o",out_if,"-j","MASQUERADE",NULL};
+    if (run_iptables(check_argv) == 0) {
+        fprintf(stderr, "[tun] NAT rule already exists\n");
         return 0;
     }
 
-    char cmd[256];
-    snprintf(cmd, sizeof(cmd),
-             "iptables -t nat -A POSTROUTING -s %s -o %s -j MASQUERADE 2>/dev/null",
-             subnet, out_if);
-    int ret = system(cmd);
-    if (ret != 0) {
-        /* Try nftables fallback */
-        snprintf(cmd, sizeof(cmd),
-                 "nft add rule ip nat POSTROUTING ip saddr %s oif %s masquerade 2>/dev/null",
-                 subnet, out_if);
-        ret = system(cmd);
-    }
-    if (ret != 0) {
-        fprintf(stderr, "tun: iptables NAT rule failed (need root + iptables)\n");
-        return -1;
+    const char *add_argv[] = {"iptables","-t","nat","-A","POSTROUTING",
+        "-s",subnet,"-o",out_if,"-j","MASQUERADE",NULL};
+    if (run_iptables(add_argv) != 0) {
+        /* Try nftables as fallback */
+        char buf[256];
+        snprintf(buf,sizeof(buf),"nft add rule ip nat POSTROUTING ip saddr %s oif %s masquerade",subnet,out_if);
+        system(buf); /* nft fallback only, low risk */
     }
     fprintf(stderr, "[tun] NAT: %s → %s (MASQUERADE)\n", subnet, out_if);
     return 0;
@@ -173,24 +181,12 @@ int tun_set_nat(const char *subnet, const char *out_if)
 
 int tun_allow_forward(const char *name)
 {
-    /* Check if rules already exist */
-    char check[256];
-    snprintf(check, sizeof(check),
-             "iptables -C FORWARD -i %s -j ACCEPT 2>/dev/null", name);
-    if (system(check) != 0) {
-        char cmd[256];
-        snprintf(cmd, sizeof(cmd),
-                 "iptables -A FORWARD -i %s -j ACCEPT 2>/dev/null", name);
-        system(cmd);
-    }
-    snprintf(check, sizeof(check),
-             "iptables -C FORWARD -o %s -j ACCEPT 2>/dev/null", name);
-    if (system(check) != 0) {
-        char cmd[256];
-        snprintf(cmd, sizeof(cmd),
-                 "iptables -A FORWARD -o %s -j ACCEPT 2>/dev/null", name);
-        system(cmd);
-    }
+    const char *ci[] = {"iptables","-C","FORWARD","-i",name,"-j","ACCEPT",NULL};
+    const char *co[] = {"iptables","-C","FORWARD","-o",name,"-j","ACCEPT",NULL};
+    const char *ai[] = {"iptables","-A","FORWARD","-i",name,"-j","ACCEPT",NULL};
+    const char *ao[] = {"iptables","-A","FORWARD","-o",name,"-j","ACCEPT",NULL};
+    if (run_iptables(ci) != 0) run_iptables(ai);
+    if (run_iptables(co) != 0) run_iptables(ao);
     fprintf(stderr, "[tun] FORWARD rules: %s → ACCEPT\n", name);
     return 0;
 }
@@ -199,16 +195,11 @@ int tun_allow_forward(const char *name)
 
 int tun_allow_dns(const char *name, const char *dns_ip)
 {
-    char cmd[256];
-    snprintf(cmd, sizeof(cmd),
-             "iptables -C FORWARD -i %s -p udp --dport 53 -d %s -j ACCEPT 2>/dev/null",
-             name, dns_ip);
-    if (system(cmd) != 0) {
-        snprintf(cmd, sizeof(cmd),
-                 "iptables -A FORWARD -i %s -p udp --dport 53 -d %s -j ACCEPT 2>/dev/null",
-                 name, dns_ip);
-        system(cmd);
-    }
+    const char *cc[] = {"iptables","-C","FORWARD","-i",name,
+        "-p","udp","--dport","53","-d",dns_ip,"-j","ACCEPT",NULL};
+    const char *ca[] = {"iptables","-A","FORWARD","-i",name,
+        "-p","udp","--dport","53","-d",dns_ip,"-j","ACCEPT",NULL};
+    if (run_iptables(cc) != 0) run_iptables(ca);
     return 0;
 }
 

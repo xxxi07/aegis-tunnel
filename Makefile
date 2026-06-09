@@ -7,6 +7,8 @@ CFLAGS   ?= -O2
 CFLAGS   += -std=c99 -D_GNU_SOURCE -Wall -Wextra -Wpedantic
 CFLAGS   += -Wshadow -Wconversion -Wstrict-prototypes -Wmissing-prototypes
 CFLAGS   += -Wno-declaration-after-statement
+# Uncomment to use thread pool instead of fork():
+# CFLAGS   += -DWITH_THREADPOOL
 LDFLAGS  += -lssl -lcrypto -lpthread
 
 PREFIX   ?= /usr/local

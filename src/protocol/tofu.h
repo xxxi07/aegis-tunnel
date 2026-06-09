@@ -80,6 +80,7 @@ const char *tofu_dir(void);
  *   our_pubkey: our static public key to send
  *   enc_key:    session encryption key
  *   dec_key:    session decryption key
+ *   nonce_ctr:  nonce counter (incremented on use to prevent reuse)
  *   is_server:  1 if we're the server (we receive first, then send)
  *
  * Returns 0 on success, -1 on error.
@@ -90,6 +91,7 @@ int tofu_exchange_keys(int fd,
                        const uint8_t our_pubkey[TOFU_KEY_LEN],
                        const uint8_t enc_key[16],
                        const uint8_t dec_key[16],
+                       uint64_t *nonce_ctr,
                        int is_server);
 
 #endif /* TOFU_H */

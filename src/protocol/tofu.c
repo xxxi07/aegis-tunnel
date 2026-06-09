@@ -160,6 +160,7 @@ int tofu_exchange_keys(int fd,
                        const uint8_t our_pubkey[TOFU_KEY_LEN],
                        const uint8_t enc_key[16],
                        const uint8_t dec_key[16],
+                       uint64_t *nonce_ctr,
                        int is_server)
 {
     uint8_t peer_pub[TOFU_KEY_LEN];
@@ -174,15 +175,19 @@ int tofu_exchange_keys(int fd,
             if (n == 0) return -1;
             got += (size_t)n;
         }
+        uint64_t rx_nonce = *nonce_ctr;
+        (*nonce_ctr)++;
         uint8_t type, flags; size_t plen = 0;
-        if (frame_parse(wb, sizeof(wb), &type, &flags, peer_pub, &plen, 1, dec_key) != 0) return -1;
+        if (frame_parse(wb, sizeof(wb), &type, &flags, peer_pub, &plen, rx_nonce, dec_key) != 0) return -1;
         if (type != FRAME_TOFU || plen != TOFU_KEY_LEN) return -1;
 
         tofu_save_peer(host, port, peer_pub);
 
         /* Send our pubkey */
         uint8_t swb[FRAME_MAX_WIRE]; size_t swl = 0;
-        if (frame_build(swb, &swl, FRAME_TOFU, FLAG_NONE, our_pubkey, TOFU_KEY_LEN, 1, enc_key) != 0) return -1;
+        uint64_t tx_nonce = *nonce_ctr;
+        (*nonce_ctr)++;
+        if (frame_build(swb, &swl, FRAME_TOFU, FLAG_NONE, our_pubkey, TOFU_KEY_LEN, tx_nonce, enc_key) != 0) return -1;
         size_t sent = 0;
         while (sent < swl) {
             ssize_t n = send(fd, swb + sent, swl - sent, MSG_NOSIGNAL);
@@ -192,7 +197,9 @@ int tofu_exchange_keys(int fd,
     } else {
         /* Client: send first, then receive */
         uint8_t swb[FRAME_MAX_WIRE]; size_t swl = 0;
-        if (frame_build(swb, &swl, FRAME_TOFU, FLAG_NONE, our_pubkey, TOFU_KEY_LEN, 1, enc_key) != 0) return -1;
+        uint64_t tx_nonce = *nonce_ctr;
+        (*nonce_ctr)++;
+        if (frame_build(swb, &swl, FRAME_TOFU, FLAG_NONE, our_pubkey, TOFU_KEY_LEN, tx_nonce, enc_key) != 0) return -1;
         size_t sent = 0;
         while (sent < swl) {
             ssize_t n = send(fd, swb + sent, swl - sent, MSG_NOSIGNAL);
@@ -208,8 +215,10 @@ int tofu_exchange_keys(int fd,
             if (n == 0) return -1;
             got += (size_t)n;
         }
+        uint64_t rx_nonce = *nonce_ctr;
+        (*nonce_ctr)++;
         uint8_t type, flags; size_t plen = 0;
-        if (frame_parse(wb, sizeof(wb), &type, &flags, peer_pub, &plen, 1, dec_key) != 0) return -1;
+        if (frame_parse(wb, sizeof(wb), &type, &flags, peer_pub, &plen, rx_nonce, dec_key) != 0) return -1;
         if (type != FRAME_TOFU || plen != TOFU_KEY_LEN) return -1;
 
         tofu_save_peer(host, port, peer_pub);

@@ -65,6 +65,7 @@ static int g_tofu_peer_known = 0;
 static uint8_t g_tofu_our_priv[32];
 static uint8_t g_tofu_our_pub[32];
 static uint8_t g_tofu_peer_pub[32];
+static uint64_t g_tofu_nonce = 0;
 static char g_remote_host[MAX_HOST_LEN];
 static int g_remote_port = 0;
 
@@ -267,7 +268,7 @@ static void usage(const char *prog)
 
 /* ─── Server main loop ─────────────────────────────────────────── */
 
-static int run_server(int listen_port, const char *g_remote_host, int remote_port,
+static int run_server(int listen_port, const char *remote_host, int remote_port,
                       const uint8_t *psk, size_t psk_len,
                       int hs_timeout, int keepalive)
 {
@@ -275,7 +276,7 @@ static int run_server(int listen_port, const char *g_remote_host, int remote_por
     if (listen_fd < 0) return 1;
 
     log_info("server", "port %d → %s:%d (max %d connections)",
-             listen_port, g_remote_host, remote_port, g_max_conns);
+             listen_port, remote_host, remote_port, g_max_conns);
 
     while (g_running) {
         struct sockaddr_in client_addr;
@@ -335,11 +336,10 @@ static int run_server(int listen_port, const char *g_remote_host, int remote_por
 
             /* TOFU: exchange static keys after PSK handshake */
             if (g_tofu_mode && !g_tofu_peer_known) {
-                tofu_exchange_keys(client_fd, g_remote_host, remote_port,
-                                   g_tofu_our_pub, keys.enc_key, keys.dec_key, 1);
+                tofu_exchange_keys(client_fd, remote_host, remote_port,
+                                   g_tofu_our_pub, keys.enc_key, keys.dec_key, &g_tofu_nonce, 1);
             }
-
-            int remote_fd = connect_to_host(g_remote_host, remote_port);
+            int remote_fd = connect_to_host(remote_host, remote_port);
             if (remote_fd < 0) {
                 close(client_fd);
                 _exit(1);
@@ -379,7 +379,7 @@ static int run_server(int listen_port, const char *g_remote_host, int remote_por
 
 /* ─── Client main loop ─────────────────────────────────────────── */
 
-static int run_client(int local_port, const char *g_remote_host, int remote_port,
+static int run_client(int local_port, const char *remote_host, int remote_port,
                       const uint8_t *psk, size_t psk_len,
                       int hs_timeout, int keepalive)
 {
@@ -387,7 +387,7 @@ static int run_client(int local_port, const char *g_remote_host, int remote_port
     if (listen_fd < 0) return 1;
 
     log_info("client", "port %d → %s:%d",
-            local_port, g_remote_host, remote_port);
+            local_port, remote_host, remote_port);
 
     while (g_running) {
         struct sockaddr_in local_addr;
@@ -406,7 +406,7 @@ static int run_client(int local_port, const char *g_remote_host, int remote_port
             continue;
         }
 
-        int tunnel_fd = connect_to_host(g_remote_host, remote_port);
+        int tunnel_fd = connect_to_host(remote_host, remote_port);
         if (tunnel_fd < 0) {
             close(local_fd);
             continue;
@@ -435,8 +435,8 @@ static int run_client(int local_port, const char *g_remote_host, int remote_port
 
         /* TOFU: exchange static keys after PSK handshake */
         if (g_tofu_mode && !g_tofu_peer_known) {
-            tofu_exchange_keys(tunnel_fd, g_remote_host, remote_port,
-                               g_tofu_our_pub, keys.enc_key, keys.dec_key, 0);
+            tofu_exchange_keys(tunnel_fd, remote_host, remote_port,
+                               g_tofu_our_pub, keys.enc_key, keys.dec_key, &g_tofu_nonce, 0);
         }
 
         /*

@@ -2,69 +2,44 @@
 
 ## 一、代码结构问题
 
-### 1.1 main.c 过于臃肿（793 行）
+### 1.1 main.c 过于臃肿（793 行）[已计划]
+
+5 种模式混合（PSK / 非对称 / TOFU / TUN / SOCKS5）。建议拆分为独立 mode_*.c 文件。
 
 当前 `main.c` 混合了 5 种运行模式：PSK 服务端/客户端、非对称服务端/客户端、TOFU、TUN VPN、SOCKS5 代理。所有模式的分支逻辑都在同一个文件中。
 
 **建议**：拆分为 `src/mode_server.c`、`src/mode_client.c`、`src/mode_tun.c`，main.c 只做参数解析和模式分发。
 
-### 1.2 handshake.c 重复的安全清理代码
+### 1.2 handshake.c 重复的安全清理代码 ✅ 已修复
 
-`handshake.c` 中有 62 处 `secure_memzero` 调用，大量重复的错误路径清理逻辑。例如：
+已用 `goto out` 统一清理，secure_memzero 调用从 62 处减少到 16 处。
 
-```c
-if (xxx != 0) {
-    secure_memzero(ik, 16);
-    secure_memzero(epriv, 32);
-    return -1;
-}
-```
+### 1.3 线程池已编译但未使用 ✅ 已添加编译选项
 
-这个模式在 PSK 握手和非对称握手中重复了 20+ 次。
-
-**建议**：使用 `goto cleanup` 模式统一清理：
-```c
-if (xxx != 0) goto fail;
-// ...
-fail:
-    secure_memzero(ik, 16);
-    secure_memzero(epriv, 32);
-    return -1;
-```
-
-### 1.3 线程池已编译但未使用
-
-`src/tunnel/threadpool.c` 实现了 pthread 线程池，但 `main.c` 的 server 模式仍然使用 `fork()` 创建子进程。代码被编译到二进制中但从未被调用。
-
-**建议**：要么接入线程池替换 fork()，要么添加编译选项 `WITH_THREADPOOL` 控制是否编译。
+Makefile 已添加 `-DWITH_THREADPOOL` 编译选项（默认注释），需要时取消注释即可启用。
 
 ---
 
-## 二、命名不一致
+## 二、命名不一致 ✅ 已修复
 
-| 问题 | 位置 | 建议 |
+| 问题 | 之前 | 之后 |
 |------|------|------|
-| `set_to()` vs `set_timeout()` vs `set_socket_timeout()` | handshake.c / main.c / main.c | 统一为 `set_socket_timeout()` |
-| `H()` vs `sha256_or_die()` | handshake.c | 统一为 `sha256_or_die()` |
-| `asym_` vs `asymmetric_` 前缀 | handshake.c / handshake.h | 统一前缀 |
-| `tofu_` vs `TOFU_` 常量 | tofu.c / tofu.h | 常量用大写，函数用小写 |
-| `TUNNEL_PLAINTEXT_FD` vs `pt_fd` | tunnel.h / tunnel.c | 统一使用枚举常量 |
+| 超时函数 | `set_to()` / `set_timeout()` / `set_socket_timeout()` | 统一 `set_socket_timeout()` |
+| 哈希函数 | `H()` / `sha256_or_die()` | 统一 `sha256_h()` |
+| 前缀 | `asym_` / `asymmetric_` | 统一 `asym_`（内部静态函数） |
+| 常量 | `tofu_` / `TOFU_` | 常量大写，函数小写 |
 
 ---
 
 ## 三、安全隐患
 
-### 3.1 TOFU 密钥交换用硬编码 nonce=1
+### 3.1 TOFU 密钥交换用硬编码 nonce=1 ✅ 已修复
 
-`tofu.c:tofu_exchange_keys()` 中 FRAME_TOFU 的 nonce 硬编码为 1。如果帧丢失或重传，nonce 会重复使用。
+`tofu_exchange_keys()` 现在接受 `uint64_t *nonce_ctr` 参数，每次使用后递增。
 
-**建议**：使用 tunnel 的 monotonic nonce 计数器。
+### 3.2 TUN 模式用 system() 调用 iptables ✅ 已修复
 
-### 3.2 TUN 模式用 system() 调用 iptables
-
-`tun.c:tun_set_nat()` 和 `tun_allow_forward()` 通过 `system()` 执行 shell 命令。如果接口名或子网字符串包含 shell 元字符，存在命令注入风险。
-
-**建议**：改用 Netlink (`libnl`) 或直接操作 `/proc/sys/net/`。
+改用 `fork() + execvp()` 直接执行 iptables，无 shell 注入风险。子网/接口名作为独立 argv 传递。
 
 ### 3.3 PSK 在进程列表中可见
 
