@@ -1,0 +1,25 @@
+# Build outputs
+build/
+*.o
+*.so
+*.a
+aegis-tunnel
+test-aegis
+test-tunnel
+e2e-test
+bench-aegis
+test-asymmetric
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary
+/tmp/
+*.tmp

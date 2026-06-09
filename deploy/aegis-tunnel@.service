@@ -1,0 +1,34 @@
+[Unit]
+Description=AEGIS-Tunnel encrypted proxy (instance %i)
+Documentation=https://github.com/example/aegis-tunnel
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/aegis/%i.conf
+ExecStart=/usr/local/bin/aegis-tunnel \
+    -l ${LISTEN_PORT} \
+    -r ${REMOTE_ADDR} \
+    -f /etc/aegis/psk.key \
+    -m ${MODE:-server} \
+    -t ${HS_TIMEOUT:-10} \
+    -c ${MAX_CONNS:-64} \
+    -K ${KEEPALIVE:-30}
+Restart=always
+RestartSec=5
+LimitNOFILE=65536
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/etc/aegis
+User=aegis-tunnel
+Group=aegis-tunnel
+
+# Security hardening
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target

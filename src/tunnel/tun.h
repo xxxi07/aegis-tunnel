@@ -1,0 +1,108 @@
+/*
+ * tun.h — TUN virtual network interface (Layer 3 VPN)
+ *
+ * Creates a TUN device that exchanges raw IP packets between
+ * the kernel network stack and userspace.  Combined with the
+ * AEGIS-Tunnel encryption layer, this provides a full VPN.
+ *
+ * Usage:
+ *   int tun_fd = tun_create("tun0");
+ *   tun_set_ip("tun0", "10.0.0.1", "255.255.255.0");
+ *   // Read IP packets from tun_fd, encrypt, send to peer
+ *   // Receive encrypted packets from peer, decrypt, write to tun_fd
+ *
+ * Wire format for VPN mode (sent through AEGIS-Tunnel frames):
+ *   [IP packet (20-65535 bytes)]
+ *
+ * Requires: Linux kernel TUN driver (/dev/net/tun), CAP_NET_ADMIN
+ */
+#ifndef TUN_H
+#define TUN_H
+
+#include <stddef.h>
+#include <stdint.h>
+
+#define TUN_MAX_PACKET  65535   /* max IP packet size (including jumbo) */
+#define TUN_DEFAULT_MTU  1500   /* typical Ethernet MTU */
+
+/*
+ * Create a TUN device.
+ *   name: desired interface name (e.g., "tun0").  May be modified
+ *         by the kernel to the actual name if the requested one
+ *         is already in use.  Buffer must be at least IFNAMSIZ (16).
+ * Returns fd on success, -1 on error.
+ */
+int tun_create(char *name);
+
+/*
+ * Set IP address and netmask on a TUN interface.
+ * Uses `ip addr add` command (simplest portable approach).
+ *   name:    interface name (e.g., "tun0")
+ *   ip:      IPv4 address (e.g., "10.0.0.1")
+ *   netmask: subnet mask (e.g., "255.255.255.0")
+ * Returns 0 on success, -1 on error.
+ */
+int tun_set_ip(const char *name, const char *ip, const char *netmask);
+
+/*
+ * Bring the interface up.
+ *   name: interface name
+ * Returns 0 on success, -1 on error.
+ */
+int tun_up(const char *name);
+
+/*
+ * Add a route through the TUN interface.
+ *   network: destination network (e.g., "10.0.0.0/24")
+ *   name:    TUN interface name
+ * Returns 0 on success, -1 on error.
+ */
+int tun_add_route(const char *network, const char *name);
+
+/*
+ * Enable IP forwarding (required for VPN gateway).
+ *   echo 1 > /proc/sys/net/ipv4/ip_forward
+ * Returns 0 on success, -1 on error.
+ */
+int tun_enable_forwarding(void);
+
+/*
+ * Add iptables NAT (masquerade) rule.
+ *   iptables -t nat -A POSTROUTING -s <subnet> -o <out_if> -j MASQUERADE
+ * Allows TUN clients to access the internet through this server.
+ *   subnet: TUN network (e.g., "10.0.0.0/24")
+ *   out_if: external interface (e.g., "eth0")
+ * Returns 0 on success, -1 on error.
+ */
+int tun_set_nat(const char *subnet, const char *out_if);
+
+/*
+ * Add iptables FORWARD rules for TUN interface.
+ *   iptables -A FORWARD -i <name> -j ACCEPT
+ *   iptables -A FORWARD -o <name> -j ACCEPT
+ * Returns 0 on success, -1 on error.
+ */
+int tun_allow_forward(const char *name);
+
+/*
+ * Setup firewall rules for DNS (optional, for split-tunnel).
+ * Allows DNS queries through the tunnel only.
+ * Returns 0 on success, -1 on error.
+ */
+int tun_allow_dns(const char *name, const char *dns_ip);
+
+/*
+ * Read an IP packet from the TUN device.
+ * Blocks until a packet is available.
+ * Returns packet length on success, -1 on error.
+ * On success, buf contains one complete IP packet.
+ */
+int tun_read(int fd, uint8_t *buf, size_t buflen);
+
+/*
+ * Write an IP packet to the TUN device.
+ * Returns bytes written on success, -1 on error.
+ */
+int tun_write(int fd, const uint8_t *buf, size_t len);
+
+#endif /* TUN_H */

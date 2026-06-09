@@ -1,0 +1,8 @@
+# AEGIS-Tunnel server configuration
+# Copy to: /etc/aegis/server.conf
+LISTEN_PORT=9000
+REMOTE_ADDR=127.0.0.1:8080
+MODE=server
+HS_TIMEOUT=10
+MAX_CONNS=64
+KEEPALIVE=30
