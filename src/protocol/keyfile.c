@@ -24,10 +24,15 @@ int keyfile_generate(const char *priv_path, const char *pub_path)
     if (write(fd, priv, ECDH_PRIVKEY_LEN) != ECDH_PRIVKEY_LEN) { close(fd); return -1; }
     close(fd);
 
-    /* Write public key (world-readable) */
+    /* Write public key as hex text (easy to cat/copy/paste) */
     fd = open(pub_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) { fprintf(stderr, "Cannot create %s: %s\n", pub_path, strerror(errno)); return -1; }
-    if (write(fd, pub, ECDH_PUBKEY_LEN) != ECDH_PUBKEY_LEN) { close(fd); return -1; }
+    {
+        char hex[65];
+        for (int i = 0; i < 32; i++) sprintf(hex + i*2, "%02x", pub[i]);
+        hex[64] = '\n';
+        if (write(fd, hex, 65) != 65) { close(fd); return -1; }
+    }
     close(fd);
 
     return 0;
