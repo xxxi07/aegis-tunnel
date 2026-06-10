@@ -1,5 +1,5 @@
 /*
- * mode_psk.c — PSK handshake server/client modes
+ * mode_psk.c — Asymmetric handshake server/client modes
  */
 #include "main.h"
 #include "protocol/handshake.h"
@@ -18,15 +18,14 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-/* ─── PSK Server ──────────────────────────────────────────────── */
+/* ─── Server ──────────────────────────────────────────────────── */
 int mode_psk_server(int listen_port, const char *remote_host, int remote_port,
                     const uint8_t *psk, size_t psk_len, int hs_timeout, int keepalive)
 {
     int listen_fd = listen_on_port(listen_port);
     if (listen_fd < 0) return 1;
 
-    log_info("server", "port %d → %s:%d (max %d connections)",
-             listen_port, remote_host, remote_port, g_max_conns);
+    log_info("server", "port %d → %s:%d (max %d)", listen_port, remote_host, remote_port, g_max_conns);
 
     while (g_running) {
         struct sockaddr_in ca; socklen_t al = sizeof(ca);
@@ -41,15 +40,11 @@ int mode_psk_server(int listen_port, const char *remote_host, int remote_port,
         pid_t pid = fork();
         if (pid < 0) { close(client_fd); continue; }
         if (pid == 0) {
-            close(listen_fd);
-            signal(SIGCHLD, SIG_DFL);
+            close(listen_fd); signal(SIGCHLD, SIG_DFL);
 
             session_keys_t keys;
-            int hs_ok = g_asym_mode
-                ? (handshake_asymmetric_server(client_fd, g_asym_priv, g_asym_peer, hs_timeout, &keys) == 0)
-                : (handshake_server(client_fd, psk, psk_len, hs_timeout, &keys) == 0);
-
-            if (!hs_ok) { log_warn("server", "handshake failed"); close(client_fd); _exit(1); }
+            if (handshake_server(client_fd, g_asym_priv, g_asym_peer, hs_timeout, &keys) != 0)
+                { log_warn("server", "handshake failed"); close(client_fd); _exit(1); }
             if (handshake_key_confirm_server(client_fd, &keys, hs_timeout) != 0)
                 { secure_memzero(&keys, sizeof(keys)); close(client_fd); _exit(1); }
 
@@ -70,7 +65,7 @@ int mode_psk_server(int listen_port, const char *remote_host, int remote_port,
     return 0;
 }
 
-/* ─── PSK Client ──────────────────────────────────────────────── */
+/* ─── Client ──────────────────────────────────────────────────── */
 int mode_psk_client(int listen_port, const char *remote_host, int remote_port,
                     const uint8_t *psk, size_t psk_len, int hs_timeout, int keepalive)
 {
@@ -90,11 +85,8 @@ int mode_psk_client(int listen_port, const char *remote_host, int remote_port,
         set_socket_timeout(tunnel_fd, hs_timeout);
 
         session_keys_t keys;
-        int hs_ok = g_asym_mode
-            ? (handshake_asymmetric_client(tunnel_fd, g_asym_priv, g_asym_peer, hs_timeout, &keys) == 0)
-            : (handshake_client(tunnel_fd, psk, psk_len, hs_timeout, &keys) == 0);
-
-        if (!hs_ok) { log_warn("client", "handshake failed"); close(local_fd); close(tunnel_fd); continue; }
+        if (handshake_client(tunnel_fd, g_asym_priv, g_asym_peer, hs_timeout, &keys) != 0)
+            { log_warn("client", "handshake failed"); close(local_fd); close(tunnel_fd); continue; }
         if (handshake_key_confirm_client(tunnel_fd, &keys, hs_timeout) != 0)
             { secure_memzero(&keys, sizeof(keys)); close(local_fd); close(tunnel_fd); continue; }
 
@@ -108,7 +100,6 @@ int mode_psk_client(int listen_port, const char *remote_host, int remote_port,
         close(local_fd); close(tunnel_fd);
         if (r != 0) log_error("client", "tunnel error");
     }
-
     close(listen_fd);
     return 0;
 }

@@ -1,8 +1,9 @@
-# AEGIS-Tunnel server configuration
-# Copy to: /etc/aegis/server.conf
-LISTEN_PORT=9000
-REMOTE_ADDR=127.0.0.1:8080
-MODE=server
-HS_TIMEOUT=10
-MAX_CONNS=64
-KEEPALIVE=30
+# AEGIS-Tunnel server configuration (asymmetric handshake)
+LISTEN_PORT = 9000
+REMOTE_ADDR = 127.0.0.1:8080
+PRIVATE_KEY = /etc/aegis/private.key
+PEER_KEY = /etc/aegis/client.pub
+MODE = server
+HS_TIMEOUT = 10
+MAX_CONNS = 64
+KEEPALIVE = 30

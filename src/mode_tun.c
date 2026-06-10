@@ -60,11 +60,8 @@ int mode_tun_server(int listen_port,
             signal(SIGCHLD, SIG_DFL);
 
             session_keys_t keys;
-            int hs_ok = g_asym_mode
-                ? (handshake_asymmetric_server(client_fd, g_asym_priv, g_asym_peer, hs_timeout, &keys) == 0)
-                : (handshake_server(client_fd, psk, psk_len, hs_timeout, &keys) == 0);
-
-            if (!hs_ok) { log_warn("tun-server", "handshake failed"); close(client_fd); _exit(1); }
+            if (handshake_server(client_fd, g_asym_priv, g_asym_peer, hs_timeout, &keys) != 0)
+                { log_warn("tun-server", "handshake failed"); close(client_fd); _exit(1); }
 
             tunnel_t tun; tunnel_init(&tun, tun_fd, client_fd, keys.enc_key, keys.dec_key);
             tun.keepalive_sec = keepalive; tun.rekey_sec = 120; tun.psk = psk; tun.psk_len = psk_len;
@@ -104,11 +101,8 @@ int mode_tun_client(int listen_port, const char *remote_host, int remote_port,
              remote_host, remote_port);
 
     session_keys_t keys;
-    int hs_ok = g_asym_mode
-        ? (handshake_asymmetric_client(tunnel_fd, g_asym_priv, g_asym_peer, hs_timeout, &keys) == 0)
-        : (handshake_client(tunnel_fd, psk, psk_len, hs_timeout, &keys) == 0);
-
-    if (!hs_ok) { log_warn("tun-client", "handshake failed"); close(tunnel_fd); close(tun_fd); return 1; }
+    if (handshake_client(tunnel_fd, g_asym_priv, g_asym_peer, hs_timeout, &keys) != 0)
+        { log_warn("tun-client", "handshake failed"); close(tunnel_fd); close(tun_fd); return 1; }
 
     tunnel_t tun; tunnel_init(&tun, tun_fd, tunnel_fd, keys.enc_key, keys.dec_key);
     tun.keepalive_sec = keepalive; tun.rekey_sec = 120; tun.psk = psk; tun.psk_len = psk_len;
