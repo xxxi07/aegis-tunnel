@@ -103,25 +103,29 @@ static void usage(const char *prog) {
         "\n"
         "Required:\n"
         "  -l <port>       Local listen port\n"
-        "  -r <host:port>  Remote target address\n"
+        "  -r <host:port>  Remote target (use 'vpn' for pure TUN mode)\n"
         "\n"
         "Keys (~/.aegis-tunnel/, auto-generated):\n"
         "  First run: keys generated, public key printed\n"
         "  Then paste peer's hex public key with -Q <hex>\n"
         "  Or use -Q <file> to specify a peer key file\n"
         "\n"
+        "Commands:\n"
+        "  keygen               Generate keys, print public key\n"
+        "  peer add <h> <hex>   Add peer's public key\n"
+        "  peer list            List known peers\n"
+        "  status               Show key/peer status\n"
+        "  tun down             Remove TUN device + iptables rules\n"
+        "\n"
         "Options:\n"
         "  -P <file>       Override private key path\n"
-        "  -Q <hex|file>   Peer public key (64 hex chars = 32 bytes, or file path)\n"
+        "  -Q <hex|file>   Peer public key (64 hex chars or file)\n"
         "  -C <file>       Config file\n"
         "  -m <mode>       'server' (default) or 'client'\n"
         "  -t <sec>        Handshake timeout (default: 5)\n"
         "  -c <max>        Max connections (default: 32)\n"
-        "  -K <sec>        Keepalive interval (default: 0)\n"
-        "  -T <name>       TUN mode: virtual NIC name\n"
-        "  -I <ip>         TUN IP address\n"
-        "  -N <mask>       TUN netmask (default: 255.255.255.0)\n"
-        "  -R <net>        TUN route\n"
+        "  -K <sec>        Keepalive (default: 0)\n"
+        "  -T <ip/prefix>  TUN VPN: e.g. -T 10.0.0.1/24\n"
         "  -W <iface>      WAN interface for NAT (default: eth0)\n"
         "  -v              Verbose logging\n"
         "  -h              Show this help\n"
@@ -198,13 +202,47 @@ static int cmd_peer_list(void) {
     closedir(d);
     return 0;
 }
+static int cmd_status(void) {
+    const char *home = getenv("HOME"); if (!home) home = "/tmp";
+    char dir[520]; snprintf(dir, sizeof(dir), "%s/.aegis-tunnel", home);
+    printf("Key storage: %s\n", dir);
+    struct stat st;
+    if (stat(dir, &st) == 0) {
+        char path[520];
+        snprintf(path, sizeof(path), "%s/private.key", dir);
+        printf("  Private key: %s (%s)\n", path,
+               (access(path, F_OK) == 0) ? "exists" : "missing");
+        snprintf(path, sizeof(path), "%s/public.key", dir);
+        printf("  Public key:  %s (%s)\n", path,
+               (access(path, F_OK) == 0) ? "exists" : "missing");
+    } else {
+        printf("  (not yet created — run 'aegis-tunnel keygen')\n");
+    }
+    cmd_peer_list();
+    return 0;
+}
+static int cmd_tun_down(void) {
+    const char *name = "tun0";
+    /* Delete TUN device */
+    char cmd[128];
+    snprintf(cmd, sizeof(cmd), "ip link del %s 2>/dev/null", name);
+    system(cmd);
+    /* Clean iptables */
+    system("iptables -t nat -F POSTROUTING 2>/dev/null");
+    system("iptables -F FORWARD 2>/dev/null");
+    printf("TUN device %s removed, iptables rules cleared.\n", name);
+    return 0;
+}
 
 int main(int argc, char **argv) {
     /* Subcommands: aegis-tunnel keygen | peer add <host> <hex> | peer list */
     if (argc >= 2) {
-        if (!strcmp(argv[1], "keygen")) return cmd_keygen();
+        if (!strcmp(argv[1], "keygen"))    return cmd_keygen();
+        if (!strcmp(argv[1], "status"))    return cmd_status();
+        if (!strcmp(argv[1], "tun") && argc >= 3 && !strcmp(argv[2], "down"))
+                                           return cmd_tun_down();
         if (!strcmp(argv[1], "peer") && argc >= 3) {
-            if (!strcmp(argv[2], "list")) return cmd_peer_list();
+            if (!strcmp(argv[2], "list"))  return cmd_peer_list();
             if (!strcmp(argv[2], "add") && argc >= 5) return cmd_peer_add(argv[3], argv[4]);
             fprintf(stderr, "Usage: %s peer add <host> <hex-or-file>\n", argv[0]);
             fprintf(stderr, "       %s peer list\n", argv[0]);
@@ -233,7 +271,31 @@ int main(int argc, char **argv) {
         case 't': hs_timeout  = atoi(optarg);           break;
         case 'c': g_max_conns = atoi(optarg);           break;
         case 'K': keepalive   = atoi(optarg);           break;
-        case 'T': tun_mode    = 1; strncpy(tun_name, optarg, 15);   break;
+        case 'T': tun_mode = 1;
+                  if (strchr(optarg, '/')) {
+                      /* CIDR: 10.0.0.1/24 */
+                      char *slash = strchr(optarg, '/');
+                      *slash = '\0';
+                      strncpy(tun_ip, optarg, 31);
+                      int prefix = atoi(slash + 1);
+                      *slash = '/';
+                      /* Convert prefix to netmask */
+                      uint32_t nm = (prefix == 0) ? 0 : (~0u << (32 - (unsigned)prefix));
+                      snprintf(tun_netmask, 31, "%u.%u.%u.%u",
+                               (nm >> 24) & 0xff, (nm >> 16) & 0xff,
+                               (nm >> 8) & 0xff, nm & 0xff);
+                      /* Auto-derive route from IP + prefix */
+                      uint32_t ip_n;
+                      sscanf(tun_ip, "%u.%u.%u.%u",
+                             (unsigned *)&ip_n, (unsigned *)&ip_n,
+                             (unsigned *)&ip_n, (unsigned *)&ip_n);
+                      /* Actually need octets. Simpler: just use the first 3 octets */
+                      char *dot = strrchr(tun_ip, '.');
+                      if (dot) { *dot = '\0'; snprintf(tun_route, 63, "%s.0/%d", tun_ip, prefix); *dot = '.'; }
+                  } else {
+                      strncpy(tun_ip, optarg, 31);
+                  }
+                  break;
         case 'I': strncpy(tun_ip, optarg, 31);           break;
         case 'N': strncpy(tun_netmask, optarg, 31);      break;
         case 'R': strncpy(tun_route, optarg, 63);         break;
