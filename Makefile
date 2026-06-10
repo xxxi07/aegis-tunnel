@@ -21,15 +21,16 @@ INC      := -I$(SRC_DIR)
 # ── Source files by module ──
 CRYPTO   := $(SRC_DIR)/crypto/aegis.c
 UTIL     := $(SRC_DIR)/util/util.c $(SRC_DIR)/util/log.c $(SRC_DIR)/util/config.c
-PROTOCOL := $(SRC_DIR)/protocol/handshake.c $(SRC_DIR)/protocol/ecdh.c $(SRC_DIR)/protocol/frame_reader.c $(SRC_DIR)/protocol/keyfile.c $(SRC_DIR)/protocol/tofu.c
+PROTOCOL := $(SRC_DIR)/protocol/handshake.c $(SRC_DIR)/protocol/ecdh.c $(SRC_DIR)/protocol/frame_reader.c $(SRC_DIR)/protocol/keyfile.c
 TUNNEL   := $(SRC_DIR)/tunnel/tunnel.c $(SRC_DIR)/tunnel/threadpool.c $(SRC_DIR)/tunnel/tun.c
 PROXY    := $(SRC_DIR)/proxy/socks5.c
 
 LIB_SRCS := $(CRYPTO) $(UTIL) $(PROTOCOL) $(TUNNEL) $(PROXY)
 LIB_OBJS := $(LIB_SRCS:.c=.o)
 
-MAIN_SRCS := $(SRC_DIR)/main.c $(LIB_SRCS)
-MAIN_OBJS := $(MAIN_SRCS:.c=.o)
+MODE_SRCS := $(SRC_DIR)/main.c $(SRC_DIR)/mode_psk.c $(SRC_DIR)/mode_tun.c
+MAIN_SRCS  := $(MODE_SRCS) $(LIB_SRCS)
+MAIN_OBJS  := $(MAIN_SRCS:.c=.o)
 
 TEST_SRCS := tests/test_aegis.c tests/test_tunnel.c tests/e2e_test.c tests/bench_aegis.c
 

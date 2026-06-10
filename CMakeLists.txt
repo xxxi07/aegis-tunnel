@@ -85,6 +85,8 @@ set(LIB_SOURCES
 # Main executable (adds main.c on top of library)
 set(MAIN_SOURCES
     src/main.c
+    src/mode_psk.c
+    src/mode_tun.c
     ${LIB_SOURCES}
 )
 
