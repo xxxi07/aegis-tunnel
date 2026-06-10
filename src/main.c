@@ -96,8 +96,7 @@ void set_socket_timeout(int fd, int seconds) {
 
 static void usage(const char *prog) {
     fprintf(stderr,
-        "Usage: %s -l <port> -r <host:port> -P <priv.key> -Q <peer.pub> [options]\n"
-        "       %s -C <config.conf>  (read all settings from file)\n"
+        "Usage: %s -r <host:port> [options]\n"
         "\n"
         "AEGIS-Tunnel -- Lightweight encrypted tunnel using AEGIS-128 AEAD\n"
         "\n"
@@ -139,7 +138,7 @@ static void usage(const char *prog) {
         "  # Server: %s -l 9000 -r 127.0.0.1:8080\n"
         "  # Client: %s -l 9000 -r server:9000 -m client\n"
         "\n",
-        prog, prog, prog, prog, prog, prog);
+        prog, prog, prog, prog, prog);
 }
 
 /* ─── Subcommands ─────────────────────────────────────────────── */
@@ -152,10 +151,12 @@ static int cmd_keygen(void) {
     snprintf(pub, sizeof(pub), "%s/public.key", dir);
     if (keyfile_generate(priv, pub) != 0) return 1;
     printf("Keys generated in %s\n", dir);
-    printf("Public key (send to peer):\n");
+    printf("Public key (send to peer):\n  ");
     char hex[65];
     FILE *f = fopen(pub, "r");
-    if (f) { fread(hex, 1, 64, f); hex[64] = '\0'; fclose(f); printf("  %s\n", hex); }
+    if (f) { fread(hex, 1, 64, f); hex[64] = '\0'; fclose(f); printf("%s\n", hex); }
+    printf("\nNext: get peer's public key, then:\n");
+    printf("  aegis-tunnel peer add <hostname> <peer-hex-key>\n");
     return 0;
 }
 static int cmd_peer_add(const char *host, const char *hex_or_file) {
@@ -177,13 +178,18 @@ static int cmd_peer_add(const char *host, const char *hex_or_file) {
         while ((n = fread(buf, 1, sizeof(buf), src)) > 0) fwrite(buf, 1, n, dst);
         fclose(src); fclose(dst);
     } else {
-        /* Hex string: write directly */
+        /* Hex string: validate and write */
+        size_t hlen = strlen(hex_or_file);
+        if (hlen != 64) {
+            fprintf(stderr, "Error: hex key must be 64 characters (got %zu)\n", hlen);
+            return 1;
+        }
         FILE *f = fopen(path, "w");
         if (!f) return 1;
         fprintf(f, "%s\n", hex_or_file);
         fclose(f);
     }
-    printf("Peer key saved: %s\n", path);
+    printf("Peer '%s' added.\n", host);
     return 0;
 }
 static int cmd_peer_list(void) {
@@ -250,7 +256,7 @@ int main(int argc, char **argv) {
         }
     }
 
-    int  listen_port = 0;
+    int  listen_port = 9000;  /* default port */
     char *remote_str = NULL, *config_file = NULL;
     char *privkey_file = NULL, *peerkey_file = NULL;
     const char *mode = "server";
@@ -309,7 +315,7 @@ int main(int argc, char **argv) {
     if (config_file) {  /* load config (CLI args override) */
         config_t cfg;
         if (config_load(&cfg, config_file) == 0) {
-            if (!listen_port) listen_port = config_get_int(&cfg, "LISTEN_PORT", 0);
+            if (listen_port == 9000) listen_port = config_get_int(&cfg, "LISTEN_PORT", 9000);
             if (!remote_str)  { const char *v = config_get(&cfg, "REMOTE_ADDR"); if (v) remote_str = strdup(v); }
             if (!privkey_file){ const char *v = config_get(&cfg, "PRIVATE_KEY"); if (v) privkey_file = strdup(v); }
             if (!peerkey_file){ const char *v = config_get(&cfg, "PEER_KEY");    if (v) peerkey_file = strdup(v); }
@@ -328,7 +334,7 @@ int main(int argc, char **argv) {
         }
     }
 
-    if (listen_port <= 0 || !remote_str) { fprintf(stderr, "Error: -l and -r required\n"); usage(argv[0]); return 1; }
+    if (listen_port <= 0 || !remote_str) { fprintf(stderr, "Error: -r <host:port> is required\n"); usage(argv[0]); return 1; }
     if (strcmp(mode,"server") && strcmp(mode,"client")) { fprintf(stderr, "Error: mode must be server or client\n"); return 1; }
 
 
