@@ -19,6 +19,16 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#define TUN_FWMARK  51820   /* WireGuard-compatible fwmark */
+
+static void tun_setup_routing(const char *name, const char *allowed_ips, const char *nat_if)
+{
+    tun_enable_forwarding();
+    tun_set_fwmark_rule(TUN_FWMARK);
+    tun_set_nat(allowed_ips, nat_if);
+    tun_allow_forward(name);
+}
+
 /* ─── TUN Server ──────────────────────────────────────────────── */
 int mode_tun_server(int listen_port,
                     const char *tun_name,
@@ -33,16 +43,22 @@ int mode_tun_server(int listen_port,
 
     if (tun_ip && tun_ip[0]) tun_set_ip(name, tun_ip, tun_netmask);
     tun_up(name);
-    if (tun_route && tun_route[0]) tun_add_route(tun_route, name);
-    tun_enable_forwarding();
-    tun_set_nat(tun_route ? tun_route : "10.0.0.0/24", tun_nat_if);
-    tun_allow_forward(name);
+
+    /* Routing: full-tunnel (0.0.0.0/0) or subnet route */
+    if (tun_route && tun_route[0]) {
+        if (strcmp(tun_route, "0.0.0.0/0") == 0 || strcmp(tun_route, "::/0") == 0)
+            tun_add_full_tunnel(name);
+        else
+            tun_add_route(tun_route, name);
+    }
+    tun_setup_routing(name, tun_route ? tun_route : "10.0.0.0/24", tun_nat_if);
 
     int listen_fd = listen_on_port(listen_port);
     if (listen_fd < 0) { close(tun_fd); return 1; }
 
-    log_info("tun-server", "%s (%s/%s) listening on :%d",
-             name, tun_ip && tun_ip[0] ? tun_ip : "dhcp", tun_netmask, listen_port);
+    log_info("tun-server", "%s (%s/%s) listening on :%d route=%s",
+             name, tun_ip && tun_ip[0] ? tun_ip : "dhcp", tun_netmask,
+             listen_port, tun_route ? tun_route : "10.0.0.0/24");
 
     while (g_running) {
         struct sockaddr_in ca; socklen_t al = sizeof(ca);
@@ -50,14 +66,16 @@ int mode_tun_server(int listen_port,
         if (client_fd < 0) { if (errno == EINTR) continue; break; }
         if (g_active_conns >= g_max_conns) { close(client_fd); continue; }
 
+        /* Mark tunnel socket to bypass TUN routing */
+        tun_set_fwmark(client_fd, TUN_FWMARK);
+
         char ip[INET_ADDRSTRLEN]; inet_ntop(AF_INET, &ca.sin_addr, ip, sizeof(ip));
         log_info("tun-server", "client %s:%d", ip, ntohs(ca.sin_port));
 
         pid_t pid = fork();
         if (pid < 0) { close(client_fd); continue; }
         if (pid == 0) {
-            close(listen_fd);
-            signal(SIGCHLD, SIG_DFL);
+            close(listen_fd); signal(SIGCHLD, SIG_DFL);
 
             session_keys_t keys;
             if (handshake_server(client_fd, g_asym_priv, g_asym_peer, hs_timeout, &keys) != 0)
@@ -91,14 +109,24 @@ int mode_tun_client(int listen_port, const char *remote_host, int remote_port,
 
     if (tun_ip && tun_ip[0]) tun_set_ip(name, tun_ip, tun_netmask);
     tun_up(name);
-    if (tun_route && tun_route[0]) tun_add_route(tun_route, name);
+
+    /* Routing */
+    if (tun_route && tun_route[0]) {
+        if (strcmp(tun_route, "0.0.0.0/0") == 0 || strcmp(tun_route, "::/0") == 0)
+            tun_add_full_tunnel(name);
+        else
+            tun_add_route(tun_route, name);
+    }
 
     int tunnel_fd = connect_to_host(remote_host, remote_port);
     if (tunnel_fd < 0) { close(tun_fd); return 1; }
 
-    log_info("tun-client", "%s (%s/%s) → %s:%d",
+    /* Mark tunnel socket to bypass TUN routing */
+    tun_set_fwmark(tunnel_fd, TUN_FWMARK);
+
+    log_info("tun-client", "%s (%s/%s) → %s:%d route=%s",
              name, tun_ip && tun_ip[0] ? tun_ip : "dhcp", tun_netmask,
-             remote_host, remote_port);
+             remote_host, remote_port, tun_route ? tun_route : "(none)");
 
     session_keys_t keys;
     if (handshake_client(tunnel_fd, g_asym_priv, g_asym_peer, hs_timeout, &keys) != 0)

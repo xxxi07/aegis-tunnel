@@ -231,6 +231,9 @@ static int cmd_status(void) {
 }
 static int cmd_tun_down(void) {
     const char *name = "tun0";
+    /* Restore default route */
+    system("ip route del 0.0.0.0/1 2>/dev/null");
+    system("ip route del 128.0.0.0/1 2>/dev/null");
     /* Delete TUN device */
     char cmd[128];
     snprintf(cmd, sizeof(cmd), "ip link del %s 2>/dev/null", name);
@@ -238,7 +241,10 @@ static int cmd_tun_down(void) {
     /* Clean iptables */
     system("iptables -t nat -F POSTROUTING 2>/dev/null");
     system("iptables -F FORWARD 2>/dev/null");
-    printf("TUN device %s removed, iptables rules cleared.\n", name);
+    /* Clean policy routing */
+    system("ip rule del not fwmark 51820 table main 2>/dev/null");
+    system("ip rule del fwmark 51820 table main 2>/dev/null");
+    printf("TUN %s removed, routes and iptables cleared.\n", name);
     return 0;
 }
 

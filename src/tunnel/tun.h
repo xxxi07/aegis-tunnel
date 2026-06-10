@@ -60,6 +60,39 @@ int tun_up(const char *name);
 int tun_add_route(const char *network, const char *name);
 
 /*
+ * Set SO_MARK on a socket to bypass TUN routing (prevents loop).
+ * WireGuard-style: encrypted tunnel traffic must not be routed
+ * back into the TUN device.
+ *
+ *   mark: fwmark value (e.g., 51820 like WireGuard default)
+ */
+int tun_set_fwmark(int fd, int mark);
+
+/*
+ * Set up full-tunnel routing (redirect all traffic through TUN).
+ *
+ * When allowed_ips is "0.0.0.0/0" or "::/0", adds split-default routes:
+ *   ip route add 0.0.0.0/1 dev <name>
+ *   ip route add 128.0.0.0/1 dev <name>
+ *
+ * This overrides the default route without deleting it.
+ * Must be paired with tun_set_fwmark on the tunnel socket
+ * to prevent the encrypted traffic itself from looping.
+ *
+ * Returns 0 on success, -1 on error.
+ */
+int tun_add_full_tunnel(const char *name);
+
+/*
+ * Set up policy routing to exclude fwmark'd packets from TUN routes.
+ *   ip rule add not fwmark <mark> table main
+ *
+ * Ensures the tunnel's own TCP connection goes through the real NIC,
+ * not through the TUN device (which would cause a loop).
+ */
+int tun_set_fwmark_rule(int mark);
+
+/*
  * Enable IP forwarding (required for VPN gateway).
  *   echo 1 > /proc/sys/net/ipv4/ip_forward
  * Returns 0 on success, -1 on error.

@@ -121,6 +121,55 @@ int tun_add_route(const char *network, const char *name)
     return (ret == 0) ? 0 : -1;
 }
 
+/* ─── Set SO_MARK on socket ──────────────────────────────────── */
+
+int tun_set_fwmark(int fd, int mark)
+{
+    if (setsockopt(fd, SOL_SOCKET, SO_MARK, &mark, sizeof(mark)) < 0) {
+        fprintf(stderr, "tun: SO_MARK failed: %s\n", strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
+/* ─── Full-tunnel routing ────────────────────────────────────── */
+
+int tun_add_full_tunnel(const char *name)
+{
+    char cmd[128];
+    /* Two /1 routes cover the entire IPv4 space,
+     * taking priority over the existing default route. */
+    const char *routes[] = {"0.0.0.0/1", "128.0.0.0/1"};
+    for (int i = 0; i < 2; i++) {
+        snprintf(cmd, sizeof(cmd), "ip route add %s dev %s 2>/dev/null", routes[i], name);
+        if (system(cmd) != 0) {
+            /* Try replacing if already exists */
+            snprintf(cmd, sizeof(cmd), "ip route replace %s dev %s 2>/dev/null", routes[i], name);
+            if (system(cmd) != 0) {
+                fprintf(stderr, "tun: failed to add route %s dev %s\n", routes[i], name);
+                return -1;
+            }
+        }
+    }
+    fprintf(stderr, "[tun] full tunnel: 0.0.0.0/0 → %s\n", name);
+    return 0;
+}
+
+/* ─── fwmark policy routing ──────────────────────────────────── */
+
+int tun_set_fwmark_rule(int mark)
+{
+    char cmd[128];
+    /* Packets without fwmark go through main table (including TUN routes) */
+    snprintf(cmd, sizeof(cmd), "ip rule add not fwmark %d table main 2>/dev/null", mark);
+    system(cmd);
+    /* Packets with fwmark bypass the TUN routes */
+    snprintf(cmd, sizeof(cmd), "ip rule add fwmark %d table main 2>/dev/null", mark);
+    system(cmd);
+    fprintf(stderr, "[tun] fwmark %d: policy routing set\n", mark);
+    return 0;
+}
+
 /* ─── Enable IP forwarding ───────────────────────────────────── */
 
 int tun_enable_forwarding(void)
