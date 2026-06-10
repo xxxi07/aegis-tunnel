@@ -104,15 +104,14 @@ static void usage(const char *prog) {
         "  -l <port>       Local listen port\n"
         "  -r <host:port>  Remote target address\n"
         "\n"
-        "Key storage (~/.aegis-tunnel/):\n"
-        "  Private key:    auto-generated at first run (~/.aegis-tunnel/private.key)\n"
-        "  Public key:     ~/.aegis-tunnel/public.key (share with peer out-of-band)\n"
-        "  Peer key:       ~/.aegis-tunnel/peers/<host>.pub\n"
-        "                   Copy peer's public.key to this path\n"
+        "Keys (~/.aegis-tunnel/, auto-generated):\n"
+        "  First run: keys generated, public key printed\n"
+        "  Then paste peer's hex public key with -Q <hex>\n"
+        "  Or use -Q <file> to specify a peer key file\n"
         "\n"
         "Options:\n"
         "  -P <file>       Override private key path\n"
-        "  -Q <file>       Override peer key path\n"
+        "  -Q <hex|file>   Peer public key (64 hex chars = 32 bytes, or file path)\n"
         "  -C <file>       Config file\n"
         "  -m <mode>       'server' (default) or 'client'\n"
         "  -t <sec>        Handshake timeout (default: 5)\n"
@@ -127,10 +126,9 @@ static void usage(const char *prog) {
         "  -h              Show this help\n"
         "\n"
         "Setup:\n"
-        "  1. Run once: keys auto-generated in ~/.aegis-tunnel/\n"
-        "  2. Copy ~/.aegis-tunnel/public.key to peer\n"
-        "  3. Copy peer's public.key to ~/.aegis-tunnel/peers/<host>.pub\n"
-        "  4. Run: %s -l 9000 -r server:9000\n"
+        "  1. Run: %s -l 9000 -r server:9000 (prints your public key)\n"
+        "  2. Send your public key to peer, get theirs\n"
+        "  3. Run: %s -l 9000 -r server:9000 -Q <peer-hex-key>\n"
         "\n"
         "Examples:\n"
         "  # Server (default key paths):\n"
@@ -226,24 +224,50 @@ int main(int argc, char **argv) {
         }
         privkey_file = default_priv;
     }
-    if (!peerkey_file) {
+    if (keyfile_load_private(g_asym_priv, privkey_file) != 0) return 1;
+
+    /* Peer key: support hex string OR file path */
+    if (peerkey_file) {
+        size_t qlen = strlen(peerkey_file);
+        if (qlen == 64 && !strchr(peerkey_file, '/') && !strchr(peerkey_file, '.')) {
+            /* Hex string: parse directly */
+            if (parse_hex(g_asym_peer, 32, peerkey_file) != 32) {
+                fprintf(stderr, "Error: -Q hex key must be 64 hex characters\n");
+                return 1;
+            }
+            log_info("main", "peer key from hex string");
+        } else {
+            /* File path */
+            if (keyfile_load_public(g_asym_peer, peerkey_file) != 0) return 1;
+            log_info("main", "peer key from file: %s", peerkey_file);
+        }
+    } else {
+        /* Try default peer path */
         char peer_dir[520], default_peer[520];
         snprintf(peer_dir, sizeof(peer_dir), "%s/peers", key_dir);
         mkdir(peer_dir, 0700);
         snprintf(default_peer, sizeof(default_peer), "%s/peers/%s.pub", key_dir, remote_host);
         if (access(default_peer, F_OK) == 0) {
-            peerkey_file = default_peer;
+            if (keyfile_load_public(g_asym_peer, default_peer) != 0) return 1;
             log_info("main", "using peer key: %s", default_peer);
         } else {
-            fprintf(stderr, "Error: peer key not found at %s\n", default_peer);
-            fprintf(stderr, "  Copy the peer's public.key to this path\n  Or use -Q <path>\n");
+            /* No peer key — print our public key and ask for theirs */
+            fprintf(stderr, "\n═══ No peer key found ═══\n");
+            fprintf(stderr, "Your public key (send this to peer):\n  ");
+            {
+                char pub_path[520];
+                snprintf(pub_path, sizeof(pub_path), "%s/public.key", key_dir);
+                uint8_t our_pub[32];
+                if (keyfile_load_public(our_pub, pub_path) == 0) {
+                    for (int i = 0; i < 32; i++) fprintf(stderr, "%02x", our_pub[i]);
+                }
+            }
+            fprintf(stderr, "\n\nThen run again with peer's key:\n");
+            fprintf(stderr, "  %s -l %d -r %s -Q <peer-hex-key>\n",
+                    argv[0], listen_port, remote_str);
             return 1;
         }
     }
-
-    if (keyfile_load_private(g_asym_priv, privkey_file) != 0) return 1;
-    if (keyfile_load_public(g_asym_peer, peerkey_file) != 0)   return 1;
-    log_info("main", "private: %s, peer: %s", privkey_file, peerkey_file);
 
     struct sigaction sa; memset(&sa, 0, sizeof(sa));
     sa.sa_handler = sig_handler; sigemptyset(&sa.sa_mask); sa.sa_flags = SA_RESTART;
