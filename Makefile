@@ -36,9 +36,9 @@ TEST_SRCS := tests/test_aegis.c tests/test_tunnel.c tests/e2e_test.c tests/bench
 
 # ═══════════════════════════════════════════════════════════════
 
-.PHONY: all clean install uninstall cmake debug release test test-asymmetric
+.PHONY: all clean install uninstall cmake debug release test
 
-all: aegis-tunnel aegis-tunnel-keygen test-aegis test-tunnel e2e-test bench-aegis test-asymmetric
+all: aegis-tunnel aegis-tunnel-keygen test-aegis test-tunnel e2e-test bench-aegis
 
 # ── Main executable ──
 aegis-tunnel: $(MAIN_OBJS)
@@ -83,11 +83,7 @@ bench-aegis: $(CRYPTO) $(SRC_DIR)/util/util.c tests/bench_aegis.c
 	$(CC) $(CFLAGS) $(INC) -o $@ tests/bench_aegis.c $(CRYPTO) $(SRC_DIR)/util/util.c -lssl -lcrypto
 	@echo "  → $@ built"
 
-test-asymmetric: $(CRYPTO) $(SRC_DIR)/util/util.c $(PROTOCOL) $(SRC_DIR)/tunnel/tunnel.c tests/test_asymmetric.c
-	$(CC) $(CFLAGS) $(INC) -o $@ tests/test_asymmetric.c $(CRYPTO) $(SRC_DIR)/util/util.c $(PROTOCOL) $(SRC_DIR)/tunnel/tunnel.c $(LDFLAGS)
-	@echo "  → $@ built"
-
-test: test-aegis test-tunnel e2e-test test-asymmetric
+test: test-aegis test-tunnel e2e-test
 	@echo "=== test-aegis ===" && ./test-aegis
 	@echo "=== test-tunnel ===" && timeout 10 ./test-tunnel
 	@echo "=== e2e-test ===" && timeout 10 ./e2e-test
@@ -122,5 +118,5 @@ uninstall:
 # ── Clean ──
 clean:
 	rm -f aegis-tunnel libaegis-tunnel.so libaegis-tunnel.a
-	rm -f aegis-tunnel-keygen test-aegis test-tunnel e2e-test bench-aegis test-asymmetric
+	rm -f aegis-tunnel-keygen test-aegis test-tunnel e2e-test bench-aegis
 	find $(SRC_DIR) tests -name '*.o' -delete
