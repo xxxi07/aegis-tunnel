@@ -137,50 +137,21 @@ print('[echo] done')
 "
 ```
 
-### 3.3 生成密钥对
+### 3.3 生成密钥 + 交换公钥
 
 ```bash
-mkdir -p /tmp/keys-test
 rm -rf ~/.aegis-tunnel
 
-# 模拟"服务端"生成密钥
-./aegis-tunnel -l 19990 -r server.com:9000 2>&1 | head -5
-cp -r ~/.aegis-tunnel /tmp/keys-test/server-keys
+# 一行生成密钥
+./aegis-tunnel keygen
+# 输出：Public key (send to peer):
+#         a1b2c3d4e5f6...
 
-# 模拟"客户端"生成密钥
-rm -rf ~/.aegis-tunnel
-./aegis-tunnel -l 19991 -r client.local:9000 2>&1 | head -5
-cp -r ~/.aegis-tunnel /tmp/keys-test/client-keys
+# 一行添加对端公钥
+./aegis-tunnel peer add pi a1b2c3d4e5f6...
 
-echo ""
-echo "=== 服务端公钥 ==="
-cat /tmp/keys-test/server-keys/public.key
-echo ""
-echo "=== 客户端公钥 ==="
-cat /tmp/keys-test/client-keys/public.key
-```
-
-**预期**：打印两行 64 位 hex 字符串。
-
-### 3.4 交换公钥
-
-```bash
-# 服务端保存客户端的公钥
-SERVER_KEY=$(cat /tmp/keys-test/server-keys/public.key)
-CLIENT_KEY=$(cat /tmp/keys-test/client-keys/public.key)
-
-rm -rf ~/.aegis-tunnel
-cp -r /tmp/keys-test/server-keys ~/.aegis-tunnel
-echo "$CLIENT_KEY" > ~/.aegis-tunnel/peers/client.pub
-mkdir -p ~/.aegis-tunnel/peers 2>/dev/null
-echo "$CLIENT_KEY" > ~/.aegis-tunnel/peers/client.pub
-```
-
-确认：
-
-```bash
-echo "服务端私钥: $(cat ~/.aegis-tunnel/public.key)"
-echo "对端(客户端)公钥: $(cat ~/.aegis-tunnel/peers/client.pub)"
+# 查看已知对端
+./aegis-tunnel peer list
 ```
 
 ### 3.5 终端 2 — 启动服务端

@@ -12,6 +12,7 @@
 #include "util/util.h"
 
 #include <arpa/inet.h>
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <netdb.h>
@@ -137,7 +138,80 @@ static void usage(const char *prog) {
         prog, prog, prog, prog, prog, prog);
 }
 
+/* ─── Subcommands ─────────────────────────────────────────────── */
+static int cmd_keygen(void) {
+    const char *home = getenv("HOME"); if (!home) home = "/tmp";
+    char dir[512]; snprintf(dir, sizeof(dir), "%s/.aegis-tunnel", home);
+    mkdir(dir, 0700);
+    char priv[520], pub[520];
+    snprintf(priv, sizeof(priv), "%s/private.key", dir);
+    snprintf(pub, sizeof(pub), "%s/public.key", dir);
+    if (keyfile_generate(priv, pub) != 0) return 1;
+    printf("Keys generated in %s\n", dir);
+    printf("Public key (send to peer):\n");
+    char hex[65];
+    FILE *f = fopen(pub, "r");
+    if (f) { fread(hex, 1, 64, f); hex[64] = '\0'; fclose(f); printf("  %s\n", hex); }
+    return 0;
+}
+static int cmd_peer_add(const char *host, const char *hex_or_file) {
+    const char *home = getenv("HOME"); if (!home) home = "/tmp";
+    char dir[520], peer_dir[520], path[520];
+    snprintf(dir, sizeof(dir), "%s/.aegis-tunnel", home);
+    snprintf(peer_dir, sizeof(peer_dir), "%s/peers", dir);
+    mkdir(dir, 0700); mkdir(peer_dir, 0700);
+    snprintf(path, sizeof(path), "%s/%s.pub", peer_dir, host);
+
+    /* If hex_or_file looks like a file path, copy it; otherwise write as hex */
+    if (strchr(hex_or_file, '/') || strchr(hex_or_file, '.')) {
+        /* File path: copy contents */
+        FILE *src = fopen(hex_or_file, "r");
+        if (!src) { fprintf(stderr, "Cannot open %s\n", hex_or_file); return 1; }
+        FILE *dst = fopen(path, "w");
+        if (!dst) { fclose(src); return 1; }
+        char buf[4096]; size_t n;
+        while ((n = fread(buf, 1, sizeof(buf), src)) > 0) fwrite(buf, 1, n, dst);
+        fclose(src); fclose(dst);
+    } else {
+        /* Hex string: write directly */
+        FILE *f = fopen(path, "w");
+        if (!f) return 1;
+        fprintf(f, "%s\n", hex_or_file);
+        fclose(f);
+    }
+    printf("Peer key saved: %s\n", path);
+    return 0;
+}
+static int cmd_peer_list(void) {
+    const char *home = getenv("HOME"); if (!home) home = "/tmp";
+    char dir[520]; snprintf(dir, sizeof(dir), "%s/.aegis-tunnel/peers", home);
+    DIR *d = opendir(dir);
+    if (!d) { printf("No peers configured yet.\n"); return 0; }
+    printf("Known peers:\n");
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        if (e->d_name[0] == '.') continue;
+        size_t len = strlen(e->d_name);
+        if (len > 4 && !strcmp(e->d_name + len - 4, ".pub"))
+            printf("  %.*s\n", (int)(len - 4), e->d_name);
+    }
+    closedir(d);
+    return 0;
+}
+
 int main(int argc, char **argv) {
+    /* Subcommands: aegis-tunnel keygen | peer add <host> <hex> | peer list */
+    if (argc >= 2) {
+        if (!strcmp(argv[1], "keygen")) return cmd_keygen();
+        if (!strcmp(argv[1], "peer") && argc >= 3) {
+            if (!strcmp(argv[2], "list")) return cmd_peer_list();
+            if (!strcmp(argv[2], "add") && argc >= 5) return cmd_peer_add(argv[3], argv[4]);
+            fprintf(stderr, "Usage: %s peer add <host> <hex-or-file>\n", argv[0]);
+            fprintf(stderr, "       %s peer list\n", argv[0]);
+            return 1;
+        }
+    }
+
     int  listen_port = 0;
     char *remote_str = NULL, *config_file = NULL;
     char *privkey_file = NULL, *peerkey_file = NULL;
