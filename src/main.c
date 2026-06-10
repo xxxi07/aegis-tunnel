@@ -8,6 +8,7 @@
 #include "protocol/keyfile.h"
 #include "tunnel/tun.h"
 #include "util/config.h"
+#include "util/iniconfig.h"
 #include "util/log.h"
 #include "util/util.h"
 
@@ -96,7 +97,8 @@ void set_socket_timeout(int fd, int seconds) {
 
 static void usage(const char *prog) {
     fprintf(stderr,
-        "Usage: %s -r <host:port> [options]\n"
+        "Usage: %s -c <config.conf>  (WireGuard-style, one file)\n"
+        "       %s -r <host:port> [options]\n"
         "\n"
         "AEGIS-Tunnel -- Lightweight encrypted tunnel using AEGIS-128 AEAD\n"
         "\n"
@@ -122,7 +124,7 @@ static void usage(const char *prog) {
         "  -C <file>       Config file\n"
         "  -m <mode>       'server' (default) or 'client'\n"
         "  -t <sec>        Handshake timeout (default: 5)\n"
-        "  -c <max>        Max connections (default: 32)\n"
+        "  -x <max>        Max connections (default: 32)\n"
         "  -K <sec>        Keepalive (default: 0)\n"
         "  -T <ip/prefix>  TUN VPN: e.g. -T 10.0.0.1/24\n"
         "  -W <iface>      WAN interface for NAT (default: eth0)\n"
@@ -138,7 +140,7 @@ static void usage(const char *prog) {
         "  # Server: %s -l 9000 -r 127.0.0.1:8080\n"
         "  # Client: %s -l 9000 -r server:9000 -m client\n"
         "\n",
-        prog, prog, prog, prog, prog);
+        prog, prog, prog, prog, prog, prog);
 }
 
 /* ─── Subcommands ─────────────────────────────────────────────── */
@@ -266,16 +268,17 @@ int main(int argc, char **argv) {
     char tun_route[64] = "", tun_nat_if[16] = "eth0";
 
     int opt;
-    while ((opt = getopt(argc, argv, "l:r:P:Q:C:m:t:c:K:T:I:N:R:W:vh")) != -1) {
+    while ((opt = getopt(argc, argv, "l:r:P:Q:C:c:m:t:x:K:T:I:N:R:W:vh")) != -1) {
         switch (opt) {
         case 'l': listen_port = atoi(optarg);           break;
         case 'r': remote_str  = optarg;                break;
         case 'P': privkey_file = optarg;               break;
         case 'Q': peerkey_file = optarg;               break;
         case 'C': config_file = optarg;                break;
+        case 'c': config_file = optarg;                break;  /* alias */
         case 'm': mode        = optarg;                break;
         case 't': hs_timeout  = atoi(optarg);           break;
-        case 'c': g_max_conns = atoi(optarg);           break;
+        case 'x': g_max_conns = atoi(optarg);           break;
         case 'K': keepalive   = atoi(optarg);           break;
         case 'T': tun_mode = 1;
                   if (strchr(optarg, '/')) {
@@ -312,7 +315,84 @@ int main(int argc, char **argv) {
         }
     }
 
-    if (config_file) {  /* load config (CLI args override) */
+    /* ── Load config file (INI format, WireGuard-style) ── */
+    if (config_file) {
+        iniconf_t icfg;
+        if (iniconf_load(&icfg, config_file) == 0) {
+            /* [Interface] */
+            if (listen_port == 9000)
+                listen_port = iniconf_get_int(&icfg, "Interface", "Port", listen_port);
+            if (!remote_str) {
+                const char *v = iniconf_get(&icfg, "Peer", "Endpoint");
+                if (v) remote_str = strdup(v);
+            }
+            if (!strcmp(mode, "server")) {
+                const char *v = iniconf_get(&icfg, "Interface", "Mode");
+                if (v && (strstr(v, "client") || strstr(v, "Client"))) mode = "client";
+            }
+            if (!privkey_file) {
+                const char *v = iniconf_get(&icfg, "Interface", "PrivateKey");
+                if (v) {
+                    if (v[0] == '~') {
+                        const char *home = getenv("HOME"); if (!home) home = "/tmp";
+                        char *exp = (char*)malloc(strlen(home) + strlen(v) + 1);
+                        sprintf(exp, "%s%s", home, v + 1);
+                        privkey_file = exp;
+                    } else privkey_file = strdup(v);
+                }
+            }
+            if (!peerkey_file) {
+                const char *v = iniconf_get(&icfg, "Peer", "PublicKey");
+                if (v) {
+                    if (strlen(v) == 64 && !strchr(v, '/') && !strchr(v, '.')) {
+                        /* It's a hex key, write to temp file and use that */
+                        char tmp[256];
+                        snprintf(tmp, sizeof(tmp), "/tmp/aegis-peer-%d.pub", getpid());
+                        FILE *f = fopen(tmp, "w");
+                        if (f) { fprintf(f, "%s\n", v); fclose(f); peerkey_file = strdup(tmp); }
+                    } else {
+                        peerkey_file = strdup(v);
+                    }
+                }
+            }
+            if (!tun_mode) {
+                const char *v = iniconf_get(&icfg, "Interface", "Address");
+                if (v) {
+                    tun_mode = 1;
+                    /* Parse CIDR: 10.0.0.1/24 → IP + netmask */
+                    char *slash = strchr((char *)v, '/');
+                    if (slash) {
+                        size_t ip_len = (size_t)(slash - v);
+                        if (ip_len < 32) { memcpy(tun_ip, v, ip_len); tun_ip[ip_len] = '\0'; }
+                        int px = atoi(slash + 1);
+                        uint32_t nm = (px == 0) ? 0 : (~0u << (unsigned)(32 - px));
+                        snprintf(tun_netmask, 31, "%u.%u.%u.%u",
+                                 (nm>>24)&0xff, (nm>>16)&0xff, (nm>>8)&0xff, nm&0xff);
+                        /* Auto-route */
+                        char *dot = strrchr(tun_ip, '.');
+                        if (dot) { *dot = '\0'; snprintf(tun_route, 63, "%s.0/%d", tun_ip, px); *dot = '.'; }
+                    }
+                }
+            }
+            if (!tun_route[0]) {
+                const char *v = iniconf_get(&icfg, "Peer", "AllowedIPs");
+                if (v) strncpy(tun_route, v, 63);
+            }
+            if (hs_timeout == DEFAULT_HS_TIMEOUT)
+                hs_timeout = iniconf_get_int(&icfg, "Tunnel", "Timeout", hs_timeout);
+            if (keepalive == 0)
+                keepalive = iniconf_get_int(&icfg, "Tunnel", "Keepalive", keepalive);
+            if (g_max_conns == DEFAULT_MAX_CONN)
+                g_max_conns = iniconf_get_int(&icfg, "Tunnel", "MaxConnections", g_max_conns);
+            { const char *v = iniconf_get(&icfg, "Tunnel", "NATInterface");
+              if (v) strncpy(tun_nat_if, v, 15); }
+            iniconf_free(&icfg);
+            log_info("main", "loaded config from %s", config_file);
+        }
+    }
+
+    /* ── Legacy key=value config fallback ── */
+    if (config_file) {
         config_t cfg;
         if (config_load(&cfg, config_file) == 0) {
             if (listen_port == 9000) listen_port = config_get_int(&cfg, "LISTEN_PORT", 9000);
