@@ -1,134 +1,296 @@
-# AEGIS-Tunnel 测试指南
+# AEGIS-Tunnel 完整测试指南
 
-> 非对称 3-DH 握手模式。密钥自动生成，无需手动运行 keygen。
-
-## 1. 快速开始
+## 前提
 
 ```bash
+# 安装依赖（Ubuntu/Debian）
+sudo apt install -y gcc make libssl-dev
+
+# 克隆项目
+git clone https://github.com/xxxi07/aegis-tunnel.git
 cd aegis-tunnel
+```
+
+---
+
+## 第 1 步：编译
+
+```bash
 make clean && make
 ```
 
-**预期**：6 个二进制文件全部编译（aegis-tunnel、keygen、3 个测试、bench）。
-
-## 2. 自动化测试（21 项）
+**预期输出**：6 行 `→ xxx built`
 
 ```bash
-make test
+# 确认所有文件存在
+ls -la aegis-tunnel aegis-tunnel-keygen test-aegis test-tunnel e2e-test bench-aegis
 ```
 
-或逐个运行：
+**预期**：6 个文件全部存在，无 "No such file" 错误。
+
+---
+
+## 第 2 步：单元测试（21 项，全部自动化，无需外部依赖）
+
+### 2.1 加密算法 — 12 项
 
 ```bash
-./test-aegis       # 加密算法：12/12
-./test-tunnel      # 帧协议 + 握手：7/7
-./e2e-test         # 端到端链路：2/2
-./bench-aegis      # 性能基准
+./test-aegis
 ```
 
-## 3. 生成密钥对（可选）
+**完整预期输出**：
+```
+AEGIS-128 Unit Tests
+====================
 
-首次运行 `aegis-tunnel` 时会**自动生成**密钥对到 `~/.aegis-tunnel/`。
+  empty message, empty AD                       ... PASS
+  single block (16 bytes), no AD                ... PASS
+  multi-block (47 bytes) with AD (8 bytes)      ... PASS
+  large message (1024 bytes) with large AD (256 bytes) ... PASS
+  wrong key → authentication failure          ... PASS
+  corrupted tag → authentication failure      ... PASS
+  corrupted ciphertext → authentication failure ... PASS
+  wrong AD → authentication failure           ... PASS
+  in-place encrypt/decrypt (buffer aliasing)    ... PASS
+  streaming API roundtrip                       ... PASS
+  different keys → different ciphertexts      ... PASS
+  deterministic: same inputs → same output      ... PASS
 
-如果需要手动预生成（比如自动化部署脚本）：
+────────────────────────────────────────
+Results: 12/12 passed, 0 failed
+```
+
+### 2.2 帧协议 + 握手 — 7 项
 
 ```bash
-./aegis-tunnel-keygen /etc/aegis/keys/
-# → /etc/aegis/keys/private.key (chmod 400)
-# → /etc/aegis/keys/public.key  (发给对端)
+./test-tunnel
 ```
 
-## 4. 端到端通信测试
+**完整预期输出**：
+```
+AEGIS-Tunnel Integration Tests
+==============================
 
-### 4.1 自动密钥模式（推荐）
+  frame build → parse roundtrip (DATA, 100 bytes)  ... PASS
+  frame parse rejects wrong nonce counter            ... PASS
+  frame build → parse KEEPALIVE (zero payload)     ... PASS
+  handshake + data transfer (end-to-end)             ... PASS
+  wrong peer pubkey → handshake rejected           ... PASS
+  large frame (65535 bytes) roundtrip                ... PASS
+  corrupted frame tag → rejected                   ... PASS
+
+Results: 7/7 passed, 0 failed
+```
+
+### 2.3 端到端 — 2 项
 
 ```bash
-# 第一步：生成测试密钥对
-rm -rf ~/.aegis-tunnel  # 清理旧数据
-
-# 第二步：准备对端公钥
-mkdir -p ~/.aegis-tunnel/peers
-
-# 模拟服务端和客户端：先用 keygen 生成两对密钥，交换公钥
-./aegis-tunnel-keygen /tmp/keys-server/
-./aegis-tunnel-keygen /tmp/keys-client/
-
-# 服务端：使用服务端私钥 + 客户端公钥
-cp /tmp/keys-server/private.key ~/.aegis-tunnel/private.key
-cp /tmp/keys-server/public.key ~/.aegis-tunnel/public.key
-cp /tmp/keys-client/public.key ~/.aegis-tunnel/peers/127.0.0.1.pub
-
-# 客户端（用另一个用户或另一台机器）：
-# cp /tmp/keys-client/private.key ~/.aegis-tunnel/private.key
-# cp /tmp/keys-server/public.key ~/.aegis-tunnel/peers/server-host.pub
+./e2e-test
 ```
 
-### 4.2 显式密钥路径模式
+**完整预期输出**：
+```
+AEGIS-Tunnel End-to-End Test
+=============================
 
-**终端 1** — echo 服务器：
+  handshake + key derivation + encrypt + decrypt       ... PASS
+  wrong peer pubkey → handshake rejected             ... PASS
+
+Results: 2/2 passed, 0 failed
+```
+
+### 2.4 性能基准
+
+```bash
+./bench-aegis
+```
+
+**预期**：输出纯 C 吞吐量（x86_64 约 115 MB/s）。
+
+---
+
+## 第 3 步：端到端加密通信测试（3 个终端）
+
+### 3.1 准备密钥
+
+```bash
+# 清理旧数据，模拟全新环境
+rm -rf ~/.aegis-tunnel /tmp/keys-test
+```
+
+### 3.2 终端 1 — 启动 echo 服务器
+
 ```bash
 python3 -c "
 import socket
 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-s.bind(('127.0.0.1', 19999)); s.listen(1)
-conn, _ = s.accept(); data = conn.recv(4096); conn.sendall(data); conn.close()
-print(f'echoed: {data}')
+s.bind(('127.0.0.1', 19999))
+s.listen(1)
+print('[echo] listening on :19999')
+conn, _ = s.accept()
+data = conn.recv(4096)
+print(f'[echo] received: {data}')
+conn.sendall(data)
+conn.close()
+print('[echo] done')
 "
 ```
 
-**终端 2** — 服务端：
+### 3.3 生成密钥对
+
 ```bash
+mkdir -p /tmp/keys-test
+rm -rf ~/.aegis-tunnel
+
+# 模拟"服务端"生成密钥
+./aegis-tunnel -l 19990 -r server.com:9000 2>&1 | head -5
+cp -r ~/.aegis-tunnel /tmp/keys-test/server-keys
+
+# 模拟"客户端"生成密钥
+rm -rf ~/.aegis-tunnel
+./aegis-tunnel -l 19991 -r client.local:9000 2>&1 | head -5
+cp -r ~/.aegis-tunnel /tmp/keys-test/client-keys
+
+echo ""
+echo "=== 服务端公钥 ==="
+cat /tmp/keys-test/server-keys/public.key
+echo ""
+echo "=== 客户端公钥 ==="
+cat /tmp/keys-test/client-keys/public.key
+```
+
+**预期**：打印两行 64 位 hex 字符串。
+
+### 3.4 交换公钥
+
+```bash
+# 服务端保存客户端的公钥
+SERVER_KEY=$(cat /tmp/keys-test/server-keys/public.key)
+CLIENT_KEY=$(cat /tmp/keys-test/client-keys/public.key)
+
+rm -rf ~/.aegis-tunnel
+cp -r /tmp/keys-test/server-keys ~/.aegis-tunnel
+echo "$CLIENT_KEY" > ~/.aegis-tunnel/peers/client.pub
+mkdir -p ~/.aegis-tunnel/peers 2>/dev/null
+echo "$CLIENT_KEY" > ~/.aegis-tunnel/peers/client.pub
+```
+
+确认：
+
+```bash
+echo "服务端私钥: $(cat ~/.aegis-tunnel/public.key)"
+echo "对端(客户端)公钥: $(cat ~/.aegis-tunnel/peers/client.pub)"
+```
+
+### 3.5 终端 2 — 启动服务端
+
+```bash
+rm -rf ~/.aegis-tunnel
+cp -r /tmp/keys-test/server-keys ~/.aegis-tunnel
+mkdir -p ~/.aegis-tunnel/peers
+cat /tmp/keys-test/client-keys/public.key > ~/.aegis-tunnel/peers/client.pub
+
 ./aegis-tunnel -l 19000 -r 127.0.0.1:19999 \
-    -P /tmp/keys-server/private.key \
-    -Q /tmp/keys-client/public.key \
+    -P ~/.aegis-tunnel/private.key \
+    -Q ~/.aegis-tunnel/peers/client.pub \
     -m server -v
 ```
 
-**终端 3** — 客户端：
+**预期**：无 handshake failed 错误。
+
+### 3.6 终端 3 — 启动客户端
+
 ```bash
+rm -rf ~/.aegis-tunnel
+cp -r /tmp/keys-test/client-keys ~/.aegis-tunnel
+mkdir -p ~/.aegis-tunnel/peers
+cat /tmp/keys-test/server-keys/public.key > ~/.aegis-tunnel/peers/127.0.0.1.pub
+
 ./aegis-tunnel -l 19001 -r 127.0.0.1:19000 \
-    -P /tmp/keys-client/private.key \
-    -Q /tmp/keys-server/public.key \
+    -P ~/.aegis-tunnel/private.key \
+    -Q ~/.aegis-tunnel/peers/127.0.0.1.pub \
     -m client -v
 ```
 
-**终端 4** — 发送数据：
+**预期**：`handshake completed`，无错误。
+
+### 3.7 终端 4 — 发送加密数据
+
 ```bash
-echo "HELLO_AEGIS" | nc -q 1 127.0.0.1 19001
-# 预期：输出 HELLO_AEGIS
+echo "HELLO_AEGIS_TUNNEL" | nc -q 1 127.0.0.1 19001
 ```
 
-## 5. 错误公钥被拒绝
+**预期**：输出 `HELLO_AEGIS_TUNNEL`。
+
+同时查看终端 1（echo 服务器）输出：
+```
+[echo] received: b'HELLO_AEGIS_TUNNEL\n'
+```
+
+---
+
+## 第 4 步：错误公钥被拒绝
 
 ```bash
-# 服务端故意用自己的公钥作为对端公钥（应该失败）
+# 服务端故意用自己的公钥作为对端公钥
+SERVER_KEY=$(cat /tmp/keys-test/server-keys/public.key)
+
+rm -rf ~/.aegis-tunnel
+cp -r /tmp/keys-test/server-keys ~/.aegis-tunnel
+mkdir -p ~/.aegis-tunnel/peers
+echo "$SERVER_KEY" > ~/.aegis-tunnel/peers/client.pub
+
+# 尝试连接 → 应该失败
 ./aegis-tunnel -l 19000 -r 127.0.0.1:19999 \
-    -P /tmp/keys-server/private.key \
-    -Q /tmp/keys-server/public.key \
+    -P ~/.aegis-tunnel/private.key \
+    -Q ~/.aegis-tunnel/peers/client.pub \
     -m server -v
 # 预期：客户端连接后握手失败
 ```
 
-## 6. 性能基准
+---
+
+## 第 5 步：清理
 
 ```bash
-./bench-aegis
-# 纯 C ~115 MB/s
-
-# 启用 AES-NI 加速：
-gcc -std=c99 -D_GNU_SOURCE -DAEGIS_HAVE_AESNI -maes -msse2 -O3 -march=native \
-    -I src -o bench-ni tests/bench_aegis.c \
-    src/crypto/aegis.c src/crypto/x86/aegis128-x86.c src/util/util.c -lssl -lcrypto
-./bench-ni
-# 预期：~10 GB/s（67x 加速）
+pkill aegis-tunnel 2>/dev/null
+pkill "python3 -c" 2>/dev/null
+rm -rf /tmp/keys-test
 ```
 
-## 7. 问题排查
+---
 
-| 现象 | 解决 |
-|------|------|
-| `peer key not found` | `cp peer.pub ~/.aegis-tunnel/peers/<host>.pub` |
-| `handshake failed` | 对端公钥不匹配，检查 `-Q` 指向的 pub 文件 |
-| `make` 只生成一个文件 | `make clean && make` |
-| `cannot find -lssl` | `sudo apt install libssl-dev` |
+## 一键测试脚本
+
+```bash
+#!/bin/bash
+# 保存为 scripts/test-all.sh 并运行
+cd "$(dirname "$0")/.."
+FAIL=0
+
+echo "═══ 1. 编译 ═══"
+make clean > /dev/null 2>&1
+make 2>&1 | grep "→" || ((FAIL++))
+
+echo "═══ 2. 算法测试 ═══"
+timeout 10 ./test-aegis 2>&1 | grep -q "12/12 passed" || ((FAIL++))
+
+echo "═══ 3. 协议测试 ═══"
+timeout 10 ./test-tunnel 2>&1 | grep -q "7/7 passed" || ((FAIL++))
+
+echo "═══ 4. 端到端测试 ═══"
+timeout 10 ./e2e-test 2>&1 | grep -q "2/2 passed" || ((FAIL++))
+
+echo "═══ 5. 主程序验证 ═══"
+./aegis-tunnel -h > /dev/null 2>&1 || ((FAIL++))
+rm -rf ~/.aegis-tunnel
+timeout 2 ./aegis-tunnel -l 19990 -r test:9000 2>&1 | grep -q "No peer key" || ((FAIL++))
+
+if [ $FAIL -eq 0 ]; then
+    echo "═══ 全部通过 ═══"
+else
+    echo "═══ $FAIL 项失败 ═══"
+fi
+exit $FAIL
+```

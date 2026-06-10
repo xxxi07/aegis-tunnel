@@ -131,13 +131,10 @@ static void usage(const char *prog) {
         "  3. Run: %s -l 9000 -r server:9000 -Q <peer-hex-key>\n"
         "\n"
         "Examples:\n"
-        "  # Server (default key paths):\n"
-        "  %s -l 9000 -r 127.0.0.1:8080\n"
-        "\n"
-        "  # Client:\n"
-        "  %s -l 9000 -r server:9000 -m client\n"
+        "  # Server: %s -l 9000 -r 127.0.0.1:8080\n"
+        "  # Client: %s -l 9000 -r server:9000 -m client\n"
         "\n",
-        prog, prog, prog, prog);
+        prog, prog, prog, prog, prog, prog);
 }
 
 int main(int argc, char **argv) {
