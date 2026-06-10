@@ -21,6 +21,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -102,10 +103,16 @@ static void usage(const char *prog) {
         "Required:\n"
         "  -l <port>       Local listen port\n"
         "  -r <host:port>  Remote target address\n"
-        "  -P <file>       Private key file (32 bytes, chmod 400)\n"
-        "  -Q <file>       Peer public key file (32 bytes)\n"
+        "\n"
+        "Key storage (~/.aegis-tunnel/):\n"
+        "  Private key:    auto-generated at first run (~/.aegis-tunnel/private.key)\n"
+        "  Public key:     ~/.aegis-tunnel/public.key (share with peer out-of-band)\n"
+        "  Peer key:       ~/.aegis-tunnel/peers/<host>.pub\n"
+        "                   Copy peer's public.key to this path\n"
         "\n"
         "Options:\n"
+        "  -P <file>       Override private key path\n"
+        "  -Q <file>       Override peer key path\n"
         "  -C <file>       Config file\n"
         "  -m <mode>       'server' (default) or 'client'\n"
         "  -t <sec>        Handshake timeout (default: 5)\n"
@@ -120,15 +127,17 @@ static void usage(const char *prog) {
         "  -h              Show this help\n"
         "\n"
         "Setup:\n"
-        "  aegis-tunnel-keygen /etc/aegis/keys/   # generate keypair\n"
-        "  share public.key with peer out-of-band\n"
+        "  1. Run once: keys auto-generated in ~/.aegis-tunnel/\n"
+        "  2. Copy ~/.aegis-tunnel/public.key to peer\n"
+        "  3. Copy peer's public.key to ~/.aegis-tunnel/peers/<host>.pub\n"
+        "  4. Run: %s -l 9000 -r server:9000\n"
         "\n"
         "Examples:\n"
-        "  # Server:\n"
-        "  %s -l 9000 -r 127.0.0.1:8080 -P my.key -Q peer.pub\n"
+        "  # Server (default key paths):\n"
+        "  %s -l 9000 -r 127.0.0.1:8080\n"
         "\n"
         "  # Client:\n"
-        "  %s -l 9000 -r server:9000 -P my.key -Q peer.pub -m client\n"
+        "  %s -l 9000 -r server:9000 -m client\n"
         "\n",
         prog, prog, prog, prog);
 }
@@ -189,11 +198,8 @@ int main(int argc, char **argv) {
     }
 
     if (listen_port <= 0 || !remote_str) { fprintf(stderr, "Error: -l and -r required\n"); usage(argv[0]); return 1; }
-    if (!privkey_file || !peerkey_file)  { fprintf(stderr, "Error: -P and -Q required\n");   usage(argv[0]); return 1; }
     if (strcmp(mode,"server") && strcmp(mode,"client")) { fprintf(stderr, "Error: mode must be server or client\n"); return 1; }
 
-    if (keyfile_load_private(g_asym_priv, privkey_file) != 0) return 1;
-    if (keyfile_load_public(g_asym_peer, peerkey_file) != 0)   return 1;
 
     /* Rekey bootstrap (random key for re-keying) */
     uint8_t psk[MAX_PSK_BYTES]; random_bytes(psk, 16);
@@ -203,6 +209,41 @@ int main(int argc, char **argv) {
     char *ac = strdup(remote_str); if (!ac) { perror("strdup"); return 1; }
     if (parse_host_port(ac, &hp, &remote_port) != 0) { fprintf(stderr, "Error: '%s' format: host:port\n", remote_str); free(ac); return 1; }
     strncpy(remote_host, hp, MAX_HOST_LEN-1); remote_host[MAX_HOST_LEN-1]='\0'; free(ac);
+
+    /* Default key paths: ~/.aegis-tunnel/ */
+    char key_dir[512], default_priv[520];
+    { const char *home = getenv("HOME"); if (!home) home = "/tmp";
+      snprintf(key_dir, sizeof(key_dir), "%s/.aegis-tunnel", home);
+      mkdir(key_dir, 0700); }
+
+    if (!privkey_file) {
+        snprintf(default_priv, sizeof(default_priv), "%s/private.key", key_dir);
+        if (access(default_priv, F_OK) != 0) {
+            char pub_path[520];
+            snprintf(pub_path, sizeof(pub_path), "%s/public.key", key_dir);
+            log_info("main", "auto-generating keypair in %s", key_dir);
+            keyfile_generate(default_priv, pub_path);
+        }
+        privkey_file = default_priv;
+    }
+    if (!peerkey_file) {
+        char peer_dir[520], default_peer[520];
+        snprintf(peer_dir, sizeof(peer_dir), "%s/peers", key_dir);
+        mkdir(peer_dir, 0700);
+        snprintf(default_peer, sizeof(default_peer), "%s/peers/%s.pub", key_dir, remote_host);
+        if (access(default_peer, F_OK) == 0) {
+            peerkey_file = default_peer;
+            log_info("main", "using peer key: %s", default_peer);
+        } else {
+            fprintf(stderr, "Error: peer key not found at %s\n", default_peer);
+            fprintf(stderr, "  Copy the peer's public.key to this path\n  Or use -Q <path>\n");
+            return 1;
+        }
+    }
+
+    if (keyfile_load_private(g_asym_priv, privkey_file) != 0) return 1;
+    if (keyfile_load_public(g_asym_peer, peerkey_file) != 0)   return 1;
+    log_info("main", "private: %s, peer: %s", privkey_file, peerkey_file);
 
     struct sigaction sa; memset(&sa, 0, sizeof(sa));
     sa.sa_handler = sig_handler; sigemptyset(&sa.sa_mask); sa.sa_flags = SA_RESTART;
