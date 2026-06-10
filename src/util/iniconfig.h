@@ -19,7 +19,7 @@
  *
  * Usage:
  *   iniconf_t cfg;
- *   iniconf_load(&cfg, "/etc/aegis/wg0.conf");
+ *   iniconf_load(&cfg, "/etc/aegis/aegis.conf");
  *   const char *key = iniconf_get(&cfg, "Interface", "Address");
  *   iniconf_free(&cfg);
  */
