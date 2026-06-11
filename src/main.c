@@ -162,9 +162,9 @@ static int cmd_keygen(void) {
     FILE *f = fopen(pub, "r");
     if (f) { fread(hex, 1, 64, f); hex[64] = '\0'; fclose(f); printf("%s\n", hex); }
 
-    /* Generate default config file */
+    /* Generate default config file in project root */
     char cfg[520];
-    snprintf(cfg, sizeof(cfg), "%s/aegis.conf", dir);
+    snprintf(cfg, sizeof(cfg), "aegis.conf");
     if (access(cfg, F_OK) != 0) {
         FILE *cf = fopen(cfg, "w");
         if (cf) {
@@ -224,8 +224,11 @@ static int cmd_peer_add(const char *host, const char *hex_or_file) {
     }
     printf("Peer '%s' added.\n", host);
 
-    /* Also update config file if it exists */
-    char cfg[520]; snprintf(cfg, sizeof(cfg), "%s/aegis.conf", dir);
+    /* Also update config file if it exists (check cwd, then ~/.aegis-tunnel/) */
+    char cfg[520];
+    snprintf(cfg, sizeof(cfg), "aegis.conf");
+    if (access(cfg, F_OK) != 0)
+        snprintf(cfg, sizeof(cfg), "%s/aegis.conf", dir);
     if (access(cfg, F_OK) == 0) {
         /* Read config, replace PublicKey line */
         FILE *in = fopen(cfg, "r");
@@ -389,6 +392,10 @@ int main(int argc, char **argv) {
         default:  usage(argv[0]); return 1;
         }
     }
+
+    /* ── Auto-detect config file if not specified ── */
+    if (!config_file && access("aegis.conf", F_OK) == 0)
+        config_file = "aegis.conf";
 
     /* ── Load config file (INI format, WireGuard-style) ── */
     if (config_file) {
