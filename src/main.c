@@ -301,8 +301,8 @@ static int cmd_status(void) {
     cmd_peer_list();
     return 0;
 }
-static int cmd_tun_down(void) {
-    const char *name = "tun0";
+static int cmd_tun_down(const char *name) {
+    if (!name) name = "tun0";
     /* Restore default route */
     system("ip route del 0.0.0.0/1 2>/dev/null");
     system("ip route del 128.0.0.0/1 2>/dev/null");
@@ -326,7 +326,7 @@ int main(int argc, char **argv) {
         if (!strcmp(argv[1], "keygen"))    return cmd_keygen();
         if (!strcmp(argv[1], "status"))    return cmd_status();
         if (!strcmp(argv[1], "tun") && argc >= 3 && !strcmp(argv[2], "down"))
-                                           return cmd_tun_down();
+                                           return cmd_tun_down(argc >= 4 ? argv[3] : "tun0");
         if (!strcmp(argv[1], "peer") && argc >= 3) {
             if (!strcmp(argv[2], "list"))  return cmd_peer_list();
             if (!strcmp(argv[2], "add") && argc >= 5) return cmd_peer_add(argv[3], argv[4]);
