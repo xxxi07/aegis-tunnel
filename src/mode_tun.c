@@ -78,7 +78,7 @@ int mode_tun_server(int listen_port,
             close(listen_fd); signal(SIGCHLD, SIG_DFL);
 
             session_keys_t keys;
-            if (handshake_server(client_fd, g_asym_priv, g_asym_peer, hs_timeout, &keys) != 0)
+            if (handshake_server(client_fd, g_asym_priv, g_asym_peers[0], hs_timeout, &keys) != 0)
                 { log_warn("tun-server", "handshake failed"); close(client_fd); _exit(1); }
 
             tunnel_t tun; tunnel_init(&tun, tun_fd, client_fd, keys.enc_key, keys.dec_key);
@@ -129,7 +129,7 @@ int mode_tun_client(int listen_port, const char *remote_host, int remote_port,
              remote_host, remote_port, tun_route ? tun_route : "(none)");
 
     session_keys_t keys;
-    if (handshake_client(tunnel_fd, g_asym_priv, g_asym_peer, hs_timeout, &keys) != 0)
+    if (handshake_client(tunnel_fd, g_asym_priv, g_asym_peers[0], hs_timeout, &keys) != 0)
         { log_warn("tun-client", "handshake failed"); close(tunnel_fd); close(tun_fd); return 1; }
 
     tunnel_t tun; tunnel_init(&tun, tun_fd, tunnel_fd, keys.enc_key, keys.dec_key);

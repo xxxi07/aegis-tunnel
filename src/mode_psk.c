@@ -43,7 +43,7 @@ int mode_psk_server(int listen_port, const char *remote_host, int remote_port,
             close(listen_fd); signal(SIGCHLD, SIG_DFL);
 
             session_keys_t keys;
-            if (handshake_server(client_fd, g_asym_priv, g_asym_peer, hs_timeout, &keys) != 0)
+            if (handshake_server(client_fd, g_asym_priv, g_asym_peers[0], hs_timeout, &keys) != 0)
                 { log_warn("server", "handshake failed"); close(client_fd); _exit(1); }
             if (handshake_key_confirm_server(client_fd, &keys, hs_timeout) != 0)
                 { secure_memzero(&keys, sizeof(keys)); close(client_fd); _exit(1); }
@@ -85,7 +85,7 @@ int mode_psk_client(int listen_port, const char *remote_host, int remote_port,
         set_socket_timeout(tunnel_fd, hs_timeout);
 
         session_keys_t keys;
-        if (handshake_client(tunnel_fd, g_asym_priv, g_asym_peer, hs_timeout, &keys) != 0)
+        if (handshake_client(tunnel_fd, g_asym_priv, g_asym_peers[0], hs_timeout, &keys) != 0)
             { log_warn("client", "handshake failed"); close(local_fd); close(tunnel_fd); continue; }
         if (handshake_key_confirm_client(tunnel_fd, &keys, hs_timeout) != 0)
             { secure_memzero(&keys, sizeof(keys)); close(local_fd); close(tunnel_fd); continue; }

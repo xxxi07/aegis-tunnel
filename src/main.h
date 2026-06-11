@@ -13,9 +13,12 @@
 extern volatile sig_atomic_t g_running;
 extern volatile sig_atomic_t g_active_conns;
 extern int  g_max_conns;
+#define MAX_PEERS 16
+
 extern int  g_asym_mode;
 extern uint8_t g_asym_priv[32];
-extern uint8_t g_asym_peer[32];
+extern uint8_t g_asym_peers[MAX_PEERS][32];
+extern int  g_peer_count;
 
 /* ── Utility ── */
 int  read_psk_file(uint8_t *psk, size_t max_len, const char *path);

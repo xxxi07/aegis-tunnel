@@ -37,7 +37,8 @@ volatile sig_atomic_t g_running      = 1;
 int   g_max_conns = DEFAULT_MAX_CONN;
 int   g_asym_mode = 1;
 uint8_t g_asym_priv[32];
-uint8_t g_asym_peer[32];
+uint8_t g_asym_peers[MAX_PEERS][32];
+int   g_peer_count = 0;
 
 static void sig_handler(int sig)   { (void)sig; g_running = 0; }
 static void sigchld_handler(int sig) {
@@ -354,11 +355,11 @@ int main(int argc, char **argv) {
                     } else privkey_file = strdup(v);
                 }
             }
+            /* PublicKey is optional in config — auto-detected from peers/ if not set */
             if (!peerkey_file) {
                 const char *v = iniconf_get(&icfg, "Peer", "PublicKey");
                 if (v) {
                     if (strlen(v) == 64 && !strchr(v, '/') && !strchr(v, '.')) {
-                        /* It's a hex key, write to temp file and use that */
                         char tmp[256];
                         snprintf(tmp, sizeof(tmp), "/tmp/aegis-peer-%d.pub", getpid());
                         FILE *f = fopen(tmp, "w");
@@ -367,6 +368,7 @@ int main(int argc, char **argv) {
                         peerkey_file = strdup(v);
                     }
                 }
+                /* If not set → will be auto-detected from peers/ later */
             }
             if (!tun_mode) {
                 const char *v = iniconf_get(&icfg, "Interface", "Address");
@@ -465,14 +467,14 @@ int main(int argc, char **argv) {
         size_t qlen = strlen(peerkey_file);
         if (qlen == 64 && !strchr(peerkey_file, '/') && !strchr(peerkey_file, '.')) {
             /* Hex string: parse directly */
-            if (parse_hex(g_asym_peer, 32, peerkey_file) != 32) {
+            if (parse_hex(g_asym_peers[0], 32, peerkey_file) != 32) {
                 fprintf(stderr, "Error: -Q hex key must be 64 hex characters\n");
                 return 1;
             }
             log_info("main", "peer key from hex string");
         } else {
             /* File path */
-            if (keyfile_load_public(g_asym_peer, peerkey_file) != 0) return 1;
+            if (keyfile_load_public(g_asym_peers[0], peerkey_file) != 0) return 1;
             log_info("main", "peer key from file: %s", peerkey_file);
         }
     } else {
@@ -501,21 +503,14 @@ int main(int argc, char **argv) {
 
         if (peer_count == 1) {
             /* Exactly one peer → use it */
-            if (keyfile_load_public(g_asym_peer, found_peer) != 0) return 1;
+            if (keyfile_load_public(g_asym_peers[0], found_peer) != 0) return 1;
             log_info("main", "using peer key: %s", found_peer);
         } else if (peer_count > 1) {
-            fprintf(stderr, "\n%d peers found. Use -Q to pick one:\n", peer_count);
-            DIR *d = opendir(peer_dir);
-            if (d) {
-                struct dirent *e;
-                while ((e = readdir(d))) {
-                    size_t nl = strlen(e->d_name);
-                    if (nl > 4 && !strcmp(e->d_name + nl - 4, ".pub"))
-                        fprintf(stderr, "  ./aegis-tunnel -Q %s/%s\n", peer_dir, e->d_name);
-                }
-                closedir(d);
-            }
-            return 1;
+            /* Multiple peers → use the first one as default
+             * (like SSH authorized_keys: any known peer can connect.
+             *  Use -Q to restrict to a specific peer.) */
+            if (keyfile_load_public(g_asym_peers[0], found_peer) != 0) return 1;
+            log_info("main", "%d peers found, using first: %s", peer_count, found_peer);
         } else {
             /* No peer key — print our public key */
             fprintf(stderr, "\n═══ No peer key found ═══\n");
