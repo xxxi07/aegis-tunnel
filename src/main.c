@@ -330,7 +330,14 @@ int main(int argc, char **argv) {
                 listen_port = iniconf_get_int(&icfg, "Interface", "Port", listen_port);
             if (!remote_str) {
                 const char *v = iniconf_get(&icfg, "Peer", "Endpoint");
-                if (v) remote_str = strdup(v);
+                if (v) {
+                    /* In server mode, Endpoint can be 0.0.0.0:0 (meaning no forwarding) */
+                    if (strcmp(v, "0.0.0.0:0") == 0) {
+                        remote_str = NULL; /* TUN server, no backend */
+                    } else {
+                        remote_str = strdup(v);
+                    }
+                }
             }
             if (!strcmp(mode, "server")) {
                 const char *v = iniconf_get(&icfg, "Interface", "Mode");
@@ -420,7 +427,9 @@ int main(int argc, char **argv) {
         }
     }
 
-    if (listen_port <= 0 || !remote_str) { fprintf(stderr, "Error: -r <host:port> is required\n"); usage(argv[0]); return 1; }
+    if (listen_port <= 0) { fprintf(stderr, "Error: invalid port\n"); return 1; }
+    if (!remote_str && !tun_mode && strcmp(mode, "server")) {
+        fprintf(stderr, "Error: -r <host:port> is required\n"); usage(argv[0]); return 1; }
     if (strcmp(mode,"server") && strcmp(mode,"client")) { fprintf(stderr, "Error: mode must be server or client\n"); return 1; }
 
 
