@@ -149,17 +149,47 @@ static int cmd_keygen(void) {
     const char *home = getenv("HOME"); if (!home) home = "/tmp";
     char dir[512]; snprintf(dir, sizeof(dir), "%s/.aegis-tunnel", home);
     mkdir(dir, 0700);
+
+    /* Generate keypair */
     char priv[520], pub[520];
     snprintf(priv, sizeof(priv), "%s/private.key", dir);
     snprintf(pub, sizeof(pub), "%s/public.key", dir);
     if (keyfile_generate(priv, pub) != 0) return 1;
-    printf("Keys generated in %s\n", dir);
+
+    /* Show public key */
     printf("Public key (send to peer):\n  ");
     char hex[65];
     FILE *f = fopen(pub, "r");
     if (f) { fread(hex, 1, 64, f); hex[64] = '\0'; fclose(f); printf("%s\n", hex); }
+
+    /* Generate default config file */
+    char cfg[520];
+    snprintf(cfg, sizeof(cfg), "%s/aegis.conf", dir);
+    if (access(cfg, F_OK) != 0) {
+        FILE *cf = fopen(cfg, "w");
+        if (cf) {
+            fprintf(cf,
+                "# AEGIS-Tunnel config (auto-generated)\n"
+                "# Edit Address and NATInterface for TUN mode\n\n"
+                "[Interface]\n"
+                "PrivateKey = %s\n"
+                "Port = 9000\n"
+                "Mode = server\n\n"
+                "[Peer]\n"
+                "# PublicKey = <peer-key-hex>     ← run: aegis-tunnel peer add <name> <hex>\n"
+                "Endpoint = 0.0.0.0:0\n"
+                "AllowedIPs = 0.0.0.0/0\n\n"
+                "[Tunnel]\n"
+                "Keepalive = 30\n"
+                "NATInterface = eth0\n",
+                priv);
+            fclose(cf);
+            printf("Config: %s\n", cfg);
+        }
+    }
+
     printf("\nNext: get peer's public key, then:\n");
-    printf("  aegis-tunnel peer add <hostname> <peer-hex-key>\n");
+    printf("  aegis-tunnel peer add <name> <peer-hex-key>\n");
     return 0;
 }
 static int cmd_peer_add(const char *host, const char *hex_or_file) {
@@ -193,6 +223,44 @@ static int cmd_peer_add(const char *host, const char *hex_or_file) {
         fclose(f);
     }
     printf("Peer '%s' added.\n", host);
+
+    /* Also update config file if it exists */
+    char cfg[520]; snprintf(cfg, sizeof(cfg), "%s/aegis.conf", dir);
+    if (access(cfg, F_OK) == 0) {
+        /* Read config, replace PublicKey line */
+        FILE *in = fopen(cfg, "r");
+        char tmp[520]; snprintf(tmp, sizeof(tmp), "%s/aegis.conf.tmp", dir);
+        FILE *out = fopen(tmp, "w");
+        if (in && out) {
+            char line[512];
+            while (fgets(line, sizeof(line), in)) {
+                if (strstr(line, "PublicKey") && strstr(line, "=")) {
+                    /* Read the actual hex from the peer file */
+                    char peerfile[520];
+                    snprintf(peerfile, sizeof(peerfile), "%s/%s.pub", peer_dir, host);
+                    FILE *pf = fopen(peerfile, "r");
+                    if (pf) {
+                        char hx[65]; size_t nr = fread(hx, 1, 64, pf);
+                        hx[nr] = '\0';
+                        /* Strip newline */
+                        for (int i = (int)nr-1; i >= 0 && (hx[i]=='\n'||hx[i]=='\r'); i--) hx[i]='\0';
+                        fprintf(out, "PublicKey = %s\n", hx);
+                        fclose(pf);
+                    } else {
+                        fputs(line, out); /* keep original */
+                    }
+                } else {
+                    fputs(line, out);
+                }
+            }
+            fclose(in); fclose(out);
+            rename(tmp, cfg);
+            printf("Config updated: %s\n", cfg);
+        } else {
+            if (in) fclose(in);
+            if (out) fclose(out);
+        }
+    }
     return 0;
 }
 static int cmd_peer_list(void) {
