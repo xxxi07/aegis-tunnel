@@ -19,7 +19,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-#define TUN_FWMARK  51820   /* WireGuard-compatible fwmark */
+#define TUN_FWMARK  51820
 
 static void tun_setup_routing(const char *name, const char *allowed_ips, const char *nat_if)
 {
@@ -27,6 +27,15 @@ static void tun_setup_routing(const char *name, const char *allowed_ips, const c
     tun_set_fwmark_rule(TUN_FWMARK);
     tun_set_nat(allowed_ips, nat_if);
     tun_allow_forward(name);
+}
+
+static int try_handshake_server(int fd, session_keys_t *keys, int timeout_ms)
+{
+    for (int i = 0; i < g_peer_count; i++) {
+        if (handshake_server(fd, g_asym_priv, g_asym_peers[i], timeout_ms, keys) == 0)
+            { log_info("tun-server", "peer #%d authenticated", i); return 0; }
+    }
+    return -1;
 }
 
 /* ─── TUN Server ──────────────────────────────────────────────── */
@@ -44,7 +53,6 @@ int mode_tun_server(int listen_port,
     if (tun_ip && tun_ip[0]) tun_set_ip(name, tun_ip, tun_netmask);
     tun_up(name);
 
-    /* Routing: full-tunnel (0.0.0.0/0) or subnet route */
     if (tun_route && tun_route[0]) {
         if (strcmp(tun_route, "0.0.0.0/0") == 0 || strcmp(tun_route, "::/0") == 0)
             tun_add_full_tunnel(name);
@@ -56,9 +64,9 @@ int mode_tun_server(int listen_port,
     int listen_fd = listen_on_port(listen_port);
     if (listen_fd < 0) { close(tun_fd); return 1; }
 
-    log_info("tun-server", "%s (%s/%s) listening on :%d route=%s",
+    log_info("tun-server", "%s (%s/%s) :%d route=%s peers=%d",
              name, tun_ip && tun_ip[0] ? tun_ip : "dhcp", tun_netmask,
-             listen_port, tun_route ? tun_route : "10.0.0.0/24");
+             listen_port, tun_route ? tun_route : "10.0.0.0/24", g_peer_count);
 
     while (g_running) {
         struct sockaddr_in ca; socklen_t al = sizeof(ca);
@@ -66,7 +74,6 @@ int mode_tun_server(int listen_port,
         if (client_fd < 0) { if (errno == EINTR) continue; break; }
         if (g_active_conns >= g_max_conns) { close(client_fd); continue; }
 
-        /* Mark tunnel socket to bypass TUN routing */
         tun_set_fwmark(client_fd, TUN_FWMARK);
 
         char ip[INET_ADDRSTRLEN]; inet_ntop(AF_INET, &ca.sin_addr, ip, sizeof(ip));
@@ -78,8 +85,10 @@ int mode_tun_server(int listen_port,
             close(listen_fd); signal(SIGCHLD, SIG_DFL);
 
             session_keys_t keys;
-            if (handshake_server(client_fd, g_asym_priv, g_asym_peers[0], hs_timeout, &keys) != 0)
-                { log_warn("tun-server", "handshake failed"); close(client_fd); _exit(1); }
+            if (try_handshake_server(client_fd, &keys, hs_timeout) != 0)
+                { log_warn("tun-server", "handshake failed (tried %d peers)", g_peer_count); close(client_fd); _exit(1); }
+            if (handshake_key_confirm_server(client_fd, &keys, hs_timeout) != 0)
+                { secure_memzero(&keys, sizeof(keys)); close(client_fd); _exit(1); }
 
             tunnel_t tun; tunnel_init(&tun, tun_fd, client_fd, keys.enc_key, keys.dec_key);
             tun.keepalive_sec = keepalive; tun.rekey_sec = 120; tun.psk = psk; tun.psk_len = psk_len;
@@ -110,7 +119,6 @@ int mode_tun_client(int listen_port, const char *remote_host, int remote_port,
     if (tun_ip && tun_ip[0]) tun_set_ip(name, tun_ip, tun_netmask);
     tun_up(name);
 
-    /* Routing */
     if (tun_route && tun_route[0]) {
         if (strcmp(tun_route, "0.0.0.0/0") == 0 || strcmp(tun_route, "::/0") == 0)
             tun_add_full_tunnel(name);
@@ -121,7 +129,6 @@ int mode_tun_client(int listen_port, const char *remote_host, int remote_port,
     int tunnel_fd = connect_to_host(remote_host, remote_port);
     if (tunnel_fd < 0) { close(tun_fd); return 1; }
 
-    /* Mark tunnel socket to bypass TUN routing */
     tun_set_fwmark(tunnel_fd, TUN_FWMARK);
 
     log_info("tun-client", "%s (%s/%s) → %s:%d route=%s",
@@ -131,6 +138,8 @@ int mode_tun_client(int listen_port, const char *remote_host, int remote_port,
     session_keys_t keys;
     if (handshake_client(tunnel_fd, g_asym_priv, g_asym_peers[0], hs_timeout, &keys) != 0)
         { log_warn("tun-client", "handshake failed"); close(tunnel_fd); close(tun_fd); return 1; }
+    if (handshake_key_confirm_client(tunnel_fd, &keys, hs_timeout) != 0)
+        { secure_memzero(&keys, sizeof(keys)); close(tunnel_fd); close(tun_fd); return 1; }
 
     tunnel_t tun; tunnel_init(&tun, tun_fd, tunnel_fd, keys.enc_key, keys.dec_key);
     tun.keepalive_sec = keepalive; tun.rekey_sec = 120; tun.psk = psk; tun.psk_len = psk_len;

@@ -18,6 +18,28 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+/*
+ * Try handshake with each known peer key.  Returns 0 on success
+ * (keys filled), -1 if no peer key works.
+ * Like SSH authorized_keys: any known peer can connect.
+ */
+static int try_handshake_server(int fd, session_keys_t *keys, int timeout_ms)
+{
+    for (int i = 0; i < g_peer_count; i++) {
+        if (handshake_server(fd, g_asym_priv, g_asym_peers[i], timeout_ms, keys) == 0) {
+            log_info("server", "peer #%d authenticated", i);
+            return 0;
+        }
+    }
+    return -1;
+}
+
+static int try_handshake_client(int fd, session_keys_t *keys, int timeout_ms)
+{
+    /* Client only knows one peer (the server) */
+    return handshake_client(fd, g_asym_priv, g_asym_peers[0], timeout_ms, keys);
+}
+
 /* ─── Server ──────────────────────────────────────────────────── */
 int mode_psk_server(int listen_port, const char *remote_host, int remote_port,
                     const uint8_t *psk, size_t psk_len, int hs_timeout, int keepalive)
@@ -25,7 +47,8 @@ int mode_psk_server(int listen_port, const char *remote_host, int remote_port,
     int listen_fd = listen_on_port(listen_port);
     if (listen_fd < 0) return 1;
 
-    log_info("server", "port %d → %s:%d (max %d)", listen_port, remote_host, remote_port, g_max_conns);
+    log_info("server", "port %d → %s:%d (max %d, %d peers)",
+             listen_port, remote_host, remote_port, g_max_conns, g_peer_count);
 
     while (g_running) {
         struct sockaddr_in ca; socklen_t al = sizeof(ca);
@@ -43,8 +66,8 @@ int mode_psk_server(int listen_port, const char *remote_host, int remote_port,
             close(listen_fd); signal(SIGCHLD, SIG_DFL);
 
             session_keys_t keys;
-            if (handshake_server(client_fd, g_asym_priv, g_asym_peers[0], hs_timeout, &keys) != 0)
-                { log_warn("server", "handshake failed"); close(client_fd); _exit(1); }
+            if (try_handshake_server(client_fd, &keys, hs_timeout) != 0)
+                { log_warn("server", "handshake failed (tried %d peers)", g_peer_count); close(client_fd); _exit(1); }
             if (handshake_key_confirm_server(client_fd, &keys, hs_timeout) != 0)
                 { secure_memzero(&keys, sizeof(keys)); close(client_fd); _exit(1); }
 
@@ -85,7 +108,7 @@ int mode_psk_client(int listen_port, const char *remote_host, int remote_port,
         set_socket_timeout(tunnel_fd, hs_timeout);
 
         session_keys_t keys;
-        if (handshake_client(tunnel_fd, g_asym_priv, g_asym_peers[0], hs_timeout, &keys) != 0)
+        if (try_handshake_client(tunnel_fd, &keys, hs_timeout) != 0)
             { log_warn("client", "handshake failed"); close(local_fd); close(tunnel_fd); continue; }
         if (handshake_key_confirm_client(tunnel_fd, &keys, hs_timeout) != 0)
             { secure_memzero(&keys, sizeof(keys)); close(local_fd); close(tunnel_fd); continue; }
