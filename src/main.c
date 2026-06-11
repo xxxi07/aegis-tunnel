@@ -172,7 +172,7 @@ static int cmd_keygen(void) {
                 "# AEGIS-Tunnel config (auto-generated)\n"
                 "# Edit Address and NATInterface for TUN mode\n\n"
                 "[Interface]\n"
-                "PrivateKey = %s\n"
+                "PrivateKey = ~/.aegis-tunnel/private.key\n"
                 "Port = 9000\n"
                 "Mode = server\n\n"
                 "[Peer]\n"
@@ -181,8 +181,7 @@ static int cmd_keygen(void) {
                 "AllowedIPs = 0.0.0.0/0\n\n"
                 "[Tunnel]\n"
                 "Keepalive = 30\n"
-                "NATInterface = eth0\n",
-                priv);
+                "NATInterface = eth0\n");
             fclose(cf);
             printf("Config: %s\n", cfg);
         }
