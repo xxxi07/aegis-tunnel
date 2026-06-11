@@ -467,18 +467,50 @@ int main(int argc, char **argv) {
             log_info("main", "peer key from file: %s", peerkey_file);
         }
     } else {
-        /* Try default peer path */
-        char peer_dir[520], default_peer[520];
+        /* Auto-detect peer key from ~/.aegis-tunnel/peers/ */
+        char peer_dir[520];
         snprintf(peer_dir, sizeof(peer_dir), "%s/peers", key_dir);
         mkdir(peer_dir, 0700);
-        snprintf(default_peer, sizeof(default_peer), "%s/peers/%s.pub", key_dir, remote_host);
-        if (access(default_peer, F_OK) == 0) {
-            if (keyfile_load_public(g_asym_peer, default_peer) != 0) return 1;
-            log_info("main", "using peer key: %s", default_peer);
+
+        /* Count .pub files in peers/ */
+        int peer_count = 0;
+        char found_peer[520] = "";
+        {
+            DIR *d = opendir(peer_dir);
+            if (d) {
+                struct dirent *e;
+                while ((e = readdir(d))) {
+                    size_t nl = strlen(e->d_name);
+                    if (nl > 4 && !strcmp(e->d_name + nl - 4, ".pub")) {
+                        peer_count++;
+                        snprintf(found_peer, sizeof(found_peer), "%s/%s", peer_dir, e->d_name);
+                    }
+                }
+                closedir(d);
+            }
+        }
+
+        if (peer_count == 1) {
+            /* Exactly one peer → use it */
+            if (keyfile_load_public(g_asym_peer, found_peer) != 0) return 1;
+            log_info("main", "using peer key: %s", found_peer);
+        } else if (peer_count > 1) {
+            fprintf(stderr, "\n%d peers found. Use -Q to pick one:\n", peer_count);
+            DIR *d = opendir(peer_dir);
+            if (d) {
+                struct dirent *e;
+                while ((e = readdir(d))) {
+                    size_t nl = strlen(e->d_name);
+                    if (nl > 4 && !strcmp(e->d_name + nl - 4, ".pub"))
+                        fprintf(stderr, "  ./aegis-tunnel -Q %s/%s\n", peer_dir, e->d_name);
+                }
+                closedir(d);
+            }
+            return 1;
         } else {
-            /* No peer key — print our public key and ask for theirs */
+            /* No peer key — print our public key */
             fprintf(stderr, "\n═══ No peer key found ═══\n");
-            fprintf(stderr, "Your public key (send this to peer):\n  ");
+            fprintf(stderr, "Your public key (send to peer):\n  ");
             {
                 char pub_path[520];
                 snprintf(pub_path, sizeof(pub_path), "%s/public.key", key_dir);
@@ -487,9 +519,9 @@ int main(int argc, char **argv) {
                     for (int i = 0; i < 32; i++) fprintf(stderr, "%02x", our_pub[i]);
                 }
             }
-            fprintf(stderr, "\n\nThen run again with peer's key:\n");
-            fprintf(stderr, "  %s -l %d -r %s -Q <peer-hex-key>\n",
-                    argv[0], listen_port, remote_str);
+            fprintf(stderr, "\n\nAdd peer's key, then run again:\n");
+            fprintf(stderr, "  aegis-tunnel peer add <name> <peer-hex-key>\n");
+            fprintf(stderr, "  %s -l %d -r %s\n", argv[0], listen_port, remote_str);
             return 1;
         }
     }
