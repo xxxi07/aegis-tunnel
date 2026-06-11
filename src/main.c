@@ -243,7 +243,6 @@ static int cmd_peer_add(const char *host, const char *hex_or_file) {
                 if (out) {
                     fprintf(out, "\n[Peer]\n");
                     fprintf(out, "PublicKey = %s\n", hx);
-                    fprintf(out, "Endpoint = 0.0.0.0:0\n");
                     fprintf(out, "AllowedIPs = 0.0.0.0/0\n");
                     fclose(out);
                     printf("Config updated: aegis.conf (+[Peer])\n");
