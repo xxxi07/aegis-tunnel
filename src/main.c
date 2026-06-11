@@ -162,29 +162,6 @@ static int cmd_keygen(void) {
     FILE *f = fopen(pub, "r");
     if (f) { fread(hex, 1, 64, f); hex[64] = '\0'; fclose(f); printf("%s\n", hex); }
 
-    /* Generate default config file in project root */
-    char cfg[520];
-    snprintf(cfg, sizeof(cfg), "aegis.conf");
-    if (access(cfg, F_OK) != 0) {
-        FILE *cf = fopen(cfg, "w");
-        if (cf) {
-            fprintf(cf,
-                "# AEGIS-Tunnel config (auto-generated)\n"
-                "# Edit Address and NATInterface for TUN mode\n\n"
-                "[Interface]\n"
-                "PrivateKey = ~/.aegis-tunnel/private.key\n"
-                "Port = 9000\n"
-                "Mode = server\n\n"
-                "# Run 'aegis-tunnel peer add <name> <hex>' to add peers\n"
-                "# Each peer automatically gets its own [Peer] section below\n\n"
-                "[Tunnel]\n"
-                "Keepalive = 30\n"
-                "NATInterface = eth0\n");
-            fclose(cf);
-            printf("Config: %s\n", cfg);
-        }
-    }
-
     printf("\nNext: get peer's public key, then:\n");
     printf("  aegis-tunnel peer add <name> <peer-hex-key>\n");
     return 0;
@@ -221,8 +198,28 @@ static int cmd_peer_add(const char *host, const char *hex_or_file) {
     }
     printf("Peer '%s' added.\n", host);
 
-    /* Update config file: append new [Peer] section (WireGuard-style) */
+    /* Update/create config file with new [Peer] section */
     {
+        char cfg[520]; snprintf(cfg, sizeof(cfg), "aegis.conf");
+        if (access(cfg, F_OK) != 0)
+            snprintf(cfg, sizeof(cfg), "%s/aegis.conf", dir);
+
+        /* Create config if it doesn't exist yet */
+        if (access(cfg, F_OK) != 0) {
+            FILE *cf = fopen(cfg, "w");
+            if (cf) {
+                fprintf(cf,
+                    "[Interface]\n"
+                    "PrivateKey = ~/.aegis-tunnel/private.key\n"
+                    "Port = 9000\n"
+                    "Mode = server\n\n"
+                    "[Tunnel]\n"
+                    "Keepalive = 30\n"
+                    "NATInterface = eth0\n");
+                fclose(cf);
+            }
+        }
+
         /* Get peer hex key */
         char peerfile[520], hx[65] = "";
         snprintf(peerfile, sizeof(peerfile), "%s/%s.pub", peer_dir, host);
@@ -231,11 +228,8 @@ static int cmd_peer_add(const char *host, const char *hex_or_file) {
                   for (int i=(int)nr-1; i>=0 && (hx[i]=='\n'||hx[i]=='\r'); i--) hx[i]='\0';
                   fclose(pf); }
 
-        char cfg[520]; snprintf(cfg, sizeof(cfg), "aegis.conf");
-        if (access(cfg, F_OK) != 0)
-            snprintf(cfg, sizeof(cfg), "%s/aegis.conf", dir);
-
-        if (access(cfg, F_OK) == 0 && hx[0]) {
+        /* cfg is already set to the right path from above */
+        if (hx[0]) {
             FILE *in = fopen(cfg, "r");
             int found = 0;
             if (in) {
