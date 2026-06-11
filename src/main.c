@@ -175,10 +175,8 @@ static int cmd_keygen(void) {
                 "PrivateKey = ~/.aegis-tunnel/private.key\n"
                 "Port = 9000\n"
                 "Mode = server\n\n"
-                "[Peer]\n"
-                "# PublicKey = <peer-key-hex>     ← run: aegis-tunnel peer add <name> <hex>\n"
-                "Endpoint = 0.0.0.0:0\n"
-                "AllowedIPs = 0.0.0.0/0\n\n"
+                "# Run 'aegis-tunnel peer add <name> <hex>' to add peers\n"
+                "# Each peer automatically gets its own [Peer] section below\n\n"
                 "[Tunnel]\n"
                 "Keepalive = 30\n"
                 "NATInterface = eth0\n");
@@ -223,44 +221,44 @@ static int cmd_peer_add(const char *host, const char *hex_or_file) {
     }
     printf("Peer '%s' added.\n", host);
 
-    /* Also update config file if it exists (check cwd, then ~/.aegis-tunnel/) */
-    char cfg[520];
-    snprintf(cfg, sizeof(cfg), "aegis.conf");
-    if (access(cfg, F_OK) != 0)
-        snprintf(cfg, sizeof(cfg), "%s/aegis.conf", dir);
-    if (access(cfg, F_OK) == 0) {
-        /* Read config, replace PublicKey line */
-        FILE *in = fopen(cfg, "r");
-        char tmp[520]; snprintf(tmp, sizeof(tmp), "%s/aegis.conf.tmp", dir);
-        FILE *out = fopen(tmp, "w");
-        if (in && out) {
-            char line[512];
-            while (fgets(line, sizeof(line), in)) {
-                if (strstr(line, "PublicKey") && strstr(line, "=")) {
-                    /* Read the actual hex from the peer file */
-                    char peerfile[520];
-                    snprintf(peerfile, sizeof(peerfile), "%s/%s.pub", peer_dir, host);
-                    FILE *pf = fopen(peerfile, "r");
-                    if (pf) {
-                        char hx[65]; size_t nr = fread(hx, 1, 64, pf);
-                        hx[nr] = '\0';
-                        /* Strip newline */
-                        for (int i = (int)nr-1; i >= 0 && (hx[i]=='\n'||hx[i]=='\r'); i--) hx[i]='\0';
-                        fprintf(out, "PublicKey = %s\n", hx);
-                        fclose(pf);
-                    } else {
-                        fputs(line, out); /* keep original */
-                    }
-                } else {
-                    fputs(line, out);
-                }
+    /* Update config file: append new [Peer] section (WireGuard-style) */
+    {
+        /* Get peer hex key */
+        char peerfile[520], hx[65] = "";
+        snprintf(peerfile, sizeof(peerfile), "%s/%s.pub", peer_dir, host);
+        FILE *pf = fopen(peerfile, "r");
+        if (pf) { size_t nr = fread(hx, 1, 64, pf); hx[nr]='\0';
+                  for (int i=(int)nr-1; i>=0 && (hx[i]=='\n'||hx[i]=='\r'); i--) hx[i]='\0';
+                  fclose(pf); }
+
+        char cfg[520]; snprintf(cfg, sizeof(cfg), "aegis.conf");
+        if (access(cfg, F_OK) != 0)
+            snprintf(cfg, sizeof(cfg), "%s/aegis.conf", dir);
+
+        if (access(cfg, F_OK) == 0 && hx[0]) {
+            FILE *in = fopen(cfg, "r");
+            int found = 0;
+            if (in) {
+                /* Check if this hex already exists in any [Peer] */
+                char line[512];
+                while (fgets(line, sizeof(line), in))
+                    if (strstr(line, "PublicKey") && strstr(line, hx)) found = 1;
+                fclose(in);
             }
-            fclose(in); fclose(out);
-            rename(tmp, cfg);
-            printf("Config updated: %s\n", cfg);
-        } else {
-            if (in) fclose(in);
-            if (out) fclose(out);
+            if (!found) {
+                /* Append new [Peer] section */
+                FILE *out = fopen(cfg, "a");  /* append mode */
+                if (out) {
+                    fprintf(out, "\n[Peer]\n");
+                    fprintf(out, "PublicKey = %s\n", hx);
+                    fprintf(out, "Endpoint = 0.0.0.0:0\n");
+                    fprintf(out, "AllowedIPs = 0.0.0.0/0\n");
+                    fclose(out);
+                    printf("Config updated: aegis.conf (+[Peer])\n");
+                }
+            } else {
+                printf("Already in config\n");
+            }
         }
     }
     return 0;
