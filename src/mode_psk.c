@@ -95,7 +95,7 @@ int mode_psk_client(int listen_port, const char *remote_host, int remote_port,
     int listen_fd = listen_on_port(listen_port);
     if (listen_fd < 0) return 1;
 
-    log_info("client", "port %d → %s:%d", listen_port, remote_host, remote_port);
+    log_info("client", "port %d → %s:%d (auto-reconnect)", listen_port, remote_host, remote_port);
 
     while (g_running) {
         struct sockaddr_in la; socklen_t al = sizeof(la);
@@ -103,25 +103,46 @@ int mode_psk_client(int listen_port, const char *remote_host, int remote_port,
         if (local_fd < 0) { if (errno == EINTR) continue; perror("accept"); continue; }
         if (g_active_conns >= g_max_conns) { close(local_fd); continue; }
 
-        int tunnel_fd = connect_to_host(remote_host, remote_port);
-        if (tunnel_fd < 0) { close(local_fd); continue; }
-        set_socket_timeout(tunnel_fd, hs_timeout);
-
-        session_keys_t keys;
-        if (try_handshake_client(tunnel_fd, &keys, hs_timeout) != 0)
-            { log_warn("client", "handshake failed"); close(local_fd); close(tunnel_fd); continue; }
-        if (handshake_key_confirm_client(tunnel_fd, &keys, hs_timeout) != 0)
-            { secure_memzero(&keys, sizeof(keys)); close(local_fd); close(tunnel_fd); continue; }
-
-        tunnel_t tun; tunnel_init(&tun, local_fd, tunnel_fd, keys.enc_key, keys.dec_key);
-        tun.keepalive_sec = keepalive; tun.rekey_sec = 120; tun.psk = psk; tun.psk_len = psk_len;
-
         g_active_conns++;
-        int r = tunnel_run(&tun);
+
+        /* Reconnect loop: if tunnel drops, retry with exponential backoff */
+        int retry_delay = 0;
+        while (g_running) {
+            int tunnel_fd = connect_to_host(remote_host, remote_port);
+            if (tunnel_fd < 0) {
+                if (retry_delay == 0) log_error("client", "cannot connect to %s:%d", remote_host, remote_port);
+                goto retry;
+            }
+            set_socket_timeout(tunnel_fd, hs_timeout);
+
+            session_keys_t keys;
+            if (try_handshake_client(tunnel_fd, &keys, hs_timeout) == 0 &&
+                handshake_key_confirm_client(tunnel_fd, &keys, hs_timeout) == 0) {
+
+                tunnel_t tun; tunnel_init(&tun, local_fd, tunnel_fd, keys.enc_key, keys.dec_key);
+                tun.keepalive_sec = keepalive; tun.rekey_sec = 120; tun.psk = psk; tun.psk_len = psk_len;
+
+                retry_delay = 0;  /* reset on success */
+                int r = tunnel_run(&tun);
+                secure_memzero(&keys, sizeof(keys));
+                close(tunnel_fd);
+                if (r == 0) break;  /* clean shutdown */
+                log_warn("client", "tunnel dropped, reconnecting...");
+            } else {
+                log_warn("client", "handshake failed");
+                close(tunnel_fd);
+            }
+
+        retry:
+            if (!g_running) break;
+            if (retry_delay == 0) retry_delay = 1;
+            else if (retry_delay < 30) retry_delay *= 2;
+            log_info("client", "retry in %ds...", retry_delay);
+            sleep((unsigned)retry_delay);
+        }
+
         g_active_conns--;
-        secure_memzero(&keys, sizeof(keys));
-        close(local_fd); close(tunnel_fd);
-        if (r != 0) log_error("client", "tunnel error");
+        close(local_fd);
     }
     close(listen_fd);
     return 0;

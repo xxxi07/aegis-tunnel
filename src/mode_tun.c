@@ -126,26 +126,44 @@ int mode_tun_client(int listen_port, const char *remote_host, int remote_port,
             tun_add_route(tun_route, name);
     }
 
-    int tunnel_fd = connect_to_host(remote_host, remote_port);
-    if (tunnel_fd < 0) { close(tun_fd); return 1; }
-
-    tun_set_fwmark(tunnel_fd, TUN_FWMARK);
-
-    log_info("tun-client", "%s (%s/%s) → %s:%d route=%s",
+    log_info("tun-client", "%s (%s/%s) → %s:%d route=%s (auto-reconnect)",
              name, tun_ip && tun_ip[0] ? tun_ip : "dhcp", tun_netmask,
              remote_host, remote_port, tun_route ? tun_route : "(none)");
 
-    session_keys_t keys;
-    if (handshake_client(tunnel_fd, g_asym_priv, g_asym_peers[0], hs_timeout, &keys) != 0)
-        { log_warn("tun-client", "handshake failed"); close(tunnel_fd); close(tun_fd); return 1; }
-    if (handshake_key_confirm_client(tunnel_fd, &keys, hs_timeout) != 0)
-        { secure_memzero(&keys, sizeof(keys)); close(tunnel_fd); close(tun_fd); return 1; }
+    /* Reconnect loop */
+    int retry_delay = 0;
+    while (g_running) {
+        int tunnel_fd = connect_to_host(remote_host, remote_port);
+        if (tunnel_fd < 0) { if (retry_delay == 0) log_error("tun-client", "cannot connect"); goto retry; }
 
-    tunnel_t tun; tunnel_init(&tun, tun_fd, tunnel_fd, keys.enc_key, keys.dec_key);
-    tun.keepalive_sec = keepalive; tun.rekey_sec = 120; tun.psk = psk; tun.psk_len = psk_len;
+        tun_set_fwmark(tunnel_fd, TUN_FWMARK);
 
-    int r = tunnel_run(&tun);
-    secure_memzero(&keys, sizeof(keys));
-    close(tunnel_fd); close(tun_fd);
-    return r == 0 ? 0 : 1;
+        session_keys_t keys;
+        if (handshake_client(tunnel_fd, g_asym_priv, g_asym_peers[0], hs_timeout, &keys) == 0 &&
+            handshake_key_confirm_client(tunnel_fd, &keys, hs_timeout) == 0) {
+
+            tunnel_t tun; tunnel_init(&tun, tun_fd, tunnel_fd, keys.enc_key, keys.dec_key);
+            tun.keepalive_sec = keepalive; tun.rekey_sec = 120; tun.psk = psk; tun.psk_len = psk_len;
+
+            retry_delay = 0;
+            int r = tunnel_run(&tun);
+            secure_memzero(&keys, sizeof(keys));
+            close(tunnel_fd);
+            if (r == 0) break;
+            log_warn("tun-client", "tunnel dropped, reconnecting...");
+        } else {
+            log_warn("tun-client", "handshake failed");
+            close(tunnel_fd);
+        }
+
+    retry:
+        if (!g_running) break;
+        if (retry_delay == 0) retry_delay = 1;
+        else if (retry_delay < 30) retry_delay *= 2;
+        log_info("tun-client", "retry in %ds...", retry_delay);
+        sleep((unsigned)retry_delay);
+    }
+
+    close(tun_fd);
+    return 0;
 }
