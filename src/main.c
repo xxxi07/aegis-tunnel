@@ -198,11 +198,9 @@ static int cmd_peer_add(const char *host, const char *hex_or_file) {
     }
     printf("Peer '%s' added.\n", host);
 
-    /* Update/create config file with new [Peer] section */
+    /* Update/create config file in current directory */
     {
-        char cfg[520]; snprintf(cfg, sizeof(cfg), "aegis.conf");
-        if (access(cfg, F_OK) != 0)
-            snprintf(cfg, sizeof(cfg), "%s/aegis.conf", dir);
+        char cfg[520] = "aegis.conf";
 
         /* Create config if it doesn't exist yet */
         if (access(cfg, F_OK) != 0) {
