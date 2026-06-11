@@ -606,7 +606,7 @@ int main(int argc, char **argv) {
     }
 
     struct sigaction sa; memset(&sa, 0, sizeof(sa));
-    sa.sa_handler = sig_handler; sigemptyset(&sa.sa_mask); sa.sa_flags = SA_RESTART;
+    sa.sa_handler = sig_handler; sigemptyset(&sa.sa_mask); sa.sa_flags = 0;  /* no SA_RESTART: allow accept() to be interrupted */
     sigaction(SIGINT, &sa, NULL); sigaction(SIGTERM, &sa, NULL);
     sa.sa_handler = sigchld_handler; sa.sa_flags = SA_RESTART | SA_NOCLDSTOP;
     sigaction(SIGCHLD, &sa, NULL);
