@@ -24,3 +24,6 @@ Thumbs.db
 /tmp/
 *.tmp
 .claude/settings.local.json
+aegis.conf
+aegis-server.conf
+aegis-client.conf
