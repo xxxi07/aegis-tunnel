@@ -194,7 +194,6 @@ int mode_tun_client(int listen_port, const char *remote_host, int remote_port,
             tunnel_t tun; tunnel_init(&tun, tun_fd, tunnel_fd, keys.enc_key, keys.dec_key);
             tun.keepalive_sec = keepalive; tun.rekey_sec = 120; tun.psk = psk; tun.psk_len = psk_len;
 
-            retry_delay = 0;
             int r = tunnel_run(&tun);
             secure_memzero(&keys, sizeof(keys));
             close(tunnel_fd);
