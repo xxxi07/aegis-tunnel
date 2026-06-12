@@ -640,11 +640,15 @@ int main(int argc, char **argv) {
                 }
                 /* If not set → will be auto-detected from peers/ later */
             }
+            /* Parse AllowedIPs first (takes priority over Address auto-derive) */
+            if (!tun_route[0]) {
+                const char *v = iniconf_get(&icfg, "Peer", "AllowedIPs");
+                if (v) strncpy(tun_route, v, 63);
+            }
             if (!tun_ip[0]) {
                 const char *v = iniconf_get(&icfg, "Interface", "Address");
                 if (v) {
                     tun_mode = 1;
-                    /* Parse CIDR: 10.0.0.1/24 → IP + netmask */
                     char *slash = strchr((char *)v, '/');
                     if (slash) {
                         size_t ip_len = (size_t)(slash - v);
@@ -653,15 +657,14 @@ int main(int argc, char **argv) {
                         uint32_t nm = (px == 0) ? 0 : (~0u << (unsigned)(32 - px));
                         snprintf(tun_netmask, 31, "%u.%u.%u.%u",
                                  (nm>>24)&0xff, (nm>>16)&0xff, (nm>>8)&0xff, nm&0xff);
-                        /* Auto-route */
-                        char *dot = strrchr(tun_ip, '.');
-                        if (dot) { *dot = '\0'; snprintf(tun_route, 63, "%s.0/%d", tun_ip, px); *dot = '.'; }
+                        /* Auto-derive route only if AllowedIPs not already set */
+                        if (!tun_route[0]) {
+                            char *dot = strrchr(tun_ip, '.');
+                            if (dot) { *dot = '\0'; snprintf(tun_route, 63, "%s.0/%d", tun_ip, px); *dot = '.'; }
+                        }
                     }
                 }
             }
-            if (!tun_route[0]) {
-                const char *v = iniconf_get(&icfg, "Peer", "AllowedIPs");
-                if (v) strncpy(tun_route, v, 63);
             }
             /* PersistentKeepalive (client-side, in seconds) */
             if (keepalive == 0) {
