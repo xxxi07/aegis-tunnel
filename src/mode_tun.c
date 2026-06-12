@@ -176,19 +176,50 @@ int mode_tun_client(int listen_port, const char *remote_host, int remote_port,
     (void)is_full_tunnel;
     tun_run_postup(postup, name);
 
-    log_info("tun-client", "%s (%s/%s) → %s:%d route=%s (auto-reconnect)",
+    log_info("tun-client", "%s (%s/%s) route=%s peers=%d (auto-reconnect)",
              name, tun_ip && tun_ip[0] ? tun_ip : "dhcp", tun_netmask,
-             remote_host, remote_port, tun_route ? tun_route : "(none)");
+             tun_route ? tun_route : "(none)", g_peer_count > 0 ? g_peer_count : 1);
 
-    /* Reconnect loop */
+    /* Reconnect loop — try each configured peer in round-robin */
     int retry_delay = 0;
+    int peer_idx    = 0;
+    int use_single  = (remote_host && remote_host[0]) ? 1 : 0;  /* -r overrides multi-peer */
+    int peer_count  = (!use_single && g_peer_count > 0) ? g_peer_count : 1;
+
     while (g_running) {
-        int tunnel_fd = connect_to_host(remote_host, remote_port, TUN_FWMARK);
-        if (tunnel_fd < 0) { if (retry_delay == 0) log_error("tun-client", "cannot connect"); goto retry; }
+        const char *host; int port; int pi;
+
+        if (use_single) {
+            host = remote_host; port = remote_port; pi = 0;
+        } else if (g_peer_endpoints[peer_idx][0]) {
+            /* Parse endpoint from config; auto-append :9000 if no port */
+            char ep_buf[320];
+            snprintf(ep_buf, sizeof(ep_buf), "%s", g_peer_endpoints[peer_idx]);
+            if (!strrchr(ep_buf, ':')) {
+                size_t el = strlen(ep_buf);
+                snprintf(ep_buf + el, sizeof(ep_buf) - el, ":9000");
+            }
+            char *hp = NULL;
+            if (parse_host_port(ep_buf, &hp, &port) != 0) {
+                log_warn("tun-client", "bad endpoint for peer #%d", peer_idx);
+                peer_idx = (peer_idx + 1) % peer_count; continue;
+            }
+            host = hp; pi = peer_idx;
+        } else {
+            host = remote_host; port = remote_port; pi = 0;
+        }
+
+        log_info("tun-client", "trying peer #%d: %s:%d", pi, host, port);
+        int tunnel_fd = connect_to_host(host, port, TUN_FWMARK);
+        if (tunnel_fd < 0) {
+            if (retry_delay == 0) log_error("tun-client", "cannot connect");
+            peer_idx = (peer_idx + 1) % peer_count; goto retry;
+        }
 
         session_keys_t keys;
-        if (handshake_client(tunnel_fd, g_asym_priv, g_asym_peers[0], hs_timeout, &keys) == 0 &&
+        if (handshake_client(tunnel_fd, g_asym_priv, g_asym_peers[pi], hs_timeout, &keys) == 0 &&
             handshake_key_confirm_client(tunnel_fd, &keys, hs_timeout) == 0) {
+            log_info("tun-client", "peer #%d authenticated", pi);
 
             tunnel_t tun; tunnel_init(&tun, tun_fd, tunnel_fd, keys.enc_key, keys.dec_key);
             tun.keepalive_sec = keepalive; tun.rekey_sec = 0; tun.psk = NULL; tun.psk_len = 0;
@@ -199,8 +230,9 @@ int mode_tun_client(int listen_port, const char *remote_host, int remote_port,
             if (r == 0) break;
             log_warn("tun-client", "tunnel dropped, reconnecting...");
         } else {
-            log_warn("tun-client", "handshake failed");
+            log_warn("tun-client", "handshake failed with peer #%d", pi);
             close(tunnel_fd);
+            peer_idx = (peer_idx + 1) % peer_count;  /* try next peer on failure */
         }
 
     retry:

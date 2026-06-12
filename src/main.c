@@ -39,6 +39,7 @@ int   g_max_conns = DEFAULT_MAX_CONN;
 int   g_asym_mode = 1;
 uint8_t g_asym_priv[32];
 uint8_t g_asym_peers[MAX_PEERS][32];
+char   g_peer_endpoints[MAX_PEERS][256];
 int   g_peer_count = 0;
 
 static void sig_handler(int sig)   { (void)sig; g_running = 0; }
@@ -642,7 +643,7 @@ int main(int argc, char **argv) {
                     } else privkey_file = strdup(v);
                 }
             }
-            /* Load peer keys from config (iterate all [Peer] sections) */
+            /* Load peer keys + endpoints from config (iterate all [Peer] sections) */
             if (!peerkey_file) {
                 int pi = 0;
                 while (pi < MAX_PEERS) {
@@ -650,6 +651,13 @@ int main(int argc, char **argv) {
                     if (!v) break;
                     if (strlen(v) == 64) {
                         if (parse_hex(g_asym_peers[pi], 32, v) == 32) {
+                            const char *ep = iniconf_get_indexed(&icfg, "Peer", pi, "Endpoint");
+                            if (ep) {
+                                strncpy(g_peer_endpoints[pi], ep, 255);
+                                g_peer_endpoints[pi][255] = '\0';
+                            } else {
+                                g_peer_endpoints[pi][0] = '\0';
+                            }
                             g_peer_count = pi + 1;
                         }
                     }

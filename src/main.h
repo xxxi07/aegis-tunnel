@@ -18,6 +18,7 @@ extern int  g_max_conns;
 extern int  g_asym_mode;
 extern uint8_t g_asym_priv[32];
 extern uint8_t g_asym_peers[MAX_PEERS][32];
+extern char   g_peer_endpoints[MAX_PEERS][256];
 extern int  g_peer_count;
 
 /* ── Utility ── */
