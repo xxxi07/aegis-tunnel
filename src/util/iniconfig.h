@@ -51,8 +51,14 @@ typedef struct {
 /* Load INI config file. Returns 0 on success, -1 on error. */
 int  iniconf_load(iniconf_t *cfg, const char *path);
 
-/* Get value from section. Returns NULL if not found. */
+/* Get value from first matching section. Returns NULL if not found. */
 const char *iniconf_get(const iniconf_t *cfg, const char *section, const char *key);
+
+/* Get value from the n-th occurrence of a section (0-based index).
+ * Use when multiple same-named sections exist (e.g. [Peer] [Peer] ...).
+ * Returns NULL if section/key not found at that index. */
+const char *iniconf_get_indexed(const iniconf_t *cfg, const char *section,
+                                 int index, const char *key);
 
 /* Get integer value (returns default_val if not found). */
 int  iniconf_get_int(const iniconf_t *cfg, const char *section, const char *key, int default_val);

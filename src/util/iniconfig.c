@@ -79,6 +79,25 @@ const char *iniconf_get(const iniconf_t *cfg, const char *section, const char *k
     return NULL;
 }
 
+const char *iniconf_get_indexed(const iniconf_t *cfg, const char *section,
+                                 int index, const char *key)
+{
+    int nth = 0;
+    for (size_t s = 0; s < cfg->count; s++) {
+        if (strcasecmp(cfg->sections[s].name, section) == 0) {
+            if (nth == index) {
+                for (size_t i = 0; i < cfg->sections[s].count; i++) {
+                    if (strcasecmp(cfg->sections[s].entries[i].key, key) == 0)
+                        return cfg->sections[s].entries[i].value;
+                }
+                return NULL;
+            }
+            nth++;
+        }
+    }
+    return NULL;
+}
+
 int iniconf_get_int(const iniconf_t *cfg, const char *section, const char *key, int def)
 {
     const char *v = iniconf_get(cfg, section, key);

@@ -371,8 +371,6 @@ static int cmd_create_tun(int is_server) {
     const char *privkey  = iniconf_get(&icfg, "Interface", "PrivateKey");
     const char *pubkey   = iniconf_get(&icfg, "Interface", "PublicKey");
     const char *port     = iniconf_get(&icfg, "Interface", "Port");
-    const char *peer_pk  = iniconf_get(&icfg, "Peer", "PublicKey");
-    const char *endpoint = iniconf_get(&icfg, "Peer", "Endpoint");
     const char *nat_if   = iniconf_get(&icfg, "Tunnel", "NATInterface");
     const char *keepalive = iniconf_get(&icfg, "Tunnel", "Keepalive");
 
@@ -419,34 +417,52 @@ static int cmd_create_tun(int is_server) {
     }
     fprintf(out, "\n");
 
-    /* ── [Peer] ── */
-    fprintf(out, "[Peer]\n");
-    fprintf(out, "PublicKey = %s\n", peer_pk ? peer_pk : "<peer-public-key>");
+    /* ── [Peer] sections (iterate all peers from base config) ── */
+    {
+        int peer_idx = 0;
+        while (1) {
+            const char *pk = iniconf_get_indexed(&icfg, "Peer", peer_idx, "PublicKey");
+            if (!pk) break;
+            const char *ep = iniconf_get_indexed(&icfg, "Peer", peer_idx, "Endpoint");
 
-    if (is_server) {
-        /* Server: AllowedIPs defines which subnets the peer can access */
-        fprintf(out, "AllowedIPs = 10.0.0.0/24\n");
-        if (endpoint)
-            fprintf(out, "# Endpoint = %s\n", endpoint);
-    } else {
-        /* Client: Endpoint is the server's real address */
-        {
-            char ep_buf[320];
-            if (endpoint)
-                snprintf(ep_buf, sizeof(ep_buf), "%s", endpoint);
-            else
-                snprintf(ep_buf, sizeof(ep_buf), "server.com:9000");
-            /* Auto-append :9000 if no port specified */
-            if (!strrchr(ep_buf, ':')) {
-                size_t el = strlen(ep_buf);
-                snprintf(ep_buf + el, sizeof(ep_buf) - el, ":9000");
+            fprintf(out, "[Peer]\n");
+            fprintf(out, "PublicKey = %s\n", pk);
+
+            if (is_server) {
+                fprintf(out, "AllowedIPs = 10.0.0.0/24\n");
+                if (ep) fprintf(out, "# Endpoint = %s\n", ep);
+            } else {
+                /* Client: only first peer gets Endpoint */
+                if (peer_idx == 0) {
+                    char ep_buf[320];
+                    if (ep) snprintf(ep_buf, sizeof(ep_buf), "%s", ep);
+                    else    snprintf(ep_buf, sizeof(ep_buf), "server.com:9000");
+                    if (!strrchr(ep_buf, ':')) {
+                        size_t el = strlen(ep_buf);
+                        snprintf(ep_buf + el, sizeof(ep_buf) - el, ":9000");
+                    }
+                    fprintf(out, "Endpoint = %s\n", ep_buf);
+                }
+                fprintf(out, "AllowedIPs = 0.0.0.0/0\n");
+                fprintf(out, "PersistentKeepalive = %s\n", keepalive ? keepalive : "25");
             }
-            fprintf(out, "Endpoint = %s\n", ep_buf);
+            fprintf(out, "\n");
+            peer_idx++;
         }
-        fprintf(out, "AllowedIPs = 0.0.0.0/0\n");
-        fprintf(out, "PersistentKeepalive = %s\n", keepalive ? keepalive : "25");
+        if (peer_idx == 0) {
+            /* No peers in base config — fallback placeholder */
+            fprintf(out, "[Peer]\n");
+            fprintf(out, "PublicKey = <peer-public-key>\n");
+            if (is_server)
+                fprintf(out, "AllowedIPs = 10.0.0.0/24\n");
+            else {
+                fprintf(out, "Endpoint = server.com:9000\n");
+                fprintf(out, "AllowedIPs = 0.0.0.0/0\n");
+                fprintf(out, "PersistentKeepalive = %s\n", keepalive ? keepalive : "25");
+            }
+            fprintf(out, "\n");
+        }
     }
-    fprintf(out, "\n");
 
     /* ── [Tunnel] ── */
     fprintf(out, "[Tunnel]\n");
