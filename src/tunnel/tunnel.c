@@ -181,7 +181,8 @@ int tunnel_run(tunnel_t *tun)
     int64_t last_ka    = (int64_t)time(NULL);
     int64_t last_rekey = (int64_t)time(NULL);
 
-    while (tun->running) {
+    extern volatile sig_atomic_t g_running;
+    while (tun->running && g_running) {
         fds[0].fd = pt_fd;
         fds[0].events = POLLIN;
         fds[0].revents = 0;
