@@ -103,19 +103,23 @@ int tun_up(const char *name)
     return (ret == 0) ? 0 : -1;
 }
 
-/* ─── Add route ──────────────────────────────────────────────── */
+/* ─── Add route (to TUN routing table, not main) ──────────────── */
+
+#define TUN_ROUTE_TABLE  51820   /* same as fwmark */
 
 int tun_add_route(const char *network, const char *name)
 {
     char cmd[256];
+    /* Add to custom table so only unmarked packets traverse TUN */
     snprintf(cmd, sizeof(cmd),
-             "ip route add %s dev %s 2>/dev/null", network, name);
+             "ip route add %s dev %s table %d 2>/dev/null",
+             network, name, TUN_ROUTE_TABLE);
     int ret = system(cmd);
     if (ret != 0) {
-        /* Try without 'dev' keyword */
+        /* Try replacing if already exists */
         snprintf(cmd, sizeof(cmd),
-                 "ip route add %s via 0.0.0.0 dev %s 2>/dev/null",
-                 network, name);
+                 "ip route replace %s dev %s table %d 2>/dev/null",
+                 network, name, TUN_ROUTE_TABLE);
         ret = system(cmd);
     }
     return (ret == 0) ? 0 : -1;
@@ -136,22 +140,23 @@ int tun_set_fwmark(int fd, int mark)
 
 int tun_add_full_tunnel(const char *name)
 {
-    char cmd[128];
-    /* Two /1 routes cover the entire IPv4 space,
-     * taking priority over the existing default route. */
-    const char *routes[] = {"0.0.0.0/1", "128.0.0.0/1"};
-    for (int i = 0; i < 2; i++) {
-        snprintf(cmd, sizeof(cmd), "ip route add %s dev %s 2>/dev/null", routes[i], name);
+    char cmd[256];
+    /* Single 0.0.0.0/0 route in the TUN table.
+     * Only unmarked packets hit this table (see tun_set_fwmark_rule).
+     * The tunnel's own marked TCP packets use the main table → real NIC. */
+    snprintf(cmd, sizeof(cmd),
+             "ip route add 0.0.0.0/0 dev %s table %d 2>/dev/null",
+             name, TUN_ROUTE_TABLE);
+    if (system(cmd) != 0) {
+        snprintf(cmd, sizeof(cmd),
+                 "ip route replace 0.0.0.0/0 dev %s table %d 2>/dev/null",
+                 name, TUN_ROUTE_TABLE);
         if (system(cmd) != 0) {
-            /* Try replacing if already exists */
-            snprintf(cmd, sizeof(cmd), "ip route replace %s dev %s 2>/dev/null", routes[i], name);
-            if (system(cmd) != 0) {
-                fprintf(stderr, "tun: failed to add route %s dev %s\n", routes[i], name);
-                return -1;
-            }
+            fprintf(stderr, "tun: failed to add full tunnel route via %s\n", name);
+            return -1;
         }
     }
-    fprintf(stderr, "[tun] full tunnel: 0.0.0.0/0 → %s\n", name);
+    fprintf(stderr, "[tun] full tunnel: 0.0.0.0/0 → %s (table %d)\n", name, TUN_ROUTE_TABLE);
     return 0;
 }
 
@@ -159,14 +164,17 @@ int tun_add_full_tunnel(const char *name)
 
 int tun_set_fwmark_rule(int mark)
 {
-    char cmd[128];
-    /* Packets without fwmark go through main table (including TUN routes) */
-    snprintf(cmd, sizeof(cmd), "ip rule add not fwmark %d table main 2>/dev/null", mark);
+    char cmd[256];
+    /* Unmarked packets → TUN routing table (has VPN routes).
+     * Marked packets (tunnel's own TCP) → default main table → real NIC. */
+    snprintf(cmd, sizeof(cmd),
+             "ip rule add not fwmark %d table %d 2>/dev/null", mark, TUN_ROUTE_TABLE);
     system(cmd);
-    /* Packets with fwmark bypass the TUN routes */
-    snprintf(cmd, sizeof(cmd), "ip rule add fwmark %d table main 2>/dev/null", mark);
+    /* Clean up any old broken rule from previous versions */
+    snprintf(cmd, sizeof(cmd),
+             "ip rule del fwmark %d table main 2>/dev/null", mark);
     system(cmd);
-    fprintf(stderr, "[tun] fwmark %d: policy routing set\n", mark);
+    fprintf(stderr, "[tun] fwmark %d: unmarked→table %d, marked→main\n", mark, TUN_ROUTE_TABLE);
     return 0;
 }
 
