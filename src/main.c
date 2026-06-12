@@ -461,7 +461,7 @@ static int cmd_create_tun(int is_server) {
             fprintf(out, "PublicKey = %s\n", pk);
 
             if (is_server) {
-                fprintf(out, "AllowedIPs = 10.0.0.0/24\n");
+                fprintf(out, "AllowedIPs = 10.0.0.2/32\n");
                 if (ep) fprintf(out, "# Endpoint = %s\n", ep);
             } else {
                 /* Client: only first peer gets Endpoint */
@@ -486,7 +486,7 @@ static int cmd_create_tun(int is_server) {
             fprintf(out, "[Peer]\n");
             fprintf(out, "PublicKey = <peer-public-key>\n");
             if (is_server)
-                fprintf(out, "AllowedIPs = 10.0.0.0/24\n");
+                fprintf(out, "AllowedIPs = 10.0.0.2/32\n");
             else {
                 fprintf(out, "Endpoint = server.com:9000\n");
                 fprintf(out, "AllowedIPs = 0.0.0.0/0\n");
