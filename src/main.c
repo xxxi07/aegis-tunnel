@@ -18,6 +18,7 @@
 #include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <pwd.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -44,6 +45,18 @@ static void sig_handler(int sig)   { (void)sig; g_running = 0; }
 static void sigchld_handler(int sig) {
     (void)sig;
     while (waitpid(-1, NULL, WNOHANG) > 0) g_active_conns--;
+}
+
+/* Get real user's home directory, even when running under sudo. */
+static const char *get_real_home(void)
+{
+    const char *sudo_user = getenv("SUDO_USER");
+    if (sudo_user && sudo_user[0]) {
+        struct passwd *pw = getpwnam(sudo_user);
+        if (pw && pw->pw_dir) return pw->pw_dir;
+    }
+    const char *home = getenv("HOME");
+    return home ? home : "/tmp";
 }
 
 int read_psk_file(uint8_t *psk, size_t max_len, const char *path) {
@@ -138,7 +151,7 @@ static void usage(const char *prog) {
 
 /* ─── Subcommands ─────────────────────────────────────────────── */
 static int cmd_keygen(void) {
-    const char *home = getenv("HOME"); if (!home) home = "/tmp";
+    const char *home = get_real_home();
     char dir[512]; snprintf(dir, sizeof(dir), "%s/.aegis-tunnel", home);
     mkdir(dir, 0700);
 
@@ -154,16 +167,19 @@ static int cmd_keygen(void) {
     FILE *f = fopen(pub, "r");
     if (f) { size_t nr = fread(hex, 1, 64, f); hex[nr] = '\0'; fclose(f); printf("%s\n", hex); }
 
-    /* Generate base aegis.conf if it doesn't exist */
-    if (access("aegis.conf", F_OK) != 0) {
+    /* Clear old config files and regenerate aegis.conf */
+    unlink("aegis.conf");
+    unlink("aegis-server.conf");
+    unlink("aegis-client.conf");
+
+    {
         FILE *cf = fopen("aegis.conf", "w");
         if (cf) {
             fprintf(cf,
                 "[Interface]\n"
                 "PrivateKey = ~/.aegis-tunnel/private.key\n"
                 "PublicKey = %s\n"
-                "Port = 9000\n"
-                "Mode = server\n\n"
+                "Port = 9000\n\n"
                 "[Tunnel]\n"
                 "Keepalive = 30\n"
                 "NATInterface = eth0\n",
@@ -178,7 +194,7 @@ static int cmd_keygen(void) {
     return 0;
 }
 static int cmd_peer_add(const char *host, const char *hex_or_file) {
-    const char *home = getenv("HOME"); if (!home) home = "/tmp";
+    const char *home = get_real_home();
     char dir[520], peer_dir[520], path[520];
     snprintf(dir, sizeof(dir), "%s/.aegis-tunnel", home);
     snprintf(peer_dir, sizeof(peer_dir), "%s/peers", dir);
@@ -229,8 +245,7 @@ static int cmd_peer_add(const char *host, const char *hex_or_file) {
                     "[Interface]\n"
                     "PrivateKey = ~/.aegis-tunnel/private.key\n"
                     "PublicKey = %s\n"
-                    "Port = 9000\n"
-                    "Mode = server\n\n"
+                    "Port = 9000\n\n"
                     "[Tunnel]\n"
                     "Keepalive = 30\n"
                     "NATInterface = eth0\n",
@@ -276,7 +291,7 @@ static int cmd_peer_add(const char *host, const char *hex_or_file) {
     return 0;
 }
 static int cmd_peer_list(void) {
-    const char *home = getenv("HOME"); if (!home) home = "/tmp";
+    const char *home = get_real_home();
     char dir[520]; snprintf(dir, sizeof(dir), "%s/.aegis-tunnel/peers", home);
     DIR *d = opendir(dir);
     if (!d) { printf("No peers configured yet.\n"); return 0; }
@@ -292,7 +307,7 @@ static int cmd_peer_list(void) {
     return 0;
 }
 static int cmd_status(void) {
-    const char *home = getenv("HOME"); if (!home) home = "/tmp";
+    const char *home = get_real_home();
     char dir[520]; snprintf(dir, sizeof(dir), "%s/.aegis-tunnel", home);
     printf("Key storage: %s\n", dir);
     struct stat st;
@@ -363,7 +378,7 @@ static int cmd_create_tun(int is_server) {
     /* Read our public key from the key file (for display in config) */
     char pubkey_hex[65] = "";
     {
-        const char *home = getenv("HOME"); if (!home) home = "/tmp";
+        const char *home = get_real_home();
         char pub_path[520];
         snprintf(pub_path, sizeof(pub_path), "%s/.aegis-tunnel/public.key", home);
         FILE *f = fopen(pub_path, "r");
@@ -597,7 +612,7 @@ int main(int argc, char **argv) {
                 const char *v = iniconf_get(&icfg, "Interface", "PrivateKey");
                 if (v) {
                     if (v[0] == '~') {
-                        const char *home = getenv("HOME"); if (!home) home = "/tmp";
+                        const char *home = get_real_home();
                         char *exp = (char*)malloc(strlen(home) + strlen(v) + 1);
                         sprintf(exp, "%s%s", home, v + 1);
                         privkey_file = exp;
@@ -708,7 +723,7 @@ int main(int argc, char **argv) {
 
     /* Default key paths: ~/.aegis-tunnel/ */
     char key_dir[512], default_priv[520];
-    { const char *home = getenv("HOME"); if (!home) home = "/tmp";
+    { const char *home = get_real_home();
       snprintf(key_dir, sizeof(key_dir), "%s/.aegis-tunnel", home);
       mkdir(key_dir, 0700); }
 
