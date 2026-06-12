@@ -49,6 +49,37 @@ static void sigchld_handler(int sig) {
 }
 
 /* Get real user's home directory, even when running under sudo. */
+/* Detect the default network interface (the one with the default route).
+ * Returns "eth0" as fallback if detection fails. */
+static const char *detect_default_iface(void)
+{
+    static char iface[16] = "";
+    if (iface[0]) return iface;  /* already detected */
+
+    FILE *fp = popen("ip route show default 2>/dev/null", "r");
+    if (!fp) goto fallback;
+    char line[256];
+    if (!fgets(line, sizeof(line), fp)) { pclose(fp); goto fallback; }
+    pclose(fp);
+
+    /* Parse: "default via X.X.X.X dev <iface> ..." */
+    char *dev = strstr(line, " dev ");
+    if (dev) {
+        dev += 5;  /* skip " dev " */
+        char *end = dev;
+        while (*end && *end != ' ' && *end != '\n') end++;
+        size_t len = (size_t)(end - dev);
+        if (len > 0 && len < 16) {
+            memcpy(iface, dev, len);
+            iface[len] = '\0';
+            return iface;
+        }
+    }
+fallback:
+    strcpy(iface, "eth0");
+    return iface;
+}
+
 static const char *get_real_home(void)
 {
     const char *sudo_user = getenv("SUDO_USER");
@@ -185,8 +216,8 @@ static int cmd_keygen(void) {
                 "Port = 9000\n\n"
                 "[Tunnel]\n"
                 "Keepalive = 30\n"
-                "NATInterface = eth0\n",
-                hex);
+                "NATInterface = %s\n",
+                hex, detect_default_iface());
             fclose(cf);
             printf("\nConfig: aegis.conf\n");
         }
@@ -251,8 +282,8 @@ static int cmd_peer_add(const char *host, const char *hex_or_file) {
                     "Port = 9000\n\n"
                     "[Tunnel]\n"
                     "Keepalive = 30\n"
-                    "NATInterface = eth0\n",
-                    our_pub);
+                    "NATInterface = %s\n",
+                    our_pub, detect_default_iface());
                 fclose(cf);
             }
         }
@@ -409,10 +440,10 @@ static int cmd_create_tun(int is_server) {
         fprintf(out, "ListenPort = %s\n", port ? port : "9000");
         fprintf(out, "# PostUp = iptables -A FORWARD -i %%i -j ACCEPT;"
                      " iptables -t nat -A POSTROUTING -s 10.0.0.0/24 -o %s -j MASQUERADE\n",
-                nat_if ? nat_if : "eth0");
+                nat_if ? nat_if : detect_default_iface());
         fprintf(out, "# PostDown = iptables -D FORWARD -i %%i -j ACCEPT;"
                      " iptables -t nat -D POSTROUTING -s 10.0.0.0/24 -o %s -j MASQUERADE\n",
-                nat_if ? nat_if : "eth0");
+                nat_if ? nat_if : detect_default_iface());
     } else {
         fprintf(out, "Address = 10.0.0.2/24\n");
     }
@@ -468,7 +499,7 @@ static int cmd_create_tun(int is_server) {
     /* ── [Tunnel] ── */
     fprintf(out, "[Tunnel]\n");
     fprintf(out, "Keepalive = %s\n", keepalive ? keepalive : "30");
-    fprintf(out, "NATInterface = %s\n", nat_if ? nat_if : "eth0");
+    fprintf(out, "NATInterface = %s\n", nat_if ? nat_if : detect_default_iface());
     fprintf(out, "Timeout = 10\n");
     fprintf(out, "MaxConnections = 64\n");
 
@@ -524,7 +555,8 @@ int main(int argc, char **argv) {
     int  keepalive = 0, hs_timeout = DEFAULT_HS_TIMEOUT;
     int  tun_mode = 0;
     char tun_name[16] = "tun0", tun_ip[32] = "", tun_netmask[32] = "255.255.255.0";
-    char tun_route[64] = "", tun_nat_if[16] = "eth0";
+    char tun_route[64] = ""; char tun_nat_if[16] = "";  /* auto-detect below */
+    if (!tun_nat_if[0]) strncpy(tun_nat_if, detect_default_iface(), 15);
     char tun_postup[256] = "", tun_postdown[256] = "";
 
     int opt;
