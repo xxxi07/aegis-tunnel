@@ -71,7 +71,7 @@ int mode_psk_server(int listen_port, const char *remote_host, int remote_port,
             if (handshake_key_confirm_server(client_fd, &keys, hs_timeout) != 0)
                 { secure_memzero(&keys, sizeof(keys)); close(client_fd); _exit(1); }
 
-            int remote_fd = connect_to_host(remote_host, remote_port);
+            int remote_fd = connect_to_host(remote_host, remote_port, 0);
             if (remote_fd < 0) { close(client_fd); _exit(1); }
 
             tunnel_t tun; tunnel_init(&tun, remote_fd, client_fd, keys.enc_key, keys.dec_key);
@@ -108,7 +108,7 @@ int mode_psk_client(int listen_port, const char *remote_host, int remote_port,
         /* Reconnect loop: if tunnel drops, retry with exponential backoff */
         int retry_delay = 0;
         while (g_running) {
-            int tunnel_fd = connect_to_host(remote_host, remote_port);
+            int tunnel_fd = connect_to_host(remote_host, remote_port, 0);
             if (tunnel_fd < 0) {
                 if (retry_delay == 0) log_error("client", "cannot connect to %s:%d", remote_host, remote_port);
                 goto retry;

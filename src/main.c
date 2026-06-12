@@ -84,8 +84,10 @@ int parse_host_port(char *addr, char **host, int *port) {
     *colon = '\0'; *host = addr; *port = atoi(colon + 1);
     return (*port > 0 && *port <= 65535) ? 0 : -1;
 }
-int connect_to_host(const char *host, int port) {
+int connect_to_host(const char *host, int port, int fwmark) {
     int fd = socket(AF_INET, SOCK_STREAM, 0); if (fd < 0) { perror("socket"); return -1; }
+    /* Set fwmark BEFORE connect so the TCP SYN bypasses TUN routes */
+    if (fwmark > 0) setsockopt(fd, SOL_SOCKET, SO_MARK, &fwmark, sizeof(fwmark));
     struct hostent *he = gethostbyname(host);
     if (!he) { fprintf(stderr, "Error: cannot resolve '%s'\n", host); close(fd); return -1; }
     struct sockaddr_in a; memset(&a, 0, sizeof(a));

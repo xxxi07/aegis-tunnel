@@ -183,10 +183,8 @@ int mode_tun_client(int listen_port, const char *remote_host, int remote_port,
     /* Reconnect loop */
     int retry_delay = 0;
     while (g_running) {
-        int tunnel_fd = connect_to_host(remote_host, remote_port);
+        int tunnel_fd = connect_to_host(remote_host, remote_port, TUN_FWMARK);
         if (tunnel_fd < 0) { if (retry_delay == 0) log_error("tun-client", "cannot connect"); goto retry; }
-
-        tun_set_fwmark(tunnel_fd, TUN_FWMARK);
 
         session_keys_t keys;
         if (handshake_client(tunnel_fd, g_asym_priv, g_asym_peers[0], hs_timeout, &keys) == 0 &&
