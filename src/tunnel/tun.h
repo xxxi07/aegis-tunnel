@@ -134,6 +134,13 @@ int tun_allow_dns(const char *name, const char *dns_ip);
 int tun_exec_script(const char *script, const char *name);
 
 /*
+ * Tear down TUN device: flush custom routing table, remove policy rules,
+ * delete the interface, and optionally clean iptables (server mode).
+ * Called automatically on exit — no need for manual 'tun down'.
+ */
+void tun_teardown(const char *name, int is_server);
+
+/*
  * Parse comma-separated AllowedIPs and add routes for each subnet.
  *   allowed_ips: comma-separated CIDR list (e.g., "10.0.0.0/24,192.168.1.0/24")
  *   name:       TUN interface name

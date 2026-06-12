@@ -378,3 +378,39 @@ int tun_set_nat_multi(const char *allowed_ips, const char *out_if)
     }
     return 0;
 }
+
+/* ─── Teardown: clean routes, rules, device on exit ─────────── */
+
+void tun_teardown(const char *name, int is_server)
+{
+    char cmd[256];
+
+    /* Flush TUN routing table */
+    snprintf(cmd, sizeof(cmd), "ip route flush table %d 2>/dev/null", TUN_ROUTE_TABLE);
+    system(cmd);
+
+    /* Remove policy routing rules */
+    snprintf(cmd, sizeof(cmd),
+             "ip rule del not fwmark %d table %d 2>/dev/null",
+             TUN_ROUTE_TABLE, TUN_ROUTE_TABLE);
+    system(cmd);
+    /* Legacy rules from older versions */
+    snprintf(cmd, sizeof(cmd),
+             "ip rule del not fwmark %d table main 2>/dev/null", TUN_ROUTE_TABLE);
+    system(cmd);
+    snprintf(cmd, sizeof(cmd),
+             "ip rule del fwmark %d table main 2>/dev/null", TUN_ROUTE_TABLE);
+    system(cmd);
+
+    /* Delete TUN device */
+    snprintf(cmd, sizeof(cmd), "ip link del %s 2>/dev/null", name);
+    system(cmd);
+
+    /* Server: clean iptables */
+    if (is_server) {
+        system("iptables -t nat -F POSTROUTING 2>/dev/null");
+        system("iptables -F FORWARD 2>/dev/null");
+    }
+
+    fprintf(stderr, "[tun] %s removed, routes and rules cleared.\n", name);
+}

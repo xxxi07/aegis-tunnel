@@ -140,6 +140,7 @@ int mode_tun_server(int listen_port,
     while (waitpid(-1, NULL, 0) > 0) {}
 
     tun_run_postdown(postdown, name);
+    tun_teardown(name, 1 /* server */);
     close(listen_fd); close(tun_fd);
     return 0;
 }
@@ -244,6 +245,7 @@ int mode_tun_client(int listen_port, const char *remote_host, int remote_port,
     }
 
     tun_run_postdown(postdown, name);
+    tun_teardown(name, 0 /* client */);
     close(tun_fd);
     return 0;
 }
