@@ -279,3 +279,97 @@ int tun_write(int fd, const uint8_t *buf, size_t len)
     }
     return (int)n;
 }
+
+/* ─── Execute PostUp / PostDown script ────────────────────────── */
+
+int tun_exec_script(const char *script, const char *name)
+{
+    if (!script || !script[0]) return 0;
+
+    /* Build command with %i substitution */
+    char cmd[1024];
+    const char *src = script;
+    char *dst = cmd;
+    size_t remaining = sizeof(cmd) - 1;
+
+    while (*src && remaining > 0) {
+        if (src[0] == '%' && src[1] == 'i') {
+            size_t nl = strlen(name);
+            if (nl > remaining) nl = remaining;
+            memcpy(dst, name, nl);
+            dst += nl;
+            remaining -= nl;
+            src += 2;
+        } else {
+            *dst++ = *src++;
+            remaining--;
+        }
+    }
+    *dst = '\0';
+
+    fprintf(stderr, "[tun] exec: %s\n", cmd);
+    int ret = system(cmd);
+    if (ret != 0) {
+        fprintf(stderr, "[tun] script exited with %d\n", ret);
+        return -1;
+    }
+    return 0;
+}
+
+/* ─── Multi-subnet routes ───────────────────────────────────── */
+
+int tun_add_routes_multi(const char *allowed_ips, const char *name)
+{
+    if (!allowed_ips || !allowed_ips[0]) return 0;
+
+    char buf[256];
+    strncpy(buf, allowed_ips, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+
+    char *token, *save = NULL;
+    char *ptr = buf;
+    while ((token = strtok_r(ptr, ", \t", &save)) != NULL) {
+        ptr = NULL;  /* continue parsing same string */
+        /* Skip empty tokens */
+        while (*token == ' ' || *token == '\t') token++;
+        if (!*token) continue;
+
+        /* Full tunnel needs special handling */
+        if (!strcmp(token, "0.0.0.0/0") || !strcmp(token, "::/0")) {
+            tun_add_full_tunnel(name);
+        } else {
+            tun_add_route(token, name);
+        }
+    }
+    return 0;
+}
+
+/* ─── Multi-subnet NAT ──────────────────────────────────────── */
+
+int tun_set_nat_multi(const char *allowed_ips, const char *out_if)
+{
+    if (!allowed_ips || !allowed_ips[0]) return 0;
+
+    char buf[256];
+    strncpy(buf, allowed_ips, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+
+    char *token, *save = NULL;
+    char *ptr = buf;
+    while ((token = strtok_r(ptr, ", \t", &save)) != NULL) {
+        ptr = NULL;
+        while (*token == ' ' || *token == '\t') token++;
+        if (!*token) continue;
+
+        /* Don't NAT 0.0.0.0/0 (full tunnel — NAT for all subnets doesn't make sense) */
+        if (!strcmp(token, "0.0.0.0/0")) {
+            /* NAT for private ranges commonly used behind the server */
+            tun_set_nat("10.0.0.0/8", out_if);
+            tun_set_nat("172.16.0.0/12", out_if);
+            tun_set_nat("192.168.0.0/16", out_if);
+        } else {
+            tun_set_nat(token, out_if);
+        }
+    }
+    return 0;
+}

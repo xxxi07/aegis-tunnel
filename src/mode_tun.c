@@ -21,12 +21,51 @@
 
 #define TUN_FWMARK  51820
 
-static void tun_setup_routing(const char *name, const char *allowed_ips, const char *nat_if)
+/*
+ * Set up routing based on role (server vs client).
+ *
+ * Server: enable forwarding → fwmark → routes per AllowedIPs →
+ *         NAT per AllowedIPs → FORWARD rules → PostUp
+ * Client: fwmark → routes per AllowedIPs → PostUp
+ */
+static void tun_setup_routing(const char *name, const char *allowed_ips,
+                               const char *nat_if, int is_server)
 {
-    tun_enable_forwarding();
-    tun_set_fwmark_rule(TUN_FWMARK);
-    tun_set_nat(allowed_ips, nat_if);
-    tun_allow_forward(name);
+    if (is_server) {
+        /* Server: full gateway setup */
+        tun_enable_forwarding();
+        tun_set_fwmark_rule(TUN_FWMARK);
+        if (allowed_ips && allowed_ips[0]) {
+            tun_add_routes_multi(allowed_ips, name);
+            tun_set_nat_multi(allowed_ips, nat_if);
+        }
+        tun_allow_forward(name);
+    } else {
+        /* Client: only routes, no NAT/forwarding */
+        tun_set_fwmark_rule(TUN_FWMARK);
+        if (allowed_ips && allowed_ips[0])
+            tun_add_routes_multi(allowed_ips, name);
+    }
+}
+
+/*
+ * Execute PostUp / PostDown scripts if set.
+ * WireGuard-style: %i is replaced with interface name.
+ */
+static void tun_run_postup(const char *script, const char *name)
+{
+    if (script && script[0]) {
+        log_info("tun", "PostUp: %s", script);
+        tun_exec_script(script, name);
+    }
+}
+
+static void tun_run_postdown(const char *script, const char *name)
+{
+    if (script && script[0]) {
+        log_info("tun", "PostDown: %s", script);
+        tun_exec_script(script, name);
+    }
 }
 
 static int try_handshake_server(int fd, session_keys_t *keys, int timeout_ms)
@@ -43,6 +82,7 @@ int mode_tun_server(int listen_port,
                     const char *tun_name,
                     const char *tun_ip, const char *tun_netmask,
                     const char *tun_route, const char *tun_nat_if,
+                    const char *postup, const char *postdown,
                     const uint8_t *psk, size_t psk_len,
                     int hs_timeout, int keepalive)
 {
@@ -59,14 +99,15 @@ int mode_tun_server(int listen_port,
         else
             tun_add_route(tun_route, name);
     }
-    tun_setup_routing(name, tun_route ? tun_route : "10.0.0.0/24", tun_nat_if);
+    tun_setup_routing(name, tun_route, tun_nat_if, 1 /* server */);
+    tun_run_postup(postup, name);
 
     int listen_fd = listen_on_port(listen_port);
     if (listen_fd < 0) { close(tun_fd); return 1; }
 
     log_info("tun-server", "%s (%s/%s) :%d route=%s peers=%d",
              name, tun_ip && tun_ip[0] ? tun_ip : "dhcp", tun_netmask,
-             listen_port, tun_route ? tun_route : "10.0.0.0/24", g_peer_count);
+             listen_port, tun_route ? tun_route : "(none)", g_peer_count);
 
     while (g_running) {
         struct sockaddr_in ca; socklen_t al = sizeof(ca);
@@ -100,6 +141,8 @@ int mode_tun_server(int listen_port,
         g_active_conns++; close(client_fd);
     }
     while (waitpid(-1, NULL, 0) > 0) {}
+
+    tun_run_postdown(postdown, name);
     close(listen_fd); close(tun_fd);
     return 0;
 }
@@ -109,6 +152,7 @@ int mode_tun_client(int listen_port, const char *remote_host, int remote_port,
                     const char *tun_name,
                     const char *tun_ip, const char *tun_netmask,
                     const char *tun_route,
+                    const char *postup, const char *postdown,
                     const uint8_t *psk, size_t psk_len,
                     int hs_timeout, int keepalive)
 {
@@ -125,6 +169,11 @@ int mode_tun_client(int listen_port, const char *remote_host, int remote_port,
         else
             tun_add_route(tun_route, name);
     }
+    /* Add multi-subnet routes from AllowedIPs (client side) */
+    if (tun_route && tun_route[0] && strchr(tun_route, ','))
+        tun_add_routes_multi(tun_route, name);
+    tun_set_fwmark_rule(TUN_FWMARK);
+    tun_run_postup(postup, name);
 
     log_info("tun-client", "%s (%s/%s) → %s:%d route=%s (auto-reconnect)",
              name, tun_ip && tun_ip[0] ? tun_ip : "dhcp", tun_netmask,
@@ -164,6 +213,7 @@ int mode_tun_client(int listen_port, const char *remote_host, int remote_port,
         sleep((unsigned)retry_delay);
     }
 
+    tun_run_postdown(postdown, name);
     close(tun_fd);
     return 0;
 }

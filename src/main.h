@@ -36,11 +36,14 @@ int mode_psk_client(int listen_port, const char *remote_host, int remote_port,
 int mode_tun_server(int listen_port, const char *tun_name,
                     const char *tun_ip, const char *tun_netmask, const char *tun_route,
                     const char *tun_nat_if,
+                    const char *postup, const char *postdown,
                     const uint8_t *psk, size_t psk_len, int hs_timeout, int keepalive);
 int mode_tun_client(int listen_port, const char *remote_host, int remote_port,
                     const char *tun_name,
                     const char *tun_ip, const char *tun_netmask, const char *tun_route,
+                    const char *postup, const char *postdown,
                     const uint8_t *psk, size_t psk_len, int hs_timeout, int keepalive);
 
 #endif /* MAIN_H */
+
 

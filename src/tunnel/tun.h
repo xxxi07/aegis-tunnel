@@ -125,6 +125,31 @@ int tun_allow_forward(const char *name);
 int tun_allow_dns(const char *name, const char *dns_ip);
 
 /*
+ * Execute a shell script, substituting %i with the interface name.
+ * Used for PostUp / PostDown hooks (WireGuard-style).
+ *   script: shell command line (may contain %i)
+ *   name:   TUN interface name
+ * Returns 0 on success, -1 on error.
+ */
+int tun_exec_script(const char *script, const char *name);
+
+/*
+ * Parse comma-separated AllowedIPs and add routes for each subnet.
+ *   allowed_ips: comma-separated CIDR list (e.g., "10.0.0.0/24,192.168.1.0/24")
+ *   name:       TUN interface name
+ * Returns 0 on success.
+ */
+int tun_add_routes_multi(const char *allowed_ips, const char *name);
+
+/*
+ * Parse comma-separated AllowedIPs and add NAT for each subnet.
+ *   allowed_ips: comma-separated CIDR list
+ *   out_if:      external interface for MASQUERADE
+ * Returns 0 on success.
+ */
+int tun_set_nat_multi(const char *allowed_ips, const char *out_if);
+
+/*
  * Read an IP packet from the TUN device.
  * Blocks until a packet is available.
  * Returns packet length on success, -1 on error.

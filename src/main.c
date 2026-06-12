@@ -103,43 +103,35 @@ static void usage(const char *prog) {
         "\n"
         "AEGIS-Tunnel -- Lightweight encrypted tunnel using AEGIS-128 AEAD\n"
         "\n"
-        "Required:\n"
-        "  -l <port>       Local listen port\n"
-        "  -r <host:port>  Remote target (use 'vpn' for pure TUN mode)\n"
+        "Commands (recommended workflow):\n"
+        "  keygen                         Generate keys + aegis.conf\n"
+        "  peer add <name> <hex|file>     Add peer's public key\n"
+        "  create tun -server|-client      Generate TUN config from aegis.conf\n"
+        "  start tun -server|-client       Start TUN VPN from config\n"
+        "  tun down [name]                Remove TUN device + iptables rules\n"
+        "  peer list                      List known peers\n"
+        "  status                         Show key/peer status\n"
         "\n"
-        "Keys (~/.aegis-tunnel/, auto-generated):\n"
-        "  First run: keys generated, public key printed\n"
-        "  Then paste peer's hex public key with -Q <hex>\n"
-        "  Or use -Q <file> to specify a peer key file\n"
+        "TUN workflow:\n"
+        "  %s keygen                           # step 1\n"
+        "  %s peer add myserver <peer-hex>     # step 2\n"
+        "  %s create tun -server               # step 3\n"
+        "  sudo %s start tun -server           # step 4\n"
         "\n"
-        "Commands:\n"
-        "  keygen               Generate keys, print public key\n"
-        "  peer add <h> <hex>   Add peer's public key\n"
-        "  peer list            List known peers\n"
-        "  status               Show key/peer status\n"
-        "  tun down             Remove TUN device + iptables rules\n"
-        "\n"
-        "Options:\n"
-        "  -P <file>       Override private key path\n"
+        "Quick start (legacy, no config file):\n"
+        "  -l <port>       Local listen port (default 9000)\n"
+        "  -r <host:port>  Remote target\n"
+        "  -m <mode>       'server' or 'client'\n"
+        "  -T <ip/prefix>  TUN VPN: e.g. -T 10.0.0.1/24\n"
+        "  -P <file>       Private key path\n"
         "  -Q <hex|file>   Peer public key (64 hex chars or file)\n"
         "  -C <file>       Config file\n"
-        "  -m <mode>       'server' (default) or 'client'\n"
         "  -t <sec>        Handshake timeout (default: 5)\n"
         "  -x <max>        Max connections (default: 32)\n"
         "  -K <sec>        Keepalive (default: 0)\n"
-        "  -T <ip/prefix>  TUN VPN: e.g. -T 10.0.0.1/24\n"
         "  -W <iface>      WAN interface for NAT (default: eth0)\n"
         "  -v              Verbose logging\n"
         "  -h              Show this help\n"
-        "\n"
-        "Setup:\n"
-        "  1. Run: %s -l 9000 -r server:9000 (prints your public key)\n"
-        "  2. Send your public key to peer, get theirs\n"
-        "  3. Run: %s -l 9000 -r server:9000 -Q <peer-hex-key>\n"
-        "\n"
-        "Examples:\n"
-        "  # Server: %s -l 9000 -r 127.0.0.1:8080\n"
-        "  # Client: %s -l 9000 -r server:9000 -m client\n"
         "\n",
         prog, prog, prog, prog, prog, prog);
 }
@@ -158,9 +150,28 @@ static int cmd_keygen(void) {
 
     /* Show public key */
     printf("Public key (send to peer):\n  ");
-    char hex[65];
+    char hex[65] = "";
     FILE *f = fopen(pub, "r");
-    if (f) { fread(hex, 1, 64, f); hex[64] = '\0'; fclose(f); printf("%s\n", hex); }
+    if (f) { size_t nr = fread(hex, 1, 64, f); hex[nr] = '\0'; fclose(f); printf("%s\n", hex); }
+
+    /* Generate base aegis.conf if it doesn't exist */
+    if (access("aegis.conf", F_OK) != 0) {
+        FILE *cf = fopen("aegis.conf", "w");
+        if (cf) {
+            fprintf(cf,
+                "[Interface]\n"
+                "PrivateKey = ~/.aegis-tunnel/private.key\n"
+                "PublicKey = %s\n"
+                "Port = 9000\n"
+                "Mode = server\n\n"
+                "[Tunnel]\n"
+                "Keepalive = 30\n"
+                "NATInterface = eth0\n",
+                hex);
+            fclose(cf);
+            printf("\nConfig: aegis.conf\n");
+        }
+    }
 
     printf("\nNext: get peer's public key, then:\n");
     printf("  aegis-tunnel peer add <name> <peer-hex-key>\n");
@@ -206,14 +217,24 @@ static int cmd_peer_add(const char *host, const char *hex_or_file) {
         if (access(cfg, F_OK) != 0) {
             FILE *cf = fopen(cfg, "w");
             if (cf) {
+                /* Read our public key for the Interface section */
+                char our_pub[65] = "";
+                {
+                    char pub_path[520];
+                    snprintf(pub_path, sizeof(pub_path), "%s/public.key", dir);
+                    FILE *pf = fopen(pub_path, "r");
+                    if (pf) { size_t nr = fread(our_pub, 1, 64, pf); our_pub[nr] = '\0'; fclose(pf); }
+                }
                 fprintf(cf,
                     "[Interface]\n"
                     "PrivateKey = ~/.aegis-tunnel/private.key\n"
+                    "PublicKey = %s\n"
                     "Port = 9000\n"
                     "Mode = server\n\n"
                     "[Tunnel]\n"
                     "Keepalive = 30\n"
-                    "NATInterface = eth0\n");
+                    "NATInterface = eth0\n",
+                    our_pub);
                 fclose(cf);
             }
         }
@@ -243,8 +264,7 @@ static int cmd_peer_add(const char *host, const char *hex_or_file) {
                 if (out) {
                     fprintf(out, "\n[Peer]\n");
                     fprintf(out, "PublicKey = %s\n", hx);
-                fprintf(out, "Endpoint = %s:9000\n", host);
-                    fprintf(out, "AllowedIPs = 0.0.0.0/0\n");
+                    fprintf(out, "Endpoint = %s\n", host);
                     fclose(out);
                     printf("Config updated: aegis.conf (+[Peer])\n");
                 }
@@ -309,8 +329,128 @@ static int cmd_tun_down(const char *name) {
     return 0;
 }
 
+/*
+ * Create a TUN-specific config from aegis.conf.
+ *   is_server: 1 → aegis-server.conf, 0 → aegis-client.conf
+ *
+ * Reads base aegis.conf, adds TUN-specific settings,
+ * writes the result to aegis-server.conf or aegis-client.conf.
+ */
+static int cmd_create_tun(int is_server) {
+    const char *src = "aegis.conf";
+    const char *dst = is_server ? "aegis-server.conf" : "aegis-client.conf";
+
+    if (access(src, F_OK) != 0) {
+        fprintf(stderr, "Error: %s not found. Run 'aegis-tunnel keygen' first.\n", src);
+        return 1;
+    }
+
+    iniconf_t icfg;
+    if (iniconf_load(&icfg, src) != 0) {
+        fprintf(stderr, "Error: cannot parse %s\n", src);
+        return 1;
+    }
+
+    /* Read base fields from aegis.conf */
+    const char *privkey  = iniconf_get(&icfg, "Interface", "PrivateKey");
+    const char *pubkey   = iniconf_get(&icfg, "Interface", "PublicKey");
+    const char *port     = iniconf_get(&icfg, "Interface", "Port");
+    const char *peer_pk  = iniconf_get(&icfg, "Peer", "PublicKey");
+    const char *endpoint = iniconf_get(&icfg, "Peer", "Endpoint");
+    const char *nat_if   = iniconf_get(&icfg, "Tunnel", "NATInterface");
+    const char *keepalive = iniconf_get(&icfg, "Tunnel", "Keepalive");
+
+    /* Read our public key from the key file (for display in config) */
+    char pubkey_hex[65] = "";
+    {
+        const char *home = getenv("HOME"); if (!home) home = "/tmp";
+        char pub_path[520];
+        snprintf(pub_path, sizeof(pub_path), "%s/.aegis-tunnel/public.key", home);
+        FILE *f = fopen(pub_path, "r");
+        if (f) {
+            size_t n = fread(pubkey_hex, 1, 64, f);
+            pubkey_hex[n] = '\0';
+            fclose(f);
+        }
+    }
+
+    FILE *out = fopen(dst, "w");
+    if (!out) { perror(dst); iniconf_free(&icfg); return 1; }
+
+    fprintf(out, "# AEGIS-Tunnel TUN %s config (generated from %s)\n\n",
+            is_server ? "server" : "client", src);
+
+    /* ── [Interface] ── */
+    fprintf(out, "[Interface]\n");
+    fprintf(out, "PrivateKey = %s\n", privkey ? privkey : "~/.aegis-tunnel/private.key");
+    if (pubkey_hex[0])
+        fprintf(out, "PublicKey = %s\n", pubkey_hex);
+    else if (pubkey)
+        fprintf(out, "PublicKey = %s\n", pubkey);
+    fprintf(out, "Mode = %s\n", is_server ? "server" : "client");
+
+    if (is_server) {
+        fprintf(out, "Address = 10.0.0.1/24\n");
+        fprintf(out, "ListenPort = %s\n", port ? port : "9000");
+        fprintf(out, "# PostUp = iptables -A FORWARD -i %%i -j ACCEPT;"
+                     " iptables -t nat -A POSTROUTING -s 10.0.0.0/24 -o %s -j MASQUERADE\n",
+                nat_if ? nat_if : "eth0");
+        fprintf(out, "# PostDown = iptables -D FORWARD -i %%i -j ACCEPT;"
+                     " iptables -t nat -D POSTROUTING -s 10.0.0.0/24 -o %s -j MASQUERADE\n",
+                nat_if ? nat_if : "eth0");
+    } else {
+        fprintf(out, "Address = 10.0.0.2/24\n");
+    }
+    fprintf(out, "\n");
+
+    /* ── [Peer] ── */
+    fprintf(out, "[Peer]\n");
+    fprintf(out, "PublicKey = %s\n", peer_pk ? peer_pk : "<peer-public-key>");
+
+    if (is_server) {
+        /* Server: AllowedIPs defines which subnets the peer can access */
+        fprintf(out, "AllowedIPs = 10.0.0.0/24\n");
+        if (endpoint)
+            fprintf(out, "# Endpoint = %s\n", endpoint);
+    } else {
+        /* Client: Endpoint is the server's real address */
+        {
+            char ep_buf[320];
+            if (endpoint)
+                snprintf(ep_buf, sizeof(ep_buf), "%s", endpoint);
+            else
+                snprintf(ep_buf, sizeof(ep_buf), "server.com:9000");
+            /* Auto-append :9000 if no port specified */
+            if (!strrchr(ep_buf, ':')) {
+                size_t el = strlen(ep_buf);
+                snprintf(ep_buf + el, sizeof(ep_buf) - el, ":9000");
+            }
+            fprintf(out, "Endpoint = %s\n", ep_buf);
+        }
+        fprintf(out, "AllowedIPs = 0.0.0.0/0\n");
+        fprintf(out, "PersistentKeepalive = %s\n", keepalive ? keepalive : "25");
+    }
+    fprintf(out, "\n");
+
+    /* ── [Tunnel] ── */
+    fprintf(out, "[Tunnel]\n");
+    fprintf(out, "Keepalive = %s\n", keepalive ? keepalive : "30");
+    fprintf(out, "NATInterface = %s\n", nat_if ? nat_if : "eth0");
+    fprintf(out, "Timeout = 10\n");
+    fprintf(out, "MaxConnections = 64\n");
+
+    fclose(out);
+    iniconf_free(&icfg);
+
+    printf("TUN %s config written to %s\n", is_server ? "server" : "client", dst);
+    printf("\nReview and edit %s if needed, then:\n", dst);
+    printf("  sudo ./aegis-tunnel start tun -%s\n", is_server ? "server" : "client");
+    return 0;
+}
+
 int main(int argc, char **argv) {
     /* Subcommands: aegis-tunnel keygen | peer add <host> <hex> | peer list */
+    int  start_tun_force = 0;  /* 1=server, 2=client — set by 'start tun' subcommand */
     if (argc >= 2) {
         if (!strcmp(argv[1], "keygen"))    return cmd_keygen();
         if (!strcmp(argv[1], "status"))    return cmd_status();
@@ -323,6 +463,25 @@ int main(int argc, char **argv) {
             fprintf(stderr, "       %s peer list\n", argv[0]);
             return 1;
         }
+        /* create tun -server | -client */
+        if (!strcmp(argv[1], "create") && argc >= 4 && !strcmp(argv[2], "tun")) {
+            if (!strcmp(argv[3], "-server")) return cmd_create_tun(1);
+            if (!strcmp(argv[3], "-client")) return cmd_create_tun(0);
+            fprintf(stderr, "Usage: %s create tun -server | -client\n", argv[0]);
+            return 1;
+        }
+        /* start tun -server | -client */
+        if (!strcmp(argv[1], "start") && argc >= 4 && !strcmp(argv[2], "tun")) {
+            if (!strcmp(argv[3], "-server"))      start_tun_force = 1;
+            else if (!strcmp(argv[3], "-client")) start_tun_force = 2;
+            else {
+                fprintf(stderr, "Usage: %s start tun -server | -client [-c <config>]\n", argv[0]);
+                return 1;
+            }
+            /* Consume subcommand args so getopt sees only remaining flags (like -c) */
+            argv += 3; argc -= 3;
+            optind = 0;  /* reset getopt for shifted argv */
+        }
     }
 
     int  listen_port = 9000;  /* default port */
@@ -333,6 +492,7 @@ int main(int argc, char **argv) {
     int  tun_mode = 0;
     char tun_name[16] = "tun0", tun_ip[32] = "", tun_netmask[32] = "255.255.255.0";
     char tun_route[64] = "", tun_nat_if[16] = "eth0";
+    char tun_postup[256] = "", tun_postdown[256] = "";
 
     int opt;
     while ((opt = getopt(argc, argv, "l:r:P:Q:C:c:m:t:x:K:T:I:N:R:W:vh")) != -1) {
@@ -382,6 +542,18 @@ int main(int argc, char **argv) {
         }
     }
 
+    /* ── 'start tun' auto-config selection ── */
+    if (start_tun_force) {
+        tun_mode = 1;
+        if (start_tun_force == 1) mode = "server"; else mode = "client";
+        /* Auto-detect config file if not explicitly given */
+        if (!config_file) {
+            const char *auto_cfg = (start_tun_force == 1) ? "aegis-server.conf" : "aegis-client.conf";
+            if (access(auto_cfg, F_OK) == 0)
+                config_file = (char *)auto_cfg;
+        }
+    }
+
     /* ── Auto-detect config file if not specified ── */
     if (!config_file && access("aegis.conf", F_OK) == 0)
         config_file = "aegis.conf";
@@ -391,8 +563,21 @@ int main(int argc, char **argv) {
         iniconf_t icfg;
         if (iniconf_load(&icfg, config_file) == 0) {
             /* [Interface] */
-            if (listen_port == 9000)
-                listen_port = iniconf_get_int(&icfg, "Interface", "Port", listen_port);
+            if (listen_port == 9000) {
+                /* Prefer ListenPort (TUN-specific), fallback to Port */
+                int lp = iniconf_get_int(&icfg, "Interface", "ListenPort", 0);
+                if (lp > 0) listen_port = lp;
+                else listen_port = iniconf_get_int(&icfg, "Interface", "Port", listen_port);
+            }
+            /* PostUp / PostDown (WireGuard-style, %i = interface name) */
+            if (!tun_postup[0]) {
+                const char *v = iniconf_get(&icfg, "Interface", "PostUp");
+                if (v) strncpy(tun_postup, v, 255);
+            }
+            if (!tun_postdown[0]) {
+                const char *v = iniconf_get(&icfg, "Interface", "PostDown");
+                if (v) strncpy(tun_postdown, v, 255);
+            }
             if (!remote_str) {
                 const char *v = iniconf_get(&icfg, "Peer", "Endpoint");
                 if (v) {
@@ -457,6 +642,10 @@ int main(int argc, char **argv) {
                 const char *v = iniconf_get(&icfg, "Peer", "AllowedIPs");
                 if (v) strncpy(tun_route, v, 63);
             }
+            /* PersistentKeepalive (client-side, in seconds) */
+            if (keepalive == 0) {
+                keepalive = iniconf_get_int(&icfg, "Peer", "PersistentKeepalive", 0);
+            }
             if (hs_timeout == DEFAULT_HS_TIMEOUT)
                 hs_timeout = iniconf_get_int(&icfg, "Tunnel", "Timeout", hs_timeout);
             if (keepalive == 0)
@@ -503,10 +692,19 @@ int main(int argc, char **argv) {
     uint8_t psk[MAX_PSK_BYTES]; random_bytes(psk, 16);
     size_t psk_len = 16;
 
-    char remote_host[MAX_HOST_LEN]; int remote_port; char *hp = NULL;
-    char *ac = strdup(remote_str); if (!ac) { perror("strdup"); return 1; }
-    if (parse_host_port(ac, &hp, &remote_port) != 0) { fprintf(stderr, "Error: '%s' format: host:port\n", remote_str); free(ac); return 1; }
-    strncpy(remote_host, hp, MAX_HOST_LEN-1); remote_host[MAX_HOST_LEN-1]='\0'; free(ac);
+    char remote_host[MAX_HOST_LEN]; int remote_port = 0; char *hp = NULL;
+    if (remote_str) {
+        char *ac = strdup(remote_str);
+        if (!ac) { perror("strdup"); return 1; }
+        if (parse_host_port(ac, &hp, &remote_port) != 0) {
+            fprintf(stderr, "Error: '%s' format: host:port\n", remote_str);
+            free(ac); return 1;
+        }
+        strncpy(remote_host, hp, MAX_HOST_LEN-1); remote_host[MAX_HOST_LEN-1]='\0';
+        free(ac);
+    } else {
+        remote_host[0] = '\0';
+    }
 
     /* Default key paths: ~/.aegis-tunnel/ */
     char key_dir[512], default_priv[520];
@@ -606,11 +804,15 @@ int main(int argc, char **argv) {
         if (!strcmp(mode, "server"))
             ret = mode_tun_server(listen_port, tun_name, tun_ip, tun_netmask,
                                   tun_route[0]?tun_route:NULL, tun_nat_if,
+                                  tun_postup[0]?tun_postup:NULL,
+                                  tun_postdown[0]?tun_postdown:NULL,
                                   psk, psk_len, hs_timeout, keepalive);
         else
             ret = mode_tun_client(listen_port, remote_host, remote_port,
                                   tun_name, tun_ip, tun_netmask,
                                   tun_route[0]?tun_route:NULL,
+                                  tun_postup[0]?tun_postup:NULL,
+                                  tun_postdown[0]?tun_postdown:NULL,
                                   psk, psk_len, hs_timeout, keepalive);
     } else if (!strcmp(mode, "server")) {
         ret = mode_psk_server(listen_port, remote_host, remote_port,
