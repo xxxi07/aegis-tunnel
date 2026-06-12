@@ -157,7 +157,7 @@ static int send_all(int dst_fd, const uint8_t *data, size_t len)
 {
     size_t sent = 0;
     while (sent < len) {
-        ssize_t n = send(dst_fd, data + sent, len - sent, MSG_NOSIGNAL);
+        ssize_t n = write(dst_fd, data + sent, len - sent);
         if (n < 0) {
             if (errno == EINTR) continue;
             if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
@@ -199,11 +199,11 @@ int tunnel_run(tunnel_t *tun)
         /* ── Plaintext → Encrypted: read, encrypt, forward ── */
         if (fds[TUNNEL_PLAINTEXT_FD].revents & POLLIN) {
             uint8_t buf[FRAME_MAX_PAYLOAD];
-            ssize_t n = recv(pt_fd, buf, sizeof(buf), 0);
+            ssize_t n = read(pt_fd, buf, sizeof(buf));
             if (n < 0) {
                 if (errno == EINTR) continue;
                 if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
-                fprintf(stderr, "[tunnel] pt_fd recv error: %s (fd=%d)\n", strerror(errno), pt_fd);
+                fprintf(stderr, "[tunnel] pt_fd read error: %s (fd=%d)\n", strerror(errno), pt_fd);
                 return -1;
             }
             if (n == 0) {
