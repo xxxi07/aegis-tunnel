@@ -634,7 +634,7 @@ int main(int argc, char **argv) {
                 }
                 /* If not set → will be auto-detected from peers/ later */
             }
-            if (!tun_mode) {
+            if (!tun_ip[0]) {
                 const char *v = iniconf_get(&icfg, "Interface", "Address");
                 if (v) {
                     tun_mode = 1;
@@ -748,10 +748,12 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "Error: -Q hex key must be 64 hex characters\n");
                 return 1;
             }
+            g_peer_count = 1;
             log_info("main", "peer key from hex string");
         } else {
             /* File path */
             if (keyfile_load_public(g_asym_peers[0], peerkey_file) != 0) return 1;
+            g_peer_count = 1;
             log_info("main", "peer key from file: %s", peerkey_file);
         }
     } else {
