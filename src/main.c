@@ -566,6 +566,12 @@ int main(int argc, char **argv) {
             const char *auto_cfg = (start_tun_force == 1) ? "aegis-server.conf" : "aegis-client.conf";
             if (access(auto_cfg, F_OK) == 0)
                 config_file = (char *)auto_cfg;
+            else {
+                fprintf(stderr, "Error: %s not found.\n", auto_cfg);
+                fprintf(stderr, "Run: aegis-tunnel create tun -%s\n",
+                        start_tun_force == 1 ? "server" : "client");
+                return 1;
+            }
         }
     }
 
