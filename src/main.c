@@ -642,20 +642,22 @@ int main(int argc, char **argv) {
                     } else privkey_file = strdup(v);
                 }
             }
-            /* PublicKey is optional in config — auto-detected from peers/ if not set */
+            /* Load peer keys from config (iterate all [Peer] sections) */
             if (!peerkey_file) {
-                const char *v = iniconf_get(&icfg, "Peer", "PublicKey");
-                if (v) {
-                    if (strlen(v) == 64 && !strchr(v, '/') && !strchr(v, '.')) {
-                        char tmp[256];
-                        snprintf(tmp, sizeof(tmp), "/tmp/aegis-peer-%d.pub", getpid());
-                        FILE *f = fopen(tmp, "w");
-                        if (f) { fprintf(f, "%s\n", v); fclose(f); peerkey_file = strdup(tmp); }
-                    } else {
-                        peerkey_file = strdup(v);
+                int pi = 0;
+                while (pi < MAX_PEERS) {
+                    const char *v = iniconf_get_indexed(&icfg, "Peer", pi, "PublicKey");
+                    if (!v) break;
+                    if (strlen(v) == 64) {
+                        if (parse_hex(g_asym_peers[pi], 32, v) == 32) {
+                            g_peer_count = pi + 1;
+                        }
                     }
+                    pi++;
                 }
-                /* If not set → will be auto-detected from peers/ later */
+                if (g_peer_count > 0)
+                    log_info("main", "%d peer(s) from config", g_peer_count);
+                /* If no peers in config → auto-detect from ~/.aegis-tunnel/peers/ later */
             }
             /* Parse AllowedIPs first (takes priority over Address auto-derive) */
             if (!tun_route[0]) {
@@ -781,8 +783,8 @@ int main(int argc, char **argv) {
             g_peer_count = 1;
             log_info("main", "peer key from file: %s", peerkey_file);
         }
-    } else {
-        /* Auto-detect peer key from ~/.aegis-tunnel/peers/ */
+    } else if (g_peer_count == 0) {
+        /* No peer from config or -Q → auto-detect from ~/.aegis-tunnel/peers/ */
         char peer_dir[520];
         snprintf(peer_dir, sizeof(peer_dir), "%s/peers", key_dir);
         mkdir(peer_dir, 0700);
