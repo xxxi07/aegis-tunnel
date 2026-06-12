@@ -665,7 +665,6 @@ int main(int argc, char **argv) {
                     }
                 }
             }
-            }
             /* PersistentKeepalive (client-side, in seconds) */
             if (keepalive == 0) {
                 keepalive = iniconf_get_int(&icfg, "Peer", "PersistentKeepalive", 0);
