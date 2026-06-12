@@ -13,6 +13,8 @@
 #include <sys/time.h>
 #include <unistd.h>
 
+#include <signal.h>
+volatile sig_atomic_t g_running = 1;
 static int passed = 0, failed = 0;
 #define T(n)  fprintf(stderr, "  %-52s ... ", n)
 #define P()   do { passed++; fprintf(stderr, "PASS\n"); } while(0)

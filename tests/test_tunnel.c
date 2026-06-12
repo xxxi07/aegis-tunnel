@@ -7,6 +7,7 @@
 #include "util/util.h"
 
 #include <pthread.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -18,6 +19,7 @@ static int passed = 0, failed = 0;
 
 /* Global peer array (normally in main.c, replicated for tests) */
 #define MAX_PEERS 16
+volatile sig_atomic_t g_running = 1;
 uint8_t g_asym_priv[32];
 uint8_t g_asym_peers[MAX_PEERS][32];
 int    g_peer_count = 0;
