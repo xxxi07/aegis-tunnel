@@ -103,23 +103,20 @@ int tun_up(const char *name)
     return (ret == 0) ? 0 : -1;
 }
 
-/* ─── Add route (to TUN routing table, not main) ──────────────── */
+/* ─── Add route (main table, for server + split-tunnel client) ─── */
 
-#define TUN_ROUTE_TABLE  51820   /* same as fwmark */
+#define TUN_ROUTE_TABLE  51820   /* custom table for full-tunnel client */
 
 int tun_add_route(const char *network, const char *name)
 {
     char cmd[256];
-    /* Add to custom table so only unmarked packets traverse TUN */
     snprintf(cmd, sizeof(cmd),
-             "ip route add %s dev %s table %d 2>/dev/null",
-             network, name, TUN_ROUTE_TABLE);
+             "ip route add %s dev %s 2>/dev/null", network, name);
     int ret = system(cmd);
     if (ret != 0) {
         /* Try replacing if already exists */
         snprintf(cmd, sizeof(cmd),
-                 "ip route replace %s dev %s table %d 2>/dev/null",
-                 network, name, TUN_ROUTE_TABLE);
+                 "ip route replace %s dev %s 2>/dev/null", network, name);
         ret = system(cmd);
     }
     return (ret == 0) ? 0 : -1;

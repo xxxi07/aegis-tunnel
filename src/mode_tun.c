@@ -32,20 +32,17 @@ static void tun_setup_routing(const char *name, const char *allowed_ips,
                                const char *nat_if, int is_server)
 {
     if (is_server) {
-        /* Server: full gateway setup */
+        /* Server: routes in main table, no fwmark policy needed */
         tun_enable_forwarding();
-        tun_set_fwmark_rule(TUN_FWMARK);
         if (allowed_ips && allowed_ips[0]) {
             tun_add_routes_multi(allowed_ips, name);
             tun_set_nat_multi(allowed_ips, nat_if);
         }
         tun_allow_forward(name);
-    } else {
-        /* Client: only routes, no NAT/forwarding */
-        tun_set_fwmark_rule(TUN_FWMARK);
-        if (allowed_ips && allowed_ips[0])
-            tun_add_routes_multi(allowed_ips, name);
     }
+    /* Client routing is handled inline in mode_tun_client:
+     * full tunnel → custom table + fwmark rule
+     * split tunnel → main table, no fwmark rule needed */
 }
 
 /*
@@ -163,16 +160,20 @@ int mode_tun_client(int listen_port, const char *remote_host, int remote_port,
     if (tun_ip && tun_ip[0]) tun_set_ip(name, tun_ip, tun_netmask);
     tun_up(name);
 
+    int is_full_tunnel = 0;
     if (tun_route && tun_route[0]) {
-        if (strcmp(tun_route, "0.0.0.0/0") == 0 || strcmp(tun_route, "::/0") == 0)
+        if (strcmp(tun_route, "0.0.0.0/0") == 0 || strcmp(tun_route, "::/0") == 0) {
             tun_add_full_tunnel(name);
-        else
+            tun_set_fwmark_rule(TUN_FWMARK);  /* only full tunnel needs fwmark bypass */
+            is_full_tunnel = 1;
+        } else {
             tun_add_route(tun_route, name);
+        }
     }
     /* Add multi-subnet routes from AllowedIPs (client side) */
     if (tun_route && tun_route[0] && strchr(tun_route, ','))
         tun_add_routes_multi(tun_route, name);
-    tun_set_fwmark_rule(TUN_FWMARK);
+    (void)is_full_tunnel;
     tun_run_postup(postup, name);
 
     log_info("tun-client", "%s (%s/%s) → %s:%d route=%s (auto-reconnect)",
