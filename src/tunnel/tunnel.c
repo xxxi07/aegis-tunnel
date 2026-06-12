@@ -10,11 +10,11 @@
 #include "tunnel/tunnel.h"
 #include "protocol/frame_reader.h"
 #include "protocol/handshake.h"
-#include "util/log.h"
 #include "util/util.h"
 
 #include <errno.h>
 #include <poll.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -192,7 +192,7 @@ int tunnel_run(tunnel_t *tun)
         int ret = poll(fds, 2, 500);
         if (ret < 0) {
             if (errno == EINTR) continue;
-            log_warn("tunnel", "poll error: %s", strerror(errno));
+            fprintf(stderr, "[tunnel] poll error: %s\n", strerror(errno));
             return -1;
         }
 
@@ -203,7 +203,7 @@ int tunnel_run(tunnel_t *tun)
             if (n < 0) {
                 if (errno == EINTR) continue;
                 if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
-                log_warn("tunnel", "pt_fd recv error: %s (fd=%d)", strerror(errno), pt_fd);
+                fprintf(stderr, "[tunnel] pt_fd recv error: %s (fd=%d)\n", strerror(errno), pt_fd);
                 return -1;
             }
             if (n == 0) {
@@ -231,8 +231,8 @@ int tunnel_run(tunnel_t *tun)
              * 3. Partial frames stay buffered for next poll() cycle.
              */
             int fill = frame_reader_fill(&fr);
-            if (fill < 0) { log_warn("tunnel", "enc_fd read error (fd=%d)", enc_fd); return -1; }
-            if (fill == 0) { log_info("tunnel", "enc_fd EOF (peer disconnected)"); return 0; }
+            if (fill < 0) { fprintf(stderr, "[tunnel] enc_fd read error (fd=%d): %s\n", enc_fd, strerror(errno)); return -1; }
+            if (fill == 0) { fprintf(stderr, "[tunnel] enc_fd EOF (peer disconnected)\n"); return 0; }
 
             for (;;) {
                 if (tun->dec_nonce >= NONCE_OVERFLOW_LIMIT)
@@ -246,7 +246,7 @@ int tunnel_run(tunnel_t *tun)
                                               plaintext, &plen,
                                               tun->dec_nonce, tun->dec_key);
                 if (r == 0) break;    /* need more data — wait for next poll */
-                if (r < 0) { log_warn("tunnel", "frame auth/parse failed (nonce=%lu)", (unsigned long)tun->dec_nonce); return -1; }
+                if (r < 0) { fprintf(stderr, "[tunnel] frame auth/parse failed (nonce=%lu)\n", (unsigned long)tun->dec_nonce); return -1; }
 
                 tun->dec_nonce++;
 
