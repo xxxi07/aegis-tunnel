@@ -31,6 +31,9 @@ ifneq ($(IS_ARM),)
         ARMCRYPTO_SRC := $(SRC_DIR)/crypto/neon/aegis128-armcrypto.c
     endif
 endif
+
+# ARM Crypto needs -march=armv8-a+crypto for vaeseq_u8/vaesmcq_u8 intrinsics
+$(SRC_DIR)/crypto/neon/aegis128-armcrypto.o: CFLAGS += -march=armv8-a+crypto
 $(info [Makefile] ARCH=$(ARCH) IS_ARM=$(IS_ARM) NEON_SRC=$(NEON_SRC) ARMCRYPTO_SRC=$(ARMCRYPTO_SRC))
 
 # ── Source files by module ──
