@@ -32,6 +32,7 @@
 #endif
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* ─── Function pointer dispatch ───────────────────────────────── */
@@ -66,6 +67,11 @@ static decrypt_fn g_decrypt = aegis_pure_decrypt;
 
 void aegis_crypto_init(void)
 {
+    /* Allow forcing pure C via AEGIS_PURE_C=1 for debugging */
+    if (getenv("AEGIS_PURE_C")) {
+        fprintf(stderr, "[crypto] Pure C backend (forced)\n");
+        return;  /* g_encrypt/g_decrypt stay at pure C default */
+    }
 
 #ifdef __x86_64__
     g_encrypt = aegis128_x86_encrypt;
