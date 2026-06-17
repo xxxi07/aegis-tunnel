@@ -22,15 +22,17 @@ INC      := -I$(SRC_DIR)
 ARCH := $(shell uname -m)
 IS_ARM := $(filter aarch64 arm64 armv8%,$(ARCH))
 
+ifneq ($(IS_ARM),)
+    # ARMv8 Crypto extensions (all ARMv8+ chips support this)
+    CFLAGS += -march=armv8-a+crypto
+endif
+
 # ── Source files by module ──
 CRYPTO   := $(SRC_DIR)/crypto/aegis.c
 ifneq ($(IS_ARM),)
 CRYPTO   += $(SRC_DIR)/crypto/neon/aegis128-plain.c \
              $(SRC_DIR)/crypto/neon/aegis128-armcrypto.c
 endif
-
-# ARM Crypto needs -march=armv8-a+crypto for vaeseq_u8/vaesmcq_u8 intrinsics
-$(SRC_DIR)/crypto/neon/aegis128-armcrypto.o: CFLAGS += -march=armv8-a+crypto
 UTIL     := $(SRC_DIR)/util/util.c $(SRC_DIR)/util/log.c $(SRC_DIR)/util/config.c $(SRC_DIR)/util/iniconfig.c
 PROTOCOL := $(SRC_DIR)/protocol/handshake.c $(SRC_DIR)/protocol/ecdh.c $(SRC_DIR)/protocol/frame_reader.c $(SRC_DIR)/protocol/keyfile.c
 TUNNEL   := $(SRC_DIR)/tunnel/tunnel.c $(SRC_DIR)/tunnel/threadpool.c $(SRC_DIR)/tunnel/tun.c
