@@ -40,16 +40,16 @@ typedef struct {
 /* ─── One-shot API (stateless, per-message) ───────────────────── */
 
 /*
+ * Auto-detect the best crypto backend at startup.
+ * Call once before any encrypt/decrypt operations.
+ * On x86_64: tries AES-NI, falls back to pure C.
+ * On aarch64: tries ARM Crypto, then NEON, falls back to pure C.
+ */
+void aegis_crypto_init(void);
+
+/*
  * Encrypt plaintext with associated data.
- *
- *   c:    output ciphertext buffer (same length as m; may alias m)
- *   tag:  output authentication tag (AEGIS_TAG_LEN = 16 bytes)
- *   m:    plaintext input
- *   mlen: plaintext length in bytes
- *   ad:   associated data (may be NULL if adlen == 0)
- *   adlen: associated data length in bytes
- *   nonce: 16-byte nonce (must be unique per key)
- *   key:  16-byte encryption key
+ * (dispatches to the best available implementation chosen by aegis_crypto_init)
  */
 void aegis_encrypt(uint8_t *c, uint8_t tag[AEGIS_TAG_LEN],
                    const uint8_t *m, size_t mlen,
@@ -59,15 +59,7 @@ void aegis_encrypt(uint8_t *c, uint8_t tag[AEGIS_TAG_LEN],
 
 /*
  * Decrypt ciphertext with associated data and verify tag.
- *
- *   m:    output plaintext buffer (same length as c; may alias c)
- *   c:    ciphertext input
- *   clen: ciphertext length in bytes
- *   ad:   associated data (must match what was passed to aegis_encrypt)
- *   adlen: associated data length in bytes
- *   nonce: 16-byte nonce (must match encryption nonce)
- *   key:  16-byte decryption key (must match encryption key)
- *   tag:  16-byte authentication tag to verify
+ * (dispatches to the best available implementation chosen by aegis_crypto_init)
  *
  * Returns 0 on success, -1 on authentication failure.
  * On failure, the output buffer m is zeroed.

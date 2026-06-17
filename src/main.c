@@ -883,6 +883,9 @@ int main(int argc, char **argv) {
     sigaction(SIGCHLD, &sa, NULL);
     signal(SIGPIPE, SIG_IGN);
 
+    /* Select the fastest crypto backend for this platform */
+    aegis_crypto_init();
+
     int ret;
     if (tun_mode) {
         if (!strcmp(mode, "server"))

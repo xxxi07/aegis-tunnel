@@ -22,7 +22,69 @@
  */
 
 #include "crypto/aegis.h"
+
+/* ─── Optimized backends ──────────────────────────────────────── */
+#ifdef __x86_64__
+#include "crypto/x86/aegis128-x86.h"
+#endif
+#ifdef __aarch64__
+#include "crypto/neon/aegis128-armcrypto.h"
+#endif
+
+#include <stdio.h>
 #include <string.h>
+
+/* ─── Function pointer dispatch ───────────────────────────────── */
+typedef void (*encrypt_fn)(uint8_t*, uint8_t[AEGIS_TAG_LEN],
+                           const uint8_t*, size_t,
+                           const uint8_t*, size_t,
+                           const uint8_t[AEGIS_NONCE_LEN],
+                           const uint8_t[AEGIS_KEY_LEN]);
+typedef int  (*decrypt_fn)(uint8_t*,
+                           const uint8_t*, size_t,
+                           const uint8_t*, size_t,
+                           const uint8_t[AEGIS_NONCE_LEN],
+                           const uint8_t[AEGIS_KEY_LEN],
+                           const uint8_t[AEGIS_TAG_LEN]);
+
+/* Forward declaration of pure C functions */
+static void aegis_pure_encrypt(uint8_t *c, uint8_t tag[AEGIS_TAG_LEN],
+                               const uint8_t *m, size_t ml,
+                               const uint8_t *ad, size_t adl,
+                               const uint8_t nonce[AEGIS_NONCE_LEN],
+                               const uint8_t key[AEGIS_KEY_LEN]);
+static int  aegis_pure_decrypt(uint8_t *m,
+                               const uint8_t *c, size_t cl,
+                               const uint8_t *ad, size_t adl,
+                               const uint8_t nonce[AEGIS_NONCE_LEN],
+                               const uint8_t key[AEGIS_KEY_LEN],
+                               const uint8_t tag[AEGIS_TAG_LEN]);
+
+/* Default to pure C — aegis_crypto_init() upgrades if optimized available */
+static encrypt_fn g_encrypt = aegis_pure_encrypt;
+static decrypt_fn g_decrypt = aegis_pure_decrypt;
+
+void aegis_crypto_init(void)
+{
+
+#ifdef __x86_64__
+    g_encrypt = aegis128_x86_encrypt;
+    g_decrypt = aegis128_x86_decrypt;
+    fprintf(stderr, "[crypto] x86 AES-NI backend\n");
+    return;
+#endif
+
+#ifdef __aarch64__
+    if (aegis128_armcrypto_available()) {
+        g_encrypt = aegis128_armcrypto_encrypt;
+        g_decrypt = aegis128_armcrypto_decrypt;
+        fprintf(stderr, "[crypto] ARM Crypto backend\n");
+        return;
+    }
+    fprintf(stderr, "[crypto] Pure C backend (no ARM Crypto)\n");
+    return;
+#endif
+}
 
 /* ════════════════════════════════════════════════════════════════
  * AES Building Blocks
@@ -509,7 +571,7 @@ int aegis_dec_final(aegis_state_t *st,
  * One-shot API Implementation
  * ════════════════════════════════════════════════════════════════ */
 
-void aegis_encrypt(uint8_t *c, uint8_t tag[AEGIS_TAG_LEN],
+static void aegis_pure_encrypt(uint8_t *c, uint8_t tag[AEGIS_TAG_LEN],
                    const uint8_t *m, size_t mlen,
                    const uint8_t *ad, size_t adlen,
                    const uint8_t nonce[AEGIS_NONCE_LEN],
@@ -538,7 +600,7 @@ void aegis_encrypt(uint8_t *c, uint8_t tag[AEGIS_TAG_LEN],
                     tag);
 }
 
-int aegis_decrypt(uint8_t *m,
+static int aegis_pure_decrypt(uint8_t *m,
                   const uint8_t *c, size_t clen,
                   const uint8_t *ad, size_t adlen,
                   const uint8_t nonce[AEGIS_NONCE_LEN],
@@ -566,4 +628,25 @@ int aegis_decrypt(uint8_t *m,
                            c + full_blocks,
                            rem,
                            tag);
+}
+
+/* ─── Dispatch wrappers (call through g_encrypt / g_decrypt) ──── */
+
+void aegis_encrypt(uint8_t *c, uint8_t tag[AEGIS_TAG_LEN],
+                   const uint8_t *m, size_t mlen,
+                   const uint8_t *ad, size_t adlen,
+                   const uint8_t nonce[AEGIS_NONCE_LEN],
+                   const uint8_t key[AEGIS_KEY_LEN])
+{
+    g_encrypt(c, tag, m, mlen, ad, adlen, nonce, key);
+}
+
+int aegis_decrypt(uint8_t *m,
+                  const uint8_t *c, size_t clen,
+                  const uint8_t *ad, size_t adlen,
+                  const uint8_t nonce[AEGIS_NONCE_LEN],
+                  const uint8_t key[AEGIS_KEY_LEN],
+                  const uint8_t tag[AEGIS_TAG_LEN])
+{
+    return g_decrypt(m, c, clen, ad, adlen, nonce, key, tag);
 }
