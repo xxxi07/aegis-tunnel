@@ -18,8 +18,21 @@ LIBDIR   ?= $(PREFIX)/lib
 SRC_DIR  := src
 INC      := -I$(SRC_DIR)
 
+# ── Architecture detection ──
+ARCH := $(shell uname -m)
+ifeq ($(ARCH),aarch64)
+    CFLAGS += -DAEGIS_HAVE_NEON
+    NEON_SRC := $(SRC_DIR)/crypto/neon/aegis128-plain.c
+    # ARM Crypto extensions (aese/aesmc instructions)
+    ARMCRYPTO_CHECK := $(shell $(CC) -march=armv8-a+crypto -dM -E - < /dev/null 2>/dev/null && echo ok || echo no)
+    ifeq ($(ARMCRYPTO_CHECK),ok)
+        CFLAGS += -DAEGIS_HAVE_ARMCRYPTO
+        ARMCRYPTO_SRC := $(SRC_DIR)/crypto/neon/aegis128-armcrypto.c
+    endif
+endif
+
 # ── Source files by module ──
-CRYPTO   := $(SRC_DIR)/crypto/aegis.c
+CRYPTO   := $(SRC_DIR)/crypto/aegis.c $(NEON_SRC) $(ARMCRYPTO_SRC)
 UTIL     := $(SRC_DIR)/util/util.c $(SRC_DIR)/util/log.c $(SRC_DIR)/util/config.c $(SRC_DIR)/util/iniconfig.c
 PROTOCOL := $(SRC_DIR)/protocol/handshake.c $(SRC_DIR)/protocol/ecdh.c $(SRC_DIR)/protocol/frame_reader.c $(SRC_DIR)/protocol/keyfile.c
 TUNNEL   := $(SRC_DIR)/tunnel/tunnel.c $(SRC_DIR)/tunnel/threadpool.c $(SRC_DIR)/tunnel/tun.c
