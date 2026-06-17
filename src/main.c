@@ -356,20 +356,34 @@ static int cmd_peer_delete(const char *name) {
         if (!out) { fclose(in); return 0; }
 
         char line[512];
-        int in_peer = 0, skip_peer = 0;
+        int in_peer = 0, skip_peer = 0, wrote_peer = 0;
         while (fgets(line, sizeof(line), in)) {
             if (line[0] == '[') {
-                /* New section — flush previous decision */
-                if (in_peer && skip_peer) { in_peer = 0; skip_peer = 0; }
-                if (strstr(line, "[Peer]")) {
-                    in_peer = 1; skip_peer = 0;
-                } else {
-                    if (in_peer) { in_peer = 0; skip_peer = 0; }
+                /* Flush buffered [Peer] header if previous peer was NOT skipped */
+                if (in_peer && !skip_peer && !wrote_peer) {
+                    fputs("[Peer]\n", out);  /* write the delayed header */
                 }
+                in_peer = 0; skip_peer = 0; wrote_peer = 0;
+                if (strstr(line, "[Peer]")) {
+                    in_peer = 1;  /* delay writing [Peer] until we know it's not skipped */
+                } else {
+                    fputs(line, out);  /* non-Peer section header: write immediately */
+                }
+                continue;
             }
             if (in_peer && hx[0] && strstr(line, "PublicKey") && strstr(line, hx))
                 skip_peer = 1;
-            if (!skip_peer) fputs(line, out);
+            if (skip_peer) continue;
+            /* Write delayed [Peer] header before first content line */
+            if (in_peer && !wrote_peer) {
+                fputs("[Peer]\n", out);
+                wrote_peer = 1;
+            }
+            fputs(line, out);
+        }
+        /* Flush trailing [Peer] header */
+        if (in_peer && !skip_peer && !wrote_peer) {
+            fputs("[Peer]\n", out);
         }
         fclose(in); fclose(out);
         rename(tmp, "aegis.conf");
