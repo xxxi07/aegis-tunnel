@@ -153,10 +153,11 @@ static void usage(const char *prog) {
         "Commands (recommended workflow):\n"
         "  keygen                         Generate keys + aegis.conf\n"
         "  peer add <name> <hex|file>     Add peer's public key\n"
+        "  peer delete <name>             Remove peer's public key\n"
+        "  peer list                      List known peers\n"
         "  create tun -server|-client      Generate TUN config from aegis.conf\n"
         "  start tun -server|-client       Start TUN VPN from config\n"
         "  tun down [name]                Remove TUN device + iptables rules\n"
-        "  peer list                      List known peers\n"
         "  status                         Show key/peer status\n"
         "\n"
         "TUN workflow:\n"
@@ -324,6 +325,59 @@ static int cmd_peer_add(const char *host, const char *hex_or_file) {
     }
     return 0;
 }
+static int cmd_peer_delete(const char *name) {
+    const char *home = get_real_home();
+    char peerfile[520];
+    snprintf(peerfile, sizeof(peerfile), "%s/.aegis-tunnel/peers/%s.pub", home, name);
+
+    /* Read the peer's public key to identify the config section */
+    char hx[65] = "";
+    FILE *pf = fopen(peerfile, "r");
+    if (pf) {
+        size_t nr = fread(hx, 1, 64, pf); hx[nr] = '\0';
+        for (int i = (int)nr - 1; i >= 0 && (hx[i] == '\n' || hx[i] == '\r'); i--) hx[i] = '\0';
+        fclose(pf);
+    }
+
+    /* Delete the .pub file */
+    if (unlink(peerfile) != 0) {
+        fprintf(stderr, "Peer '%s' not found.\n", name);
+        return 1;
+    }
+    printf("Peer '%s' removed from key storage.\n", name);
+
+    /* Remove matching [Peer] section from aegis.conf */
+    if (access("aegis.conf", F_OK) == 0) {
+        FILE *in = fopen("aegis.conf", "r");
+        if (!in) return 0;
+        char tmp[520];
+        snprintf(tmp, sizeof(tmp), "aegis.conf.%d", getpid());
+        FILE *out = fopen(tmp, "w");
+        if (!out) { fclose(in); return 0; }
+
+        char line[512];
+        int in_peer = 0, skip_peer = 0;
+        while (fgets(line, sizeof(line), in)) {
+            if (line[0] == '[') {
+                /* New section — flush previous decision */
+                if (in_peer && skip_peer) { in_peer = 0; skip_peer = 0; }
+                if (strstr(line, "[Peer]")) {
+                    in_peer = 1; skip_peer = 0;
+                } else {
+                    if (in_peer) { in_peer = 0; skip_peer = 0; }
+                }
+            }
+            if (in_peer && hx[0] && strstr(line, "PublicKey") && strstr(line, hx))
+                skip_peer = 1;
+            if (!skip_peer) fputs(line, out);
+        }
+        fclose(in); fclose(out);
+        rename(tmp, "aegis.conf");
+        printf("Config updated: aegis.conf (-[Peer])\n");
+    }
+    return 0;
+}
+
 static int cmd_peer_list(void) {
     const char *home = get_real_home();
     char dir[520]; snprintf(dir, sizeof(dir), "%s/.aegis-tunnel/peers", home);
@@ -523,8 +577,10 @@ int main(int argc, char **argv) {
         if (!strcmp(argv[1], "peer") && argc >= 3) {
             if (!strcmp(argv[2], "list"))  return cmd_peer_list();
             if (!strcmp(argv[2], "add") && argc >= 5) return cmd_peer_add(argv[3], argv[4]);
-            fprintf(stderr, "Usage: %s peer add <host> <hex-or-file>\n", argv[0]);
+            if (!strcmp(argv[2], "delete") && argc >= 4) return cmd_peer_delete(argv[3]);
+            fprintf(stderr, "Usage: %s peer add <name> <hex-or-file>\n", argv[0]);
             fprintf(stderr, "       %s peer list\n", argv[0]);
+            fprintf(stderr, "       %s peer delete <name>\n", argv[0]);
             return 1;
         }
         /* create tun -server | -client */
