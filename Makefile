@@ -27,8 +27,14 @@ ifneq ($(IS_ARM),)
     CFLAGS += -march=armv8-a+crypto
 endif
 
+# x86_64 AES-NI
+ifeq ($(ARCH),x86_64)
+    CFLAGS += -DAEGIS_HAVE_AESNI -maes -msse2
+    CRYPTO_AESNI := $(SRC_DIR)/crypto/x86/aegis128-x86.c
+endif
+
 # ── Source files by module ──
-CRYPTO   := $(SRC_DIR)/crypto/aegis.c
+CRYPTO   := $(SRC_DIR)/crypto/aegis.c $(CRYPTO_AESNI)
 ifneq ($(IS_ARM),)
 CRYPTO   += $(SRC_DIR)/crypto/neon/aegis128-plain.c \
              $(SRC_DIR)/crypto/neon/aegis128-armcrypto.c
