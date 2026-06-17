@@ -19,6 +19,12 @@
 #include "crypto/neon/aegis128-plain.h"
 #include <string.h>
 
+/* AArch64 NEON uses vqtbl4q prefix; ARM32 uses vtbl4q.
+ * Map the old names for backward compat if on aarch64. */
+#ifndef vtbl4q_u8
+#define vtbl4q_u8  vqtbl4q_u8
+#endif
+
 /* ════════════════════════════════════════════════════════════════
  * AES Building Blocks (NEON)
  * ════════════════════════════════════════════════════════════════ */
