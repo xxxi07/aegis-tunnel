@@ -106,7 +106,7 @@ static double bench_x86_aesni(void)
 
 /* ─── Run ARM Crypto benchmark (if available) ─────────────────── */
 
-#ifdef AEGIS_HAVE_ARMCRYPTO
+#ifdef __aarch64__
 #include "crypto/neon/aegis128-armcrypto.h"
 
 static double bench_armcrypto(void)
@@ -135,7 +135,7 @@ static double bench_armcrypto(void)
 }
 #endif
 
-#ifdef AEGIS_HAVE_NEON
+#ifdef __aarch64__
 #include "crypto/neon/aegis128-plain.h"
 
 static double bench_neon(void)
@@ -210,7 +210,7 @@ int main(void)
 #endif
 
     /* NEON benchmark (if available) */
-#ifdef AEGIS_HAVE_NEON
+#ifdef __aarch64__
     {
         double w = bench_neon(); (void)w;
         double neon_mbps = bench_neon();
@@ -222,7 +222,7 @@ int main(void)
 #endif
 
     /* ARM Crypto benchmark (if available) */
-#ifdef AEGIS_HAVE_ARMCRYPTO
+#ifdef __aarch64__
     if (aegis128_armcrypto_available()) {
         double w = bench_armcrypto(); (void)w;
         double ac_mbps = bench_armcrypto();
@@ -233,7 +233,7 @@ int main(void)
     printf("ARM Crypto:   [not available on this platform]\n");
 
     printf("\nPlatform: %s\n",
-#ifdef __x86_64__
+#ifdef AEGIS_HAVE_AESNI
            "x86_64"
 #elif defined(__aarch64__)
            "aarch64 (ARM 64-bit)"

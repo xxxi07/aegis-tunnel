@@ -21,23 +21,16 @@ INC      := -I$(SRC_DIR)
 # ── Architecture detection ──
 ARCH := $(shell uname -m)
 IS_ARM := $(filter aarch64 arm64 armv8%,$(ARCH))
+
+# ── Source files by module ──
+CRYPTO   := $(SRC_DIR)/crypto/aegis.c
 ifneq ($(IS_ARM),)
-    CFLAGS += -DAEGIS_HAVE_NEON
-    NEON_SRC := $(SRC_DIR)/crypto/neon/aegis128-plain.c
-    # ARM Crypto extensions (aese/aesmc instructions)
-    ARMCRYPTO_CHECK := $(shell $(CC) -march=armv8-a+crypto -E - < /dev/null 2>/dev/null && echo ok || echo no)
-    ifeq ($(ARMCRYPTO_CHECK),ok)
-        CFLAGS += -DAEGIS_HAVE_ARMCRYPTO
-        ARMCRYPTO_SRC := $(SRC_DIR)/crypto/neon/aegis128-armcrypto.c
-    endif
+CRYPTO   += $(SRC_DIR)/crypto/neon/aegis128-plain.c \
+             $(SRC_DIR)/crypto/neon/aegis128-armcrypto.c
 endif
 
 # ARM Crypto needs -march=armv8-a+crypto for vaeseq_u8/vaesmcq_u8 intrinsics
 $(SRC_DIR)/crypto/neon/aegis128-armcrypto.o: CFLAGS += -march=armv8-a+crypto
-$(info [Makefile] ARCH=$(ARCH) IS_ARM=$(IS_ARM) NEON_SRC=$(NEON_SRC) ARMCRYPTO_SRC=$(ARMCRYPTO_SRC))
-
-# ── Source files by module ──
-CRYPTO   := $(SRC_DIR)/crypto/aegis.c $(NEON_SRC) $(ARMCRYPTO_SRC)
 UTIL     := $(SRC_DIR)/util/util.c $(SRC_DIR)/util/log.c $(SRC_DIR)/util/config.c $(SRC_DIR)/util/iniconfig.c
 PROTOCOL := $(SRC_DIR)/protocol/handshake.c $(SRC_DIR)/protocol/ecdh.c $(SRC_DIR)/protocol/frame_reader.c $(SRC_DIR)/protocol/keyfile.c
 TUNNEL   := $(SRC_DIR)/tunnel/tunnel.c $(SRC_DIR)/tunnel/threadpool.c $(SRC_DIR)/tunnel/tun.c
