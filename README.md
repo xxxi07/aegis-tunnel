@@ -50,7 +50,6 @@ src/
 └── util/               # Utilities
     ├── util.c/h        # hex_dump / random_bytes / secure_memzero
     ├── iniconfig.c/h   # WireGuard-style INI parser
-    ├── config.c/h      # Legacy key=value compat parser (unused)
     └── log.c/h         # Logging module
 ```
 

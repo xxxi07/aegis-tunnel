@@ -64,10 +64,10 @@ fallback:
 int cmd_keygen(void)
 {
     const char *home = get_real_home();
-    char dir[512]; snprintf(dir, sizeof(dir), "%s/.aegis-tunnel", home);
+    char dir[768]; snprintf(dir, sizeof(dir), "%s/.aegis-tunnel", home);
     mkdir(dir, 0700);
 
-    char priv[520], pub[520];
+    char priv[768], pub[768];
     snprintf(priv, sizeof(priv), "%s/private.key", dir);
     snprintf(pub, sizeof(pub), "%s/public.key", dir);
     if (keyfile_generate(priv, pub) != 0) return 1;
@@ -108,7 +108,7 @@ int cmd_keygen(void)
 int cmd_peer_add(const char *host, const char *hex_or_file)
 {
     const char *home = get_real_home();
-    char dir[520], peer_dir[520], path[520];
+    char dir[768], peer_dir[768], path[768];
     snprintf(dir, sizeof(dir), "%s/.aegis-tunnel", home);
     snprintf(peer_dir, sizeof(peer_dir), "%s/peers", dir);
     mkdir(dir, 0700); mkdir(peer_dir, 0700);
@@ -137,14 +137,14 @@ int cmd_peer_add(const char *host, const char *hex_or_file)
 
     /* Update/create config file in current directory */
     {
-        char cfg[520] = "aegis.conf";
+        char cfg[768] = "aegis.conf";
 
         if (access(cfg, F_OK) != 0) {
             FILE *cf = fopen(cfg, "w");
             if (cf) {
                 char our_pub[65] = "";
                 {
-                    char pub_path[520];
+                    char pub_path[768];
                     snprintf(pub_path, sizeof(pub_path), "%s/public.key", dir);
                     FILE *pf = fopen(pub_path, "r");
                     if (pf) { size_t nr = fread(our_pub, 1, 64, pf); our_pub[nr] = '\0'; fclose(pf); }
@@ -162,7 +162,7 @@ int cmd_peer_add(const char *host, const char *hex_or_file)
             }
         }
 
-        char peerfile[520], hx[65] = "";
+        char peerfile[768], hx[65] = "";
         snprintf(peerfile, sizeof(peerfile), "%s/%s.pub", peer_dir, host);
         FILE *pf = fopen(peerfile, "r");
         if (pf) { size_t nr = fread(hx, 1, 64, pf); hx[nr]='\0';
@@ -200,7 +200,7 @@ int cmd_peer_add(const char *host, const char *hex_or_file)
 int cmd_peer_delete(const char *name)
 {
     const char *home = get_real_home();
-    char peerfile[520];
+    char peerfile[768];
     snprintf(peerfile, sizeof(peerfile), "%s/.aegis-tunnel/peers/%s.pub", home, name);
 
     char hx[65] = "";
@@ -220,7 +220,7 @@ int cmd_peer_delete(const char *name)
     if (access("aegis.conf", F_OK) == 0) {
         FILE *in = fopen("aegis.conf", "r");
         if (!in) return 0;
-        char tmp[520];
+        char tmp[768];
         snprintf(tmp, sizeof(tmp), "aegis.conf.%d", getpid());
         FILE *out = fopen(tmp, "w");
         if (!out) { fclose(in); return 0; }
@@ -264,7 +264,7 @@ int cmd_peer_delete(const char *name)
 int cmd_peer_list(void)
 {
     const char *home = get_real_home();
-    char dir[520]; snprintf(dir, sizeof(dir), "%s/.aegis-tunnel/peers", home);
+    char dir[768]; snprintf(dir, sizeof(dir), "%s/.aegis-tunnel/peers", home);
     DIR *d = opendir(dir);
     if (!d) { printf("No peers configured yet.\n"); return 0; }
     printf("Known peers:\n");
@@ -284,11 +284,11 @@ int cmd_peer_list(void)
 int cmd_status(void)
 {
     const char *home = get_real_home();
-    char dir[520]; snprintf(dir, sizeof(dir), "%s/.aegis-tunnel", home);
+    char dir[768]; snprintf(dir, sizeof(dir), "%s/.aegis-tunnel", home);
     printf("Key storage: %s\n", dir);
     struct stat st;
     if (stat(dir, &st) == 0) {
-        char path[520];
+        char path[768];
         snprintf(path, sizeof(path), "%s/private.key", dir);
         printf("  Private key: %s (%s)\n", path,
                (access(path, F_OK) == 0) ? "exists" : "missing");
@@ -347,7 +347,7 @@ int cmd_create_tun(int is_server)
     char pubkey_hex[65] = "";
     {
         const char *home = get_real_home();
-        char pub_path[520];
+        char pub_path[768];
         snprintf(pub_path, sizeof(pub_path), "%s/.aegis-tunnel/public.key", home);
         FILE *f = fopen(pub_path, "r");
         if (f) {

@@ -409,7 +409,7 @@ int main(int argc, char **argv) {
     }
 
     /* Default key paths: ~/.aegis-tunnel/ */
-    char key_dir[512], default_priv[520];
+    char key_dir[768], default_priv[768];
     { const char *home = get_real_home();
       snprintf(key_dir, sizeof(key_dir), "%s/.aegis-tunnel", home);
       mkdir(key_dir, 0700); }
@@ -417,7 +417,7 @@ int main(int argc, char **argv) {
     if (!privkey_file) {
         snprintf(default_priv, sizeof(default_priv), "%s/private.key", key_dir);
         if (access(default_priv, F_OK) != 0) {
-            char pub_path[520];
+            char pub_path[768];
             snprintf(pub_path, sizeof(pub_path), "%s/public.key", key_dir);
             log_info("main", "auto-generating keypair in %s", key_dir);
             keyfile_generate(default_priv, pub_path);
@@ -443,12 +443,12 @@ int main(int argc, char **argv) {
         }
     } else if (g_peer_count == 0) {
         /* No peer from config or -Q → auto-detect from ~/.aegis-tunnel/peers/ */
-        char peer_dir[520];
+        char peer_dir[768];
         snprintf(peer_dir, sizeof(peer_dir), "%s/peers", key_dir);
         mkdir(peer_dir, 0700);
 
         int peer_count = 0;
-        char found_peer[520] = "";
+        char found_peer[768] = "";
         {
             DIR *d = opendir(peer_dir);
             if (d) {
@@ -474,7 +474,7 @@ int main(int argc, char **argv) {
             fprintf(stderr, "\n═══ No peer key found ═══\n");
             fprintf(stderr, "Your public key (send to peer):\n  ");
             {
-                char pub_path[520];
+                char pub_path[768];
                 snprintf(pub_path, sizeof(pub_path), "%s/public.key", key_dir);
                 uint8_t our_pub[32];
                 if (keyfile_load_public(our_pub, pub_path) == 0) {
