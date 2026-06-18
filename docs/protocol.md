@@ -2,7 +2,7 @@
 
 ## 1. 概述
 
-AEGIS-Tunnel 协议在 TCP 之上提供加密隧道功能。协议使用 AEGIS-128 认证加密算法保护数据传输，并通过预共享密钥（PSK）进行双向认证。
+AEGIS-Tunnel 协议在 TCP 之上提供加密隧道功能。协议使用 AEGIS-128 认证加密算法保护数据传输，并通过 X25519 椭圆曲线 Diffie-Hellman（3-DH）非对称握手进行双向认证和会话密钥协商。
 
 ## 2. 加密算法
 
@@ -74,16 +74,20 @@ encrypt(payload, ad=frame_header[0..3], nonce=nonce_from_counter, key=session_ke
 
 帧头（4 字节）作为关联数据传递给 AEGIS-128。
 
-## 4. 握手协议
+## 4. 握手协议（X25519 3-DH）
 
-### 4.1 握手帧负载格式
+### 4.1 加密后端
+
+握手帧使用 AEGIS-128 加密，自动选择最优后端（x86 AES-NI > ARM Crypto > ARM NEON > Pure C）。
+
+### 4.2 握手帧负载格式
 
 ```
  0                   1                   2                   3
  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 |                                                               |
-|                   Peer Nonce (16 bytes)                       |
+|               Ephemeral Public Key (32 bytes)                 |
 |                                                               |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 |                                                               |
@@ -92,44 +96,65 @@ encrypt(payload, ad=frame_header[0..3], nonce=nonce_from_counter, key=session_ke
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 ```
 
-### 4.2 握手流程
+- handshake_init: 32 字节临时公钥 + 8 字节时间戳（共 40 字节明文）
+- handshake_resp: 同格式
+- 加密后帧 = 4 字节头 + 40 字节密文 + 16 字节 tag = 60 字节线数据
+
+### 4.3 握手流程
 
 ```
-客户端                                    服务器
-  |                                          |
-  |─ HANDSHAKE(nonce_c || ts_c) ────────────▶|
-  |   (用 init_key 加密, nonce=0)             |
-  |                                          |  验证 ts_c 在 ±60s 内
-  |                                          |  生成 nonce_s
-  |◀─ HANDSHAKE(nonce_s || ts_s) ────────────│
-  |   (用 init_key 加密, nonce=0)             |
-  |                                          |
-  |  双方计算:                                |
-  |  session_secret = SHA256(PSK ||           |
-  |      nonce_c || nonce_s)                 |
-  |  enc_key = session_secret[0..15]         |
-  |  dec_key = session_secret[16..31]        |
-  |                                          |
-  |── DATA(加密流量, nonce=1,2,3...) ────────▶|
-  |◀─ DATA(加密流量, nonce=1,2,3...) ────────│
+客户端                                         服务器
+  |                                               |
+  | 生成临时密钥对 (eph_sk_c, eph_pk_c)            |
+  |                                               |
+  |── HANDSHAKE(eph_pk_c || ts_c) ──────────────▶|
+  |   (用 init_key 加密, nonce=0)                 | 尝试所有已知 Peer 公钥
+  |                                               | 验证时间戳 ±60s
+  |                                               | 生成临时密钥对 (eph_sk_s, eph_pk_s)
+  |                                               |
+  |◀── HANDSHAKE(eph_pk_s || ts_s) ──────────────│
+  |   (用 resp_key 加密, nonce=0)                 |
+  |                                               |
+  |  双方计算共享密钥:                             |
+  |  ee = X25519(eph_sk, peer_eph_pk)             |
+  |  es = X25519(static_sk, peer_eph_pk)          |
+  |  se = X25519(eph_sk, peer_static_pk)          |
+  |  shared = SHA256(ee || es || se || "shared")  |
+  |                                               |
+  |◀══ KEY_CONFIRM ─══════════════════════════════│ (空帧，AEGIS 加密)
+  |══▶ KEY_CONFIRM ─══════════════════════════════▶| (空帧，AEGIS 加密)
+  |                                               |
+  |══▶ DATA (加密流量, nonce=1,2,3...) ──────────▶|
+  |◀══ DATA (加密流量, nonce=1,2,3...) ───────────│
 ```
 
-### 4.3 密钥派生
+### 4.4 密钥派生
 
-初始密钥（保护握手）：
+握手初始密钥（客户端发起）：
 ```
-init_key = SHA256(PSK || "AEGIS-TUNNEL-HANDSHAKE-V1")[0..15]
+ee_init = X25519(client_static_sk, server_static_pk)
+es_init = X25519(client_eph_sk, server_static_pk)
+init_key = SHA256(ee_init || es_init || "init")[0..15]
+```
+
+握手响应密钥（服务端回复）：
+```
+resp_key = SHA256(shared_secret || "resp")[0..15]
 ```
 
 会话密钥（保护数据）：
 ```
-session_secret = SHA256(PSK || client_nonce || server_nonce)
-client_enc_key = session_secret[0..15]
-server_enc_key = session_secret[16..31]
+shared_secret = SHA256(ee || es || se || "shared")
+session_enc_key = shared_secret[0..15]
+session_dec_key = shared_secret[16..31]
 ```
 
-客户端使用 client_enc_key 加密发送方向，server_enc_key 解密接收方向；
-服务器端则相反。
+客户端使用 enc_key 加密发送方向，dec_key 解密接收方向；
+服务器端则相反（enc_key 和 dec_key 互换）。
+
+### 4.5 KEY_CONFIRM
+
+握手完成后，服务端和客户端各发送一个空的 KEY_CONFIRM 帧（payload=0），用协商后的会话密钥加密。双方验证解密成功后才进入数据传输阶段，防止中间人篡改握手。
 
 ## 5. 安全考虑
 
@@ -155,7 +180,8 @@ server_enc_key = session_secret[16..31]
 
 ### 5.5 限制
 
-- 不提供前向安全性（使用静态 PSK）
-- 不提供身份保护（握手帧虽然加密，但使用 PSK 派生密钥）
+- 提供前向安全性（每次会话独立生成临时密钥对）
+- 不提供身份保护（握手帧使用 ECDH 派生密钥加密，帧头明文）
 - 最大帧负载 65535 字节
 - 不支持分片或流控制
+- Re-key 默认禁用（需显式配置 PSK 和 rekey_sec）

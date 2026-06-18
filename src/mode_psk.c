@@ -2,6 +2,7 @@
  * mode_psk.c — Asymmetric handshake server/client modes
  */
 #include "main.h"
+#include "mode_common.h"
 #include "protocol/handshake.h"
 #include "tunnel/tunnel.h"
 #include "util/log.h"
@@ -19,21 +20,8 @@
 #include <unistd.h>
 
 /*
- * Try handshake with each known peer key.  Returns 0 on success
- * (keys filled), -1 if no peer key works.
- * Like SSH authorized_keys: any known peer can connect.
+ * Try handshake with the single known peer (client only).
  */
-static int try_handshake_server(int fd, session_keys_t *keys, int timeout_ms)
-{
-    for (int i = 0; i < g_peer_count; i++) {
-        if (handshake_server(fd, g_asym_priv, g_asym_peers[i], timeout_ms, keys) == 0) {
-            log_info("server", "peer #%d authenticated", i);
-            return 0;
-        }
-    }
-    return -1;
-}
-
 static int try_handshake_client(int fd, session_keys_t *keys, int timeout_ms)
 {
     /* Client only knows one peer (the server) */
@@ -58,7 +46,6 @@ int mode_psk_server(int listen_port, const char *remote_host, int remote_port,
 
         char ip[INET_ADDRSTRLEN]; inet_ntop(AF_INET, &ca.sin_addr, ip, sizeof(ip));
         log_info("server", "#%d %s:%d", (int)g_active_conns+1, ip, ntohs(ca.sin_port));
-        set_socket_timeout(client_fd, hs_timeout);
 
         pid_t pid = fork();
         if (pid < 0) { close(client_fd); continue; }
@@ -113,7 +100,6 @@ int mode_psk_client(int listen_port, const char *remote_host, int remote_port,
                 if (retry_delay == 0) log_error("client", "cannot connect to %s:%d", remote_host, remote_port);
                 goto retry;
             }
-            set_socket_timeout(tunnel_fd, hs_timeout);
 
             session_keys_t keys;
             if (try_handshake_client(tunnel_fd, &keys, hs_timeout) == 0 &&

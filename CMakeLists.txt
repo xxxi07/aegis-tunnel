@@ -87,6 +87,8 @@ set(MAIN_SOURCES
     src/main.c
     src/mode_psk.c
     src/mode_tun.c
+    src/config_mgmt.c
+    src/mode_common.c
     ${LIB_SOURCES}
 )
 

@@ -2,11 +2,12 @@
  * main.c — AEGIS-Tunnel entry point (argument parsing + dispatch)
  *
  * Asymmetric handshake only. Use aegis-tunnel-keygen to create keys.
+ * Subcommand implementations → config_mgmt.c
+ * Shared mode helpers       → mode_common.c
  */
 #include "main.h"
-#include "protocol/handshake.h"
+#include "config_mgmt.h"
 #include "protocol/keyfile.h"
-#include "tunnel/tun.h"
 #include "util/config.h"
 #include "util/iniconfig.h"
 #include "util/log.h"
@@ -18,7 +19,6 @@
 #include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
-#include <pwd.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -48,48 +48,7 @@ static void sigchld_handler(int sig) {
     while (waitpid(-1, NULL, WNOHANG) > 0) g_active_conns--;
 }
 
-/* Get real user's home directory, even when running under sudo. */
-/* Detect the default network interface (the one with the default route).
- * Returns "eth0" as fallback if detection fails. */
-static const char *detect_default_iface(void)
-{
-    static char iface[16] = "";
-    if (iface[0]) return iface;  /* already detected */
-
-    FILE *fp = popen("ip route show default 2>/dev/null", "r");
-    if (!fp) goto fallback;
-    char line[256];
-    if (!fgets(line, sizeof(line), fp)) { pclose(fp); goto fallback; }
-    pclose(fp);
-
-    /* Parse: "default via X.X.X.X dev <iface> ..." */
-    char *dev = strstr(line, " dev ");
-    if (dev) {
-        dev += 5;  /* skip " dev " */
-        char *end = dev;
-        while (*end && *end != ' ' && *end != '\n') end++;
-        size_t len = (size_t)(end - dev);
-        if (len > 0 && len < 16) {
-            memcpy(iface, dev, len);
-            iface[len] = '\0';
-            return iface;
-        }
-    }
-fallback:
-    strcpy(iface, "eth0");
-    return iface;
-}
-
-static const char *get_real_home(void)
-{
-    const char *sudo_user = getenv("SUDO_USER");
-    if (sudo_user && sudo_user[0]) {
-        struct passwd *pw = getpwnam(sudo_user);
-        if (pw && pw->pw_dir) return pw->pw_dir;
-    }
-    const char *home = getenv("HOME");
-    return home ? home : "/tmp";
-}
+/* ─── Utility functions ──────────────────────────────────────────── */
 
 int read_psk_file(uint8_t *psk, size_t max_len, const char *path) {
     int fd = open(path, O_RDONLY);
@@ -137,11 +96,6 @@ int listen_on_port(int port) {
     if (listen(fd, SOMAXCONN) < 0) { perror("listen"); close(fd); return -1; }
     return fd;
 }
-void set_socket_timeout(int fd, int seconds) {
-    struct timeval tv = { .tv_sec = seconds, .tv_usec = 0 };
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-}
 
 static void usage(const char *prog) {
     fprintf(stderr,
@@ -184,401 +138,7 @@ static void usage(const char *prog) {
         prog, prog, prog, prog, prog, prog);
 }
 
-/* ─── Subcommands ─────────────────────────────────────────────── */
-static int cmd_keygen(void) {
-    const char *home = get_real_home();
-    char dir[512]; snprintf(dir, sizeof(dir), "%s/.aegis-tunnel", home);
-    mkdir(dir, 0700);
-
-    /* Generate keypair */
-    char priv[520], pub[520];
-    snprintf(priv, sizeof(priv), "%s/private.key", dir);
-    snprintf(pub, sizeof(pub), "%s/public.key", dir);
-    if (keyfile_generate(priv, pub) != 0) return 1;
-
-    /* Show public key */
-    printf("Public key (send to peer):\n  ");
-    char hex[65] = "";
-    FILE *f = fopen(pub, "r");
-    if (f) { size_t nr = fread(hex, 1, 64, f); hex[nr] = '\0'; fclose(f); printf("%s\n", hex); }
-
-    /* Clear old config files and regenerate aegis.conf */
-    unlink("aegis.conf");
-    unlink("aegis-server.conf");
-    unlink("aegis-client.conf");
-
-    {
-        FILE *cf = fopen("aegis.conf", "w");
-        if (cf) {
-            fprintf(cf,
-                "[Interface]\n"
-                "PrivateKey = ~/.aegis-tunnel/private.key\n"
-                "PublicKey = %s\n"
-                "Port = 9000\n\n"
-                "[Tunnel]\n"
-                "Keepalive = 30\n"
-                "NATInterface = %s\n",
-                hex, detect_default_iface());
-            fclose(cf);
-            printf("\nConfig: aegis.conf\n");
-        }
-    }
-
-    printf("\nNext: get peer's public key, then:\n");
-    printf("  aegis-tunnel peer add <name> <peer-hex-key>\n");
-    return 0;
-}
-static int cmd_peer_add(const char *host, const char *hex_or_file) {
-    const char *home = get_real_home();
-    char dir[520], peer_dir[520], path[520];
-    snprintf(dir, sizeof(dir), "%s/.aegis-tunnel", home);
-    snprintf(peer_dir, sizeof(peer_dir), "%s/peers", dir);
-    mkdir(dir, 0700); mkdir(peer_dir, 0700);
-    snprintf(path, sizeof(path), "%s/%s.pub", peer_dir, host);
-
-    /* If hex_or_file looks like a file path, copy it; otherwise write as hex */
-    if (strchr(hex_or_file, '/') || strchr(hex_or_file, '.')) {
-        /* File path: copy contents */
-        FILE *src = fopen(hex_or_file, "r");
-        if (!src) { fprintf(stderr, "Cannot open %s\n", hex_or_file); return 1; }
-        FILE *dst = fopen(path, "w");
-        if (!dst) { fclose(src); return 1; }
-        char buf[4096]; size_t n;
-        while ((n = fread(buf, 1, sizeof(buf), src)) > 0) fwrite(buf, 1, n, dst);
-        fclose(src); fclose(dst);
-    } else {
-        /* Hex string: validate and write */
-        size_t hlen = strlen(hex_or_file);
-        if (hlen != 64) {
-            fprintf(stderr, "Error: hex key must be 64 characters (got %zu)\n", hlen);
-            return 1;
-        }
-        FILE *f = fopen(path, "w");
-        if (!f) return 1;
-        fprintf(f, "%s\n", hex_or_file);
-        fclose(f);
-    }
-    printf("Peer '%s' added.\n", host);
-
-    /* Update/create config file in current directory */
-    {
-        char cfg[520] = "aegis.conf";
-
-        /* Create config if it doesn't exist yet */
-        if (access(cfg, F_OK) != 0) {
-            FILE *cf = fopen(cfg, "w");
-            if (cf) {
-                /* Read our public key for the Interface section */
-                char our_pub[65] = "";
-                {
-                    char pub_path[520];
-                    snprintf(pub_path, sizeof(pub_path), "%s/public.key", dir);
-                    FILE *pf = fopen(pub_path, "r");
-                    if (pf) { size_t nr = fread(our_pub, 1, 64, pf); our_pub[nr] = '\0'; fclose(pf); }
-                }
-                fprintf(cf,
-                    "[Interface]\n"
-                    "PrivateKey = ~/.aegis-tunnel/private.key\n"
-                    "PublicKey = %s\n"
-                    "Port = 9000\n\n"
-                    "[Tunnel]\n"
-                    "Keepalive = 30\n"
-                    "NATInterface = %s\n",
-                    our_pub, detect_default_iface());
-                fclose(cf);
-            }
-        }
-
-        /* Get peer hex key */
-        char peerfile[520], hx[65] = "";
-        snprintf(peerfile, sizeof(peerfile), "%s/%s.pub", peer_dir, host);
-        FILE *pf = fopen(peerfile, "r");
-        if (pf) { size_t nr = fread(hx, 1, 64, pf); hx[nr]='\0';
-                  for (int i=(int)nr-1; i>=0 && (hx[i]=='\n'||hx[i]=='\r'); i--) hx[i]='\0';
-                  fclose(pf); }
-
-        /* cfg is already set to the right path from above */
-        if (hx[0]) {
-            FILE *in = fopen(cfg, "r");
-            int found = 0;
-            if (in) {
-                /* Check if this hex already exists in any [Peer] */
-                char line[512];
-                while (fgets(line, sizeof(line), in))
-                    if (strstr(line, "PublicKey") && strstr(line, hx)) found = 1;
-                fclose(in);
-            }
-            if (!found) {
-                /* Append new [Peer] section */
-                FILE *out = fopen(cfg, "a");  /* append mode */
-                if (out) {
-                    fprintf(out, "\n[Peer]\n");
-                    fprintf(out, "PublicKey = %s\n", hx);
-                    fprintf(out, "Endpoint = %s\n", host);
-                    fclose(out);
-                    printf("Config updated: aegis.conf (+[Peer])\n");
-                }
-            } else {
-                printf("Already in config\n");
-            }
-        }
-    }
-    return 0;
-}
-static int cmd_peer_delete(const char *name) {
-    const char *home = get_real_home();
-    char peerfile[520];
-    snprintf(peerfile, sizeof(peerfile), "%s/.aegis-tunnel/peers/%s.pub", home, name);
-
-    /* Read the peer's public key to identify the config section */
-    char hx[65] = "";
-    FILE *pf = fopen(peerfile, "r");
-    if (pf) {
-        size_t nr = fread(hx, 1, 64, pf); hx[nr] = '\0';
-        for (int i = (int)nr - 1; i >= 0 && (hx[i] == '\n' || hx[i] == '\r'); i--) hx[i] = '\0';
-        fclose(pf);
-    }
-
-    /* Delete the .pub file */
-    if (unlink(peerfile) != 0) {
-        fprintf(stderr, "Peer '%s' not found.\n", name);
-        return 1;
-    }
-    printf("Peer '%s' removed from key storage.\n", name);
-
-    /* Remove matching [Peer] section from aegis.conf */
-    if (access("aegis.conf", F_OK) == 0) {
-        FILE *in = fopen("aegis.conf", "r");
-        if (!in) return 0;
-        char tmp[520];
-        snprintf(tmp, sizeof(tmp), "aegis.conf.%d", getpid());
-        FILE *out = fopen(tmp, "w");
-        if (!out) { fclose(in); return 0; }
-
-        char line[512];
-        int in_peer = 0, skip_peer = 0, wrote_peer = 0;
-        while (fgets(line, sizeof(line), in)) {
-            if (line[0] == '[') {
-                /* Flush buffered [Peer] header if previous peer was NOT skipped */
-                if (in_peer && !skip_peer && !wrote_peer) {
-                    fputs("[Peer]\n", out);  /* write the delayed header */
-                }
-                in_peer = 0; skip_peer = 0; wrote_peer = 0;
-                if (strstr(line, "[Peer]")) {
-                    in_peer = 1;  /* delay writing [Peer] until we know it's not skipped */
-                } else {
-                    fputs(line, out);  /* non-Peer section header: write immediately */
-                }
-                continue;
-            }
-            if (in_peer && hx[0] && strstr(line, "PublicKey") && strstr(line, hx))
-                skip_peer = 1;
-            if (skip_peer) continue;
-            /* Write delayed [Peer] header before first content line */
-            if (in_peer && !wrote_peer) {
-                fputs("[Peer]\n", out);
-                wrote_peer = 1;
-            }
-            fputs(line, out);
-        }
-        /* Flush trailing [Peer] header */
-        if (in_peer && !skip_peer && !wrote_peer) {
-            fputs("[Peer]\n", out);
-        }
-        fclose(in); fclose(out);
-        rename(tmp, "aegis.conf");
-        printf("Config updated: aegis.conf (-[Peer])\n");
-    }
-    return 0;
-}
-
-static int cmd_peer_list(void) {
-    const char *home = get_real_home();
-    char dir[520]; snprintf(dir, sizeof(dir), "%s/.aegis-tunnel/peers", home);
-    DIR *d = opendir(dir);
-    if (!d) { printf("No peers configured yet.\n"); return 0; }
-    printf("Known peers:\n");
-    struct dirent *e;
-    while ((e = readdir(d))) {
-        if (e->d_name[0] == '.') continue;
-        size_t len = strlen(e->d_name);
-        if (len > 4 && !strcmp(e->d_name + len - 4, ".pub"))
-            printf("  %.*s\n", (int)(len - 4), e->d_name);
-    }
-    closedir(d);
-    return 0;
-}
-static int cmd_status(void) {
-    const char *home = get_real_home();
-    char dir[520]; snprintf(dir, sizeof(dir), "%s/.aegis-tunnel", home);
-    printf("Key storage: %s\n", dir);
-    struct stat st;
-    if (stat(dir, &st) == 0) {
-        char path[520];
-        snprintf(path, sizeof(path), "%s/private.key", dir);
-        printf("  Private key: %s (%s)\n", path,
-               (access(path, F_OK) == 0) ? "exists" : "missing");
-        snprintf(path, sizeof(path), "%s/public.key", dir);
-        printf("  Public key:  %s (%s)\n", path,
-               (access(path, F_OK) == 0) ? "exists" : "missing");
-    } else {
-        printf("  (not yet created — run 'aegis-tunnel keygen')\n");
-    }
-    cmd_peer_list();
-    return 0;
-}
-static int cmd_tun_down(const char *name) {
-    if (!name) name = "tun0";
-    /* Flush TUN routing table and clean policy rule */
-    system("ip route flush table 51820 2>/dev/null");
-    system("ip rule del not fwmark 51820 table 51820 2>/dev/null");
-    system("ip rule del not fwmark 51820 table main 2>/dev/null");   /* legacy */
-    system("ip rule del fwmark 51820 table main 2>/dev/null");       /* legacy */
-    /* Delete TUN device */
-    char cmd[128];
-    snprintf(cmd, sizeof(cmd), "ip link del %s 2>/dev/null", name);
-    system(cmd);
-    /* Clean iptables */
-    system("iptables -t nat -F POSTROUTING 2>/dev/null");
-    system("iptables -F FORWARD 2>/dev/null");
-    printf("TUN %s removed, routes and iptables cleared.\n", name);
-    return 0;
-}
-
-/*
- * Create a TUN-specific config from aegis.conf.
- *   is_server: 1 → aegis-server.conf, 0 → aegis-client.conf
- *
- * Reads base aegis.conf, adds TUN-specific settings,
- * writes the result to aegis-server.conf or aegis-client.conf.
- */
-static int cmd_create_tun(int is_server) {
-    const char *src = "aegis.conf";
-    const char *dst = is_server ? "aegis-server.conf" : "aegis-client.conf";
-
-    if (access(src, F_OK) != 0) {
-        fprintf(stderr, "Error: %s not found. Run 'aegis-tunnel keygen' first.\n", src);
-        return 1;
-    }
-
-    iniconf_t icfg;
-    if (iniconf_load(&icfg, src) != 0) {
-        fprintf(stderr, "Error: cannot parse %s\n", src);
-        return 1;
-    }
-
-    /* Read base fields from aegis.conf */
-    const char *privkey  = iniconf_get(&icfg, "Interface", "PrivateKey");
-    const char *pubkey   = iniconf_get(&icfg, "Interface", "PublicKey");
-    const char *port     = iniconf_get(&icfg, "Interface", "Port");
-    const char *nat_if   = iniconf_get(&icfg, "Tunnel", "NATInterface");
-    const char *keepalive = iniconf_get(&icfg, "Tunnel", "Keepalive");
-
-    /* Read our public key from the key file (for display in config) */
-    char pubkey_hex[65] = "";
-    {
-        const char *home = get_real_home();
-        char pub_path[520];
-        snprintf(pub_path, sizeof(pub_path), "%s/.aegis-tunnel/public.key", home);
-        FILE *f = fopen(pub_path, "r");
-        if (f) {
-            size_t n = fread(pubkey_hex, 1, 64, f);
-            pubkey_hex[n] = '\0';
-            fclose(f);
-        }
-    }
-
-    FILE *out = fopen(dst, "w");
-    if (!out) { perror(dst); iniconf_free(&icfg); return 1; }
-
-    fprintf(out, "# AEGIS-Tunnel TUN %s config (generated from %s)\n\n",
-            is_server ? "server" : "client", src);
-
-    /* ── [Interface] ── */
-    fprintf(out, "[Interface]\n");
-    fprintf(out, "PrivateKey = %s\n", privkey ? privkey : "~/.aegis-tunnel/private.key");
-    if (pubkey_hex[0])
-        fprintf(out, "PublicKey = %s\n", pubkey_hex);
-    else if (pubkey)
-        fprintf(out, "PublicKey = %s\n", pubkey);
-    fprintf(out, "Mode = %s\n", is_server ? "server" : "client");
-
-    if (is_server) {
-        fprintf(out, "Address = 10.0.0.1/24\n");
-        fprintf(out, "ListenPort = %s\n", port ? port : "9000");
-        fprintf(out, "# PostUp = iptables -A FORWARD -i %%i -j ACCEPT;"
-                     " iptables -t nat -A POSTROUTING -s 10.0.0.0/24 -o %s -j MASQUERADE\n",
-                nat_if ? nat_if : detect_default_iface());
-        fprintf(out, "# PostDown = iptables -D FORWARD -i %%i -j ACCEPT;"
-                     " iptables -t nat -D POSTROUTING -s 10.0.0.0/24 -o %s -j MASQUERADE\n",
-                nat_if ? nat_if : detect_default_iface());
-    } else {
-        fprintf(out, "Address = 10.0.0.2/24\n");
-    }
-    fprintf(out, "\n");
-
-    /* ── [Peer] sections (iterate all peers from base config) ── */
-    {
-        int peer_idx = 0;
-        while (1) {
-            const char *pk = iniconf_get_indexed(&icfg, "Peer", peer_idx, "PublicKey");
-            if (!pk) break;
-            const char *ep = iniconf_get_indexed(&icfg, "Peer", peer_idx, "Endpoint");
-
-            fprintf(out, "[Peer]\n");
-            fprintf(out, "PublicKey = %s\n", pk);
-
-            if (is_server) {
-                fprintf(out, "AllowedIPs = 10.0.0.2/32\n");
-                if (ep) fprintf(out, "# Endpoint = %s\n", ep);
-            } else {
-                /* Client: only first peer gets Endpoint */
-                if (peer_idx == 0) {
-                    char ep_buf[320];
-                    if (ep) snprintf(ep_buf, sizeof(ep_buf), "%s", ep);
-                    else    snprintf(ep_buf, sizeof(ep_buf), "server.com:9000");
-                    if (!strrchr(ep_buf, ':')) {
-                        size_t el = strlen(ep_buf);
-                        snprintf(ep_buf + el, sizeof(ep_buf) - el, ":9000");
-                    }
-                    fprintf(out, "Endpoint = %s\n", ep_buf);
-                }
-                fprintf(out, "AllowedIPs = 0.0.0.0/0\n");
-                fprintf(out, "PersistentKeepalive = %s\n", keepalive ? keepalive : "25");
-            }
-            fprintf(out, "\n");
-            peer_idx++;
-        }
-        if (peer_idx == 0) {
-            /* No peers in base config — fallback placeholder */
-            fprintf(out, "[Peer]\n");
-            fprintf(out, "PublicKey = <peer-public-key>\n");
-            if (is_server)
-                fprintf(out, "AllowedIPs = 10.0.0.2/32\n");
-            else {
-                fprintf(out, "Endpoint = server.com:9000\n");
-                fprintf(out, "AllowedIPs = 0.0.0.0/0\n");
-                fprintf(out, "PersistentKeepalive = %s\n", keepalive ? keepalive : "25");
-            }
-            fprintf(out, "\n");
-        }
-    }
-
-    /* ── [Tunnel] ── */
-    fprintf(out, "[Tunnel]\n");
-    fprintf(out, "Keepalive = %s\n", keepalive ? keepalive : "30");
-    fprintf(out, "NATInterface = %s\n", nat_if ? nat_if : detect_default_iface());
-    fprintf(out, "Timeout = 10\n");
-    fprintf(out, "MaxConnections = 64\n");
-
-    fclose(out);
-    iniconf_free(&icfg);
-
-    printf("TUN %s config written to %s\n", is_server ? "server" : "client", dst);
-    printf("\nReview and edit %s if needed, then:\n", dst);
-    printf("  sudo ./aegis-tunnel start tun -%s\n", is_server ? "server" : "client");
-    return 0;
-}
+/* ══════════════════════════════════════════════════════════════════ */
 
 int main(int argc, char **argv) {
     /* Subcommands: aegis-tunnel keygen | peer add <host> <hex> | peer list */
@@ -656,11 +216,6 @@ int main(int argc, char **argv) {
                                (nm >> 24) & 0xff, (nm >> 16) & 0xff,
                                (nm >> 8) & 0xff, nm & 0xff);
                       /* Auto-derive route from IP + prefix */
-                      uint32_t ip_n;
-                      sscanf(tun_ip, "%u.%u.%u.%u",
-                             (unsigned *)&ip_n, (unsigned *)&ip_n,
-                             (unsigned *)&ip_n, (unsigned *)&ip_n);
-                      /* Actually need octets. Simpler: just use the first 3 octets */
                       char *dot = strrchr(tun_ip, '.');
                       if (dot) { *dot = '\0'; snprintf(tun_route, 63, "%s.0/%d", tun_ip, prefix); *dot = '.'; }
                   } else {
@@ -681,7 +236,6 @@ int main(int argc, char **argv) {
     if (start_tun_force) {
         tun_mode = 1;
         if (start_tun_force == 1) mode = "server"; else mode = "client";
-        /* Auto-detect config file if not explicitly given */
         if (!config_file) {
             const char *auto_cfg = (start_tun_force == 1) ? "aegis-server.conf" : "aegis-client.conf";
             if (access(auto_cfg, F_OK) == 0)
@@ -705,12 +259,10 @@ int main(int argc, char **argv) {
         if (iniconf_load(&icfg, config_file) == 0) {
             /* [Interface] */
             if (listen_port == 9000) {
-                /* Prefer ListenPort (TUN-specific), fallback to Port */
                 int lp = iniconf_get_int(&icfg, "Interface", "ListenPort", 0);
                 if (lp > 0) listen_port = lp;
                 else listen_port = iniconf_get_int(&icfg, "Interface", "Port", listen_port);
             }
-            /* PostUp / PostDown (WireGuard-style, %i = interface name) */
             if (!tun_postup[0]) {
                 const char *v = iniconf_get(&icfg, "Interface", "PostUp");
                 if (v) strncpy(tun_postup, v, 255);
@@ -722,12 +274,10 @@ int main(int argc, char **argv) {
             if (!remote_str) {
                 const char *v = iniconf_get(&icfg, "Peer", "Endpoint");
                 if (v) {
-                    /* In server mode, Endpoint can be 0.0.0.0:0 (meaning no forwarding) */
-                    if (strcmp(v, "0.0.0.0:0") == 0) {
-                        remote_str = NULL; /* TUN server, no backend */
-                    } else {
+                    if (strcmp(v, "0.0.0.0:0") == 0)
+                        remote_str = NULL;
+                    else
                         remote_str = strdup(v);
-                    }
                 }
             }
             if (!strcmp(mode, "server")) {
@@ -767,7 +317,6 @@ int main(int argc, char **argv) {
                 }
                 if (g_peer_count > 0)
                     log_info("main", "%d peer(s) from config", g_peer_count);
-                /* If no peers in config → auto-detect from ~/.aegis-tunnel/peers/ later */
             }
             /* Parse AllowedIPs first (takes priority over Address auto-derive) */
             if (!tun_route[0]) {
@@ -786,7 +335,6 @@ int main(int argc, char **argv) {
                         uint32_t nm = (px == 0) ? 0 : (~0u << (unsigned)(32 - px));
                         snprintf(tun_netmask, 31, "%u.%u.%u.%u",
                                  (nm>>24)&0xff, (nm>>16)&0xff, (nm>>8)&0xff, nm&0xff);
-                        /* Auto-derive route only if AllowedIPs not already set */
                         if (!tun_route[0]) {
                             char *dot = strrchr(tun_ip, '.');
                             if (dot) { *dot = '\0'; snprintf(tun_route, 63, "%s.0/%d", tun_ip, px); *dot = '.'; }
@@ -794,10 +342,8 @@ int main(int argc, char **argv) {
                     }
                 }
             }
-            /* PersistentKeepalive (client-side, in seconds) */
-            if (keepalive == 0) {
+            if (keepalive == 0)
                 keepalive = iniconf_get_int(&icfg, "Peer", "PersistentKeepalive", 0);
-            }
             if (hs_timeout == DEFAULT_HS_TIMEOUT)
                 hs_timeout = iniconf_get_int(&icfg, "Tunnel", "Timeout", hs_timeout);
             if (keepalive == 0)
@@ -839,8 +385,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "Error: -r <host:port> is required\n"); usage(argv[0]); return 1; }
     if (strcmp(mode,"server") && strcmp(mode,"client")) { fprintf(stderr, "Error: mode must be server or client\n"); return 1; }
 
-
-    /* Rekey bootstrap (random key for re-keying) */
+    /* Rekey bootstrap */
     uint8_t psk[MAX_PSK_BYTES]; random_bytes(psk, 16);
     size_t psk_len = 16;
 
@@ -880,7 +425,6 @@ int main(int argc, char **argv) {
     if (peerkey_file) {
         size_t qlen = strlen(peerkey_file);
         if (qlen == 64 && !strchr(peerkey_file, '/') && !strchr(peerkey_file, '.')) {
-            /* Hex string: parse directly */
             if (parse_hex(g_asym_peers[0], 32, peerkey_file) != 32) {
                 fprintf(stderr, "Error: -Q hex key must be 64 hex characters\n");
                 return 1;
@@ -888,7 +432,6 @@ int main(int argc, char **argv) {
             g_peer_count = 1;
             log_info("main", "peer key from hex string");
         } else {
-            /* File path */
             if (keyfile_load_public(g_asym_peers[0], peerkey_file) != 0) return 1;
             g_peer_count = 1;
             log_info("main", "peer key from file: %s", peerkey_file);
@@ -899,7 +442,6 @@ int main(int argc, char **argv) {
         snprintf(peer_dir, sizeof(peer_dir), "%s/peers", key_dir);
         mkdir(peer_dir, 0700);
 
-        /* Count .pub files in peers/ */
         int peer_count = 0;
         char found_peer[520] = "";
         {
@@ -917,18 +459,13 @@ int main(int argc, char **argv) {
             }
         }
 
-        if (peer_count == 1) {
-            /* Exactly one peer → use it */
+        if (peer_count >= 1) {
             if (keyfile_load_public(g_asym_peers[0], found_peer) != 0) return 1;
-            log_info("main", "using peer key: %s", found_peer);
-        } else if (peer_count > 1) {
-            /* Multiple peers → use the first one as default
-             * (like SSH authorized_keys: any known peer can connect.
-             *  Use -Q to restrict to a specific peer.) */
-            if (keyfile_load_public(g_asym_peers[0], found_peer) != 0) return 1;
-            log_info("main", "%d peers found, using first: %s", peer_count, found_peer);
+            if (peer_count > 1)
+                log_info("main", "%d peers found, using first: %s", peer_count, found_peer);
+            else
+                log_info("main", "using peer key: %s", found_peer);
         } else {
-            /* No peer key — print our public key */
             fprintf(stderr, "\n═══ No peer key found ═══\n");
             fprintf(stderr, "Your public key (send to peer):\n  ");
             {
@@ -947,7 +484,7 @@ int main(int argc, char **argv) {
     }
 
     struct sigaction sa; memset(&sa, 0, sizeof(sa));
-    sa.sa_handler = sig_handler; sigemptyset(&sa.sa_mask); sa.sa_flags = 0;  /* no SA_RESTART: allow accept() to be interrupted */
+    sa.sa_handler = sig_handler; sigemptyset(&sa.sa_mask); sa.sa_flags = 0;
     sigaction(SIGINT, &sa, NULL); sigaction(SIGTERM, &sa, NULL);
     sa.sa_handler = sigchld_handler; sa.sa_flags = SA_RESTART | SA_NOCLDSTOP;
     sigaction(SIGCHLD, &sa, NULL);

@@ -24,7 +24,7 @@ IS_ARM := $(filter aarch64 arm64 armv8%,$(ARCH))
 
 ifneq ($(IS_ARM),)
     # ARMv8 Crypto extensions (all ARMv8+ chips support this)
-    CFLAGS += -march=armv8-a+crypto
+    CFLAGS += -march=armv8-a+crypto -DAEGIS_HAVE_NEON
 endif
 
 # x86_64 AES-NI
@@ -47,7 +47,8 @@ PROXY    := $(SRC_DIR)/proxy/socks5.c
 LIB_SRCS := $(CRYPTO) $(UTIL) $(PROTOCOL) $(TUNNEL) $(PROXY)
 LIB_OBJS := $(LIB_SRCS:.c=.o)
 
-MODE_SRCS := $(SRC_DIR)/main.c $(SRC_DIR)/mode_psk.c $(SRC_DIR)/mode_tun.c
+MODE_SRCS := $(SRC_DIR)/main.c $(SRC_DIR)/mode_psk.c $(SRC_DIR)/mode_tun.c \
+              $(SRC_DIR)/config_mgmt.c $(SRC_DIR)/mode_common.c
 MAIN_SRCS  := $(MODE_SRCS) $(LIB_SRCS)
 MAIN_OBJS  := $(MAIN_SRCS:.c=.o)
 

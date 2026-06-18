@@ -2,6 +2,7 @@
  * mode_tun.c — TUN VPN server/client modes
  */
 #include "main.h"
+#include "mode_common.h"
 #include "protocol/handshake.h"
 #include "tunnel/tun.h"
 #include "tunnel/tunnel.h"
@@ -63,15 +64,6 @@ static void tun_run_postdown(const char *script, const char *name)
         log_info("tun", "PostDown: %s", script);
         tun_exec_script(script, name);
     }
-}
-
-static int try_handshake_server(int fd, session_keys_t *keys, int timeout_ms)
-{
-    for (int i = 0; i < g_peer_count; i++) {
-        if (handshake_server(fd, g_asym_priv, g_asym_peers[i], timeout_ms, keys) == 0)
-            { log_info("tun-server", "peer #%d authenticated", i); return 0; }
-    }
-    return -1;
 }
 
 /* ─── TUN Server ──────────────────────────────────────────────── */

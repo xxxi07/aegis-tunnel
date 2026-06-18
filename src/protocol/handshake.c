@@ -6,11 +6,9 @@
 #include "tunnel/tunnel.h"
 #include "util/util.h"
 #include <errno.h>
-#include <fcntl.h>
 #include <openssl/evp.h>
 #include <string.h>
 #include <sys/socket.h>
-#include <sys/time.h>
 #include <unistd.h>
 
 #define TIMESTAMP_WINDOW_SEC  60
@@ -23,7 +21,6 @@ static void sha256_h(uint8_t out[32], const uint8_t *in, size_t len) {
     EVP_MD_CTX_free(c);
 }
 static int check_ts(int64_t ts) { int64_t n=timestamp_now(); if(n<0)return -1; int64_t d=(n>ts)?(n-ts):(ts-n); return d>60?-1:0; }
-static void set_socket_timeout(int fd, int ms) { if(ms<=0)return; struct timeval tv={.tv_sec=ms/1000,.tv_usec=(ms%1000)*1000}; setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof(tv)); }
 static int send_all(int fd, const uint8_t *b, size_t n) { size_t s=0; while(s<n){ ssize_t r=send(fd,b+s,n-s,0); if(r<0){if(errno==EINTR)continue;return -1;} if(r==0)return -1; s+=(size_t)r;} return 0; }
 
 #include <poll.h>
@@ -79,7 +76,7 @@ static void asym_sess(session_keys_t *k, const uint8_t sh[32], const uint8_t ei[
 int handshake_server(int fd, const uint8_t our_priv[32], const uint8_t peer_pub[32], int to, session_keys_t *keys) {
     uint8_t ek[32],epk[32],iepk[32],ik[16],rk[16],sh[32];int64_t its;
     int ret = -1;
-    set_socket_timeout(fd,to);
+    (void)to;  /* timeout handled by recv_all's poll() */
     if(asym_hdr(fd,iepk)!=0)return -1;
     {uint8_t ee[32],es[32];ecdh_derive(ee,our_priv,iepk);ecdh_derive(es,our_priv,peer_pub);uint8_t b[68];memcpy(b,ee,32);memcpy(b+32,es,32);memcpy(b+64,"init",4);uint8_t h[32];sha256_h(h,b,68);memcpy(ik,h,16);}
     if(asym_ts(fd,iepk,ik,&its)!=0) goto out;
@@ -99,8 +96,7 @@ out:
 int handshake_client(int fd, const uint8_t our_priv[32], const uint8_t peer_pub[32], int to, session_keys_t *keys) {
     uint8_t ek[32],epk[32],repk[32],ik[16],rk[16],sh[32];int64_t rts;
     int ret = -1;
-    fprintf(stderr, "[handshake] client timeout=%ds, fd=%d, flags=0x%x\n", to, fd, fcntl(fd, F_GETFL, 0));
-    set_socket_timeout(fd,to);
+    (void)to;  /* timeout handled by recv_all's poll() */
     if(ecdh_keygen(epk,ek)!=0)return -1;
     asym_init_key(ik,ek,our_priv,peer_pub);
     {int64_t ts=timestamp_now(); if(asym_send(fd,epk,ts,ik)!=0) goto out;}
@@ -120,12 +116,14 @@ out:
 /* ═══════════════════════════════════════════════════ key confirm */
 
 int handshake_key_confirm_server(int fd, const session_keys_t *k, int to) {
-    set_socket_timeout(fd,to); uint8_t wb[FRAME_MAX_WIRE]; size_t wl=0;
+    (void)to;  /* timeout handled by recv_all's poll() */
+    uint8_t wb[FRAME_MAX_WIRE]; size_t wl=0;
     if(frame_build(wb,&wl,FRAME_KEYCONFIRM,FLAG_NONE,NULL,0,0,k->enc_key)!=0)return -1;
     return send_all(fd,wb,wl);
 }
 int handshake_key_confirm_client(int fd, const session_keys_t *k, int to) {
-    set_socket_timeout(fd,to); uint8_t wb[FRAME_HEADER_LEN+AEGIS_TAG_LEN];
+    (void)to;  /* timeout handled by recv_all's poll() */
+    uint8_t wb[FRAME_HEADER_LEN+AEGIS_TAG_LEN];
     if(recv_all(fd,wb,sizeof(wb))!=0)return -1;
     uint8_t ty,fl,dum[1]; size_t dl;
     if(frame_parse(wb,sizeof(wb),&ty,&fl,dum,&dl,0,k->dec_key)!=0)return -1;

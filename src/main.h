@@ -27,7 +27,6 @@ int  parse_hex(uint8_t *out, size_t out_max, const char *hex);
 int  parse_host_port(char *addr_str, char **host, int *port);
 int  connect_to_host(const char *host, int port, int fwmark);
 int  listen_on_port(int port);
-void set_socket_timeout(int fd, int seconds);
 
 /* ── Mode functions ── */
 int mode_psk_server(int listen_port, const char *remote_host, int remote_port,
