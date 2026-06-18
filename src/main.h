@@ -19,6 +19,7 @@ extern int  g_asym_mode;
 extern uint8_t g_asym_priv[32];
 extern uint8_t g_asym_peers[MAX_PEERS][32];
 extern char   g_peer_endpoints[MAX_PEERS][256];
+extern uint32_t g_peer_tun_ips[MAX_PEERS];  /* TUN IP for each peer (network byte order) */
 extern int  g_peer_count;
 
 /* ── Utility ── */

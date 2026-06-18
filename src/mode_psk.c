@@ -53,7 +53,7 @@ int mode_psk_server(int listen_port, const char *remote_host, int remote_port,
             close(listen_fd); signal(SIGCHLD, SIG_DFL);
 
             session_keys_t keys;
-            if (try_handshake_server(client_fd, &keys, hs_timeout) != 0)
+            if (try_handshake_server(client_fd, &keys, hs_timeout) < 0)
                 { log_warn("server", "handshake failed (tried %d peers)", g_peer_count); close(client_fd); _exit(1); }
             if (handshake_key_confirm_server(client_fd, &keys, hs_timeout) != 0)
                 { secure_memzero(&keys, sizeof(keys)); close(client_fd); _exit(1); }

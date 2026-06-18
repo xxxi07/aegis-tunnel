@@ -10,7 +10,7 @@ int try_handshake_server(int fd, session_keys_t *keys, int timeout_ms)
     for (int i = 0; i < g_peer_count; i++) {
         if (handshake_server(fd, g_asym_priv, g_asym_peers[i], timeout_ms, keys) == 0) {
             log_info("server", "peer #%d authenticated", i);
-            return 0;
+            return i;  /* return peer index, not just 0 */
         }
     }
     return -1;

@@ -39,6 +39,7 @@ int   g_asym_mode = 1;
 uint8_t g_asym_priv[32];
 uint8_t g_asym_peers[MAX_PEERS][32];
 char   g_peer_endpoints[MAX_PEERS][256];
+uint32_t g_peer_tun_ips[MAX_PEERS];      /* TUN IP for each peer (network byte order) */
 int   g_peer_count = 0;
 
 static void sig_handler(int sig)   { (void)sig; g_running = 0; }
@@ -308,6 +309,20 @@ int main(int argc, char **argv) {
                                 g_peer_endpoints[pi][255] = '\0';
                             } else {
                                 g_peer_endpoints[pi][0] = '\0';
+                            }
+                            /* Extract peer's TUN IP from AllowedIPs (e.g. "10.0.0.2/32" → 10.0.0.2) */
+                            {
+                                const char *aip = iniconf_get_indexed(&icfg, "Peer", pi, "AllowedIPs");
+                                g_peer_tun_ips[pi] = 0;
+                                if (aip) {
+                                    uint32_t oct[4]; int pf = 0;
+                                    if (sscanf(aip, "%u.%u.%u.%u/%d",
+                                               &oct[0], &oct[1], &oct[2], &oct[3], &pf) >= 4) {
+                                        g_peer_tun_ips[pi] =
+                                            (oct[0] << 24) | (oct[1] << 16) |
+                                            (oct[2] << 8)  | oct[3];
+                                    }
+                                }
                             }
                             g_peer_count = pi + 1;
                         }
