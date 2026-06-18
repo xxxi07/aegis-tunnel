@@ -17,6 +17,11 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+/* ─── Forward declarations ───────────────────────────────────── */
+
+static int  run_cmdv(const char *const argv[]);
+static void run_cmdv_quiet(const char *const argv[]);
+
 /* ─── Create TUN device ──────────────────────────────────────── */
 
 int tun_create(char *name)
@@ -58,11 +63,9 @@ int tun_create(char *name)
 
 int tun_set_ip(const char *name, const char *ip, const char *netmask)
 {
-    char cmd[256];
     /* Parse netmask to CIDR prefix length */
     int prefix = 24; /* default */
     if (netmask) {
-        /* Simple conversion: count leading 1 bits in netmask octets */
         unsigned int octets[4];
         if (sscanf(netmask, "%u.%u.%u.%u",
                    &octets[0], &octets[1], &octets[2], &octets[3]) == 4) {
@@ -74,12 +77,11 @@ int tun_set_ip(const char *name, const char *ip, const char *netmask)
         }
     }
 
-    snprintf(cmd, sizeof(cmd),
-             "ip addr add %s/%d dev %s 2>/dev/null",
-             ip, prefix, name);
+    char cidr[32];
+    snprintf(cidr, sizeof(cidr), "%s/%d", ip, prefix);
 
-    int ret = system(cmd);
-    if (ret != 0) {
+    const char *const argv[] = {"ip", "addr", "add", cidr, "dev", name, NULL};
+    if (run_cmdv(argv) != 0) {
         fprintf(stderr, "tun: failed to set IP on %s (are you root?)\n", name);
         return -1;
     }
@@ -92,16 +94,12 @@ int tun_set_ip(const char *name, const char *ip, const char *netmask)
 
 int tun_up(const char *name)
 {
-    char cmd[128];
-    int ret;
-
-    /* Bring the interface up */
-    snprintf(cmd, sizeof(cmd), "ip link set %s up 2>/dev/null", name);
-    ret = system(cmd);
+    const char *const ip_up[]  = {"ip", "link", "set", name, "up", NULL};
+    int ret = run_cmdv(ip_up);
     if (ret != 0) {
         /* Fallback: try ifconfig */
-        snprintf(cmd, sizeof(cmd), "ifconfig %s up 2>/dev/null", name);
-        ret = system(cmd);
+        const char *const if_up[] = {"ifconfig", name, "up", NULL};
+        ret = run_cmdv(if_up);
     }
 
     /* Increase txqueuelen from default 500 to 2000.
@@ -109,9 +107,13 @@ int tun_up(const char *name)
      * connection; a burst of ICMP replies, DNS responses, or TCP
      * ACKs can easily exceed 500 packets in a few milliseconds.
      * A larger queue absorbs bursts without kernel drops. */
-    snprintf(cmd, sizeof(cmd),
-             "ip link set %s txqueuelen 2000 2>/dev/null", name);
-    system(cmd);
+    {
+        char qlen[8];
+        snprintf(qlen, sizeof(qlen), "%d", 2000);
+        const char *const ip_txq[] = {"ip", "link", "set", name,
+                                       "txqueuelen", qlen, NULL};
+        run_cmdv_quiet(ip_txq);
+    }
 
     return (ret == 0) ? 0 : -1;
 }
@@ -122,15 +124,12 @@ int tun_up(const char *name)
 
 int tun_add_route(const char *network, const char *name)
 {
-    char cmd[256];
-    snprintf(cmd, sizeof(cmd),
-             "ip route add %s dev %s 2>/dev/null", network, name);
-    int ret = system(cmd);
+    const char *const add[] = {"ip", "route", "add", network, "dev", name, NULL};
+    int ret = run_cmdv(add);
     if (ret != 0) {
         /* Try replacing if already exists */
-        snprintf(cmd, sizeof(cmd),
-                 "ip route replace %s dev %s 2>/dev/null", network, name);
-        ret = system(cmd);
+        const char *const rep[] = {"ip", "route", "replace", network, "dev", name, NULL};
+        ret = run_cmdv(rep);
     }
     return (ret == 0) ? 0 : -1;
 }
@@ -150,23 +149,24 @@ int tun_set_fwmark(int fd, int mark)
 
 int tun_add_full_tunnel(const char *name)
 {
-    char cmd[256];
+    char table_str[16];
+    snprintf(table_str, sizeof(table_str), "%d", TUN_ROUTE_TABLE);
+
     /* Single 0.0.0.0/0 route in the TUN table.
      * Only unmarked packets hit this table (see tun_set_fwmark_rule).
      * The tunnel's own marked TCP packets use the main table → real NIC. */
-    snprintf(cmd, sizeof(cmd),
-             "ip route add 0.0.0.0/0 dev %s table %d 2>/dev/null",
-             name, TUN_ROUTE_TABLE);
-    if (system(cmd) != 0) {
-        snprintf(cmd, sizeof(cmd),
-                 "ip route replace 0.0.0.0/0 dev %s table %d 2>/dev/null",
-                 name, TUN_ROUTE_TABLE);
-        if (system(cmd) != 0) {
+    const char *const add[] = {"ip", "route", "add", "0.0.0.0/0",
+                                "dev", name, "table", table_str, NULL};
+    if (run_cmdv(add) != 0) {
+        const char *const rep[] = {"ip", "route", "replace", "0.0.0.0/0",
+                                    "dev", name, "table", table_str, NULL};
+        if (run_cmdv(rep) != 0) {
             fprintf(stderr, "tun: failed to add full tunnel route via %s\n", name);
             return -1;
         }
     }
-    fprintf(stderr, "[tun] full tunnel: 0.0.0.0/0 → %s (table %d)\n", name, TUN_ROUTE_TABLE);
+    fprintf(stderr, "[tun] full tunnel: 0.0.0.0/0 → %s (table %d)\n",
+            name, TUN_ROUTE_TABLE);
     return 0;
 }
 
@@ -174,17 +174,25 @@ int tun_add_full_tunnel(const char *name)
 
 int tun_set_fwmark_rule(int mark)
 {
-    char cmd[256];
+    char mark_str[16], table_str[16];
+    snprintf(mark_str,  sizeof(mark_str),  "%d", mark);
+    snprintf(table_str, sizeof(table_str), "%d", TUN_ROUTE_TABLE);
+
     /* Unmarked packets → TUN routing table (has VPN routes).
      * Marked packets (tunnel's own TCP) → default main table → real NIC. */
-    snprintf(cmd, sizeof(cmd),
-             "ip rule add not fwmark %d table %d 2>/dev/null", mark, TUN_ROUTE_TABLE);
-    system(cmd);
+    {
+        const char *const add[] = {"ip", "rule", "add", "not", "fwmark",
+                                    mark_str, "table", table_str, NULL};
+        run_cmdv_quiet(add);
+    }
     /* Clean up any old broken rule from previous versions */
-    snprintf(cmd, sizeof(cmd),
-             "ip rule del fwmark %d table main 2>/dev/null", mark);
-    system(cmd);
-    fprintf(stderr, "[tun] fwmark %d: unmarked→table %d, marked→main\n", mark, TUN_ROUTE_TABLE);
+    {
+        const char *const del[] = {"ip", "rule", "del", "fwmark",
+                                    mark_str, "table", "main", NULL};
+        run_cmdv_quiet(del);
+    }
+    fprintf(stderr, "[tun] fwmark %d: unmarked→table %d, marked→main\n",
+            mark, TUN_ROUTE_TABLE);
     return 0;
 }
 
@@ -203,22 +211,43 @@ int tun_enable_forwarding(void)
     return 0;
 }
 
-/* ─── Safe command execution (no shell injection) ────────────── */
-static int run_iptables(const char *argv[])
+/* ─── Safe command execution (fork+exec, no shell) ───────────── */
+
+/*
+ * Execute a command via fork() + execvp().  The argv array MUST be
+ * NULL-terminated.  Returns 0 on success (exit code 0), -1 on any
+ * error (fork failure, exec failure, non-zero exit).
+ *
+ * All standard fds are closed in the child so error messages from
+ * the subprocess are silenced (equivalent to 2>/dev/null in shell).
+ */
+static int run_cmdv(const char *const argv[])
 {
     pid_t pid = fork();
     if (pid < 0) return -1;
     if (pid == 0) {
-        /* Child: exec iptables directly (no shell) */
         close(STDIN_FILENO);
         close(STDOUT_FILENO);
         close(STDERR_FILENO);
-        execvp("iptables", (char * const *)argv);
-        _exit(1);
+        execvp(argv[0], (char *const *)argv);
+        _exit(127);
     }
     int status;
     waitpid(pid, &status, 0);
     return (WIFEXITED(status) && WEXITSTATUS(status) == 0) ? 0 : -1;
+}
+
+/* Convenience wrapper that ignores the exit code (fire-and-forget). */
+static void run_cmdv_quiet(const char *const argv[])
+{
+    (void)run_cmdv(argv);
+}
+
+/* ─── iptables helper (uses the same fork+exec engine) ─────────── */
+
+static int run_iptables(const char *argv[])
+{
+    return run_cmdv(argv);
 }
 
 /* ─── iptables NAT (masquerade) ─────────────────────────────── */
@@ -236,9 +265,10 @@ int tun_set_nat(const char *subnet, const char *out_if)
         "-s",subnet,"-o",out_if,"-j","MASQUERADE",NULL};
     if (run_iptables(add_argv) != 0) {
         /* Try nftables as fallback */
-        char buf[256];
-        snprintf(buf,sizeof(buf),"nft add rule ip nat POSTROUTING ip saddr %s oif %s masquerade",subnet,out_if);
-        system(buf); /* nft fallback only, low risk */
+        const char *const nft[] = {"nft", "add", "rule", "ip", "nat",
+                                    "POSTROUTING", "ip", "saddr", subnet,
+                                    "oif", out_if, "masquerade", NULL};
+        run_cmdv_quiet(nft);
     }
     fprintf(stderr, "[tun] NAT: %s → %s (MASQUERADE)\n", subnet, out_if);
     return 0;
@@ -412,33 +442,43 @@ int tun_set_nat_multi(const char *allowed_ips, const char *out_if)
 
 void tun_teardown(const char *name, int is_server)
 {
-    char cmd[256];
+    char table_str[16];
+    snprintf(table_str, sizeof(table_str), "%d", TUN_ROUTE_TABLE);
 
     /* Flush TUN routing table */
-    snprintf(cmd, sizeof(cmd), "ip route flush table %d 2>/dev/null", TUN_ROUTE_TABLE);
-    system(cmd);
+    {
+        const char *const flush[] = {"ip", "route", "flush", "table", table_str, NULL};
+        run_cmdv_quiet(flush);
+    }
 
     /* Remove policy routing rules */
-    snprintf(cmd, sizeof(cmd),
-             "ip rule del not fwmark %d table %d 2>/dev/null",
-             TUN_ROUTE_TABLE, TUN_ROUTE_TABLE);
-    system(cmd);
+    {
+        const char *const del1[] = {"ip", "rule", "del", "not", "fwmark",
+                                     table_str, "table", table_str, NULL};
+        run_cmdv_quiet(del1);
+    }
     /* Legacy rules from older versions */
-    snprintf(cmd, sizeof(cmd),
-             "ip rule del not fwmark %d table main 2>/dev/null", TUN_ROUTE_TABLE);
-    system(cmd);
-    snprintf(cmd, sizeof(cmd),
-             "ip rule del fwmark %d table main 2>/dev/null", TUN_ROUTE_TABLE);
-    system(cmd);
+    {
+        const char *const del2[] = {"ip", "rule", "del", "not", "fwmark",
+                                     table_str, "table", "main", NULL};
+        run_cmdv_quiet(del2);
+        const char *const del3[] = {"ip", "rule", "del", "fwmark",
+                                     table_str, "table", "main", NULL};
+        run_cmdv_quiet(del3);
+    }
 
     /* Delete TUN device */
-    snprintf(cmd, sizeof(cmd), "ip link del %s 2>/dev/null", name);
-    system(cmd);
+    {
+        const char *const link_del[] = {"ip", "link", "del", name, NULL};
+        run_cmdv_quiet(link_del);
+    }
 
     /* Server: clean iptables */
     if (is_server) {
-        system("iptables -t nat -F POSTROUTING 2>/dev/null");
-        system("iptables -F FORWARD 2>/dev/null");
+        const char *const nat_flush[] = {"iptables", "-t", "nat", "-F", "POSTROUTING", NULL};
+        run_cmdv_quiet(nat_flush);
+        const char *const fwd_flush[] = {"iptables", "-F", "FORWARD", NULL};
+        run_cmdv_quiet(fwd_flush);
     }
 
     fprintf(stderr, "[tun] %s removed, routes and rules cleared.\n", name);
