@@ -21,10 +21,10 @@ static void sha256_h(uint8_t out[32], const uint8_t *in, size_t len) {
     EVP_MD_CTX_free(c);
 }
 static int check_ts(int64_t ts) { int64_t n=timestamp_now(); if(n<0)return -1; int64_t d=(n>ts)?(n-ts):(ts-n); return d>60?-1:0; }
-static int send_all(int fd, const uint8_t *b, size_t n) { size_t s=0; while(s<n){ ssize_t r=send(fd,b+s,n-s,0); if(r<0){if(errno==EINTR)continue;return -1;} if(r==0)return -1; s+=(size_t)r;} return 0; }
+int send_all(int fd, const uint8_t *b, size_t n) { size_t s=0; while(s<n){ ssize_t r=send(fd,b+s,n-s,0); if(r<0){if(errno==EINTR)continue;return -1;} if(r==0)return -1; s+=(size_t)r;} return 0; }
 
 #include <poll.h>
-static int recv_all(int fd, uint8_t *b, size_t n) {
+int recv_all(int fd, uint8_t *b, size_t n) {
     size_t r = 0;
     while (r < n) {
         struct pollfd pfd = { .fd = fd, .events = POLLIN };

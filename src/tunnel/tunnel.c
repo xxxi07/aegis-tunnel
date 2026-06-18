@@ -193,7 +193,7 @@ int tunnel_send_data(tunnel_t *tun,
  * Send plaintext bytes to dst_fd with partial-write retry.
  * Returns 0 on success, -1 on error.
  */
-static int send_all(int dst_fd, const uint8_t *data, size_t len)
+static int write_all(int dst_fd, const uint8_t *data, size_t len)
 {
     size_t sent = 0;
     while (sent < len) {
@@ -330,7 +330,7 @@ int tunnel_run(tunnel_t *tun)
                     }
                     continue;
                 }
-                if (plen > 0 && send_all(pt_fd, plaintext, plen) != 0)
+                if (plen > 0 && write_all(pt_fd, plaintext, plen) != 0)
                     return -1;
             }
         }

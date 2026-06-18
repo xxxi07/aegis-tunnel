@@ -63,4 +63,8 @@ int handshake_rekey(int fd,
                     session_keys_t *keys, uint64_t *nonce_ctr,
                     int is_initiator);
 
+/* Low-level reliable I/O (poll-based, used by handshake + SOCKS5) */
+int send_all(int fd, const uint8_t *b, size_t n);
+int recv_all(int fd, uint8_t *b, size_t n);
+
 #endif /* HANDSHAKE_H */

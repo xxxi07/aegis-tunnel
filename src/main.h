@@ -45,6 +45,15 @@ int mode_tun_client(int listen_port, const char *remote_host, int remote_port,
                     const char *postup, const char *postdown,
                     const uint8_t *psk, size_t psk_len, int hs_timeout, int keepalive);
 
+/* ── SOCKS5 proxy modes ── */
+int mode_socks5_server(int listen_port,
+                       const uint8_t *psk, size_t psk_len,
+                       int hs_timeout, int keepalive);
+int mode_socks5_client(const char *remote_host, int remote_port,
+                       int listen_port,
+                       const uint8_t *psk, size_t psk_len,
+                       int hs_timeout, int keepalive);
+
 #endif /* MAIN_H */
 
 

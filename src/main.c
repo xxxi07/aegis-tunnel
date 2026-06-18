@@ -111,6 +111,7 @@ static void usage(const char *prog) {
         "  peer list                      List known peers\n"
         "  create tun -server|-client      Generate TUN config from aegis.conf\n"
         "  start tun -server|-client       Start TUN VPN from config\n"
+        "  socks5 -server|-client           SOCKS5 proxy mode (no root needed)\n"
         "  tun down [name]                Remove TUN device + iptables rules\n"
         "  status                         Show key/peer status\n"
         "\n"
@@ -142,7 +143,8 @@ static void usage(const char *prog) {
 
 int main(int argc, char **argv) {
     /* Subcommands: aegis-tunnel keygen | peer add <host> <hex> | peer list */
-    int  start_tun_force = 0;  /* 1=server, 2=client — set by 'start tun' subcommand */
+    int  start_tun_force   = 0;  /* 1=server, 2=client — set by 'start tun' subcommand */
+    int  socks5_force      = 0;  /* 1=server, 2=client — set by 'socks5' subcommand */
     if (argc >= 2) {
         if (!strcmp(argv[1], "keygen"))    return cmd_keygen();
         if (!strcmp(argv[1], "status"))    return cmd_status();
@@ -175,6 +177,18 @@ int main(int argc, char **argv) {
             /* Consume subcommand args so getopt sees only remaining flags (like -c) */
             argv += 3; argc -= 3;
             optind = 0;  /* reset getopt for shifted argv */
+        }
+        /* socks5 -server | -client */
+        if (!strcmp(argv[1], "socks5") && argc >= 3) {
+            if (!strcmp(argv[2], "-server"))      socks5_force = 1;
+            else if (!strcmp(argv[2], "-client")) socks5_force = 2;
+            else {
+                fprintf(stderr, "Usage: %s socks5 -server | -client [-l <port>] [-r <host:port>]\n",
+                        argv[0]);
+                return 1;
+            }
+            argv += 2; argc -= 2;
+            optind = 0;
         }
     }
 
@@ -485,6 +499,18 @@ int main(int argc, char **argv) {
     aegis_crypto_init();
 
     int ret;
+
+    /* ── SOCKS5 proxy mode ── */
+    if (socks5_force) {
+        if (socks5_force == 1)
+            ret = mode_socks5_server(listen_port, psk, psk_len, hs_timeout, keepalive);
+        else
+            ret = mode_socks5_client(remote_str ? remote_str : "127.0.0.1",
+                                     remote_port ? remote_port : 9000,
+                                     listen_port, psk, psk_len, hs_timeout, keepalive);
+        return ret;
+    }
+
     if (tun_mode) {
         if (!strcmp(mode, "server"))
             ret = mode_tun_server(listen_port, tun_name, tun_ip, tun_netmask,
