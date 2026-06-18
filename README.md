@@ -195,11 +195,9 @@ make test           # Run all tests at once
 
 | Platform | Pure C | x86 AES-NI | ARM Crypto | ARM NEON |
 |----------|--------|-----------|------------|----------|
-| x86_64 | ~400 MB/s | **~3,700 MB/s** | — | — |
-| Raspberry Pi 3 (A53) | ~180 MB/s | — | — | ~350 MB/s |
-| Raspberry Pi 4 (A72) | ~200 MB/s | — | ~800 MB/s | ~400 MB/s |
-| Raspberry Pi 5 (A76) | ~250 MB/s | — | ~1,200 MB/s | ~500 MB/s |
-| Apple M2 | ~300 MB/s | — | ~2,500 MB/s | ~600 MB/s |
+| x86_64 | ~110 MB/s | **~9500 MB/s** | — | — |
+
+| aarch64 | ~80 MB/s | — | ~120 MB/s | ~3900 MB/s |
 
 ## Security
 

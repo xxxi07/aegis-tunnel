@@ -13,6 +13,8 @@
 #include "util/util.h"
 
 #include <errno.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdio.h>
@@ -115,6 +117,21 @@ void tunnel_init(tunnel_t *tun,
     tun->keepalive_sec = 0;
     tun->running = 1;
 
+    /* ── TCP performance tuning ──
+     * Disable Nagle's algorithm (TCP_NODELAY).  Without this, small
+     * frames like ICMP echo (~100 bytes) are delayed up to 40 ms by
+     * the Nagle/delayed-ACK interaction, causing severe packet loss
+     * for latency-sensitive protocols (ping, DNS, VoIP).
+     *
+     * Also increase the send buffer to reduce blocking probability
+     * when the tunnel pushes bursts of packets. */
+    {
+        int one = 1;
+        setsockopt(encrypted_fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+        int sndbuf = 256 * 1024;  /* 256 KB */
+        setsockopt(encrypted_fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+    }
+
     /* Derive session PSK from enc_key for nonce-triggered re-key.
      * XOR enc_key and dec_key → deterministic per-session value. */
     for (int i = 0; i < 16; i++)
@@ -206,33 +223,41 @@ int tunnel_run(tunnel_t *tun)
             return -1;
         }
 
-        /* ── Plaintext → Encrypted: read, encrypt, forward ── */
+        /* ── Plaintext → Encrypted: drain ALL queued packets ──
+         * Each read() on a TUN device returns exactly one IP packet.
+         * Draining in a loop avoids queue buildup when bursts arrive
+         * (e.g., multiple ICMP replies, DNS responses, TCP ACKs). */
         if (fds[TUNNEL_PLAINTEXT_FD].revents & POLLIN) {
-            uint8_t buf[FRAME_MAX_PAYLOAD];
-            ssize_t n = read(pt_fd, buf, sizeof(buf));
-            if (n < 0) {
-                if (errno == EINTR) continue;
-                if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
-                fprintf(stderr, "[tunnel] pt_fd read error: %s (fd=%d)\n", strerror(errno), pt_fd);
-                return -1;
-            }
-            if (n == 0) {
-                /* Plaintext peer disconnected — send CLOSE */
-                uint8_t wb[FRAME_MAX_WIRE];
-                size_t wl = 0;
-                if (tun->enc_nonce < NONCE_OVERFLOW_LIMIT &&
-                    frame_build(wb, &wl, FRAME_CLOSE, FLAG_NONE,
-                                NULL, 0, tun->enc_nonce, tun->enc_key) == 0) {
-                    tun->enc_nonce++;
-                    send(enc_fd, wb, wl, MSG_NOSIGNAL);
+            int drained = 0;
+            for (;;) {
+                uint8_t buf[FRAME_MAX_PAYLOAD];
+                ssize_t n = read(pt_fd, buf, sizeof(buf));
+                if (n < 0) {
+                    if (errno == EINTR) continue;
+                    if (errno == EAGAIN || errno == EWOULDBLOCK) break;  /* drained */
+                    fprintf(stderr, "[tunnel] pt_fd read error: %s (fd=%d)\n", strerror(errno), pt_fd);
+                    return -1;
                 }
-                return 0;
-            }
+                if (n == 0) {
+                    /* Plaintext peer disconnected — send CLOSE */
+                    uint8_t wb[FRAME_MAX_WIRE];
+                    size_t wl = 0;
+                    if (tun->enc_nonce < NONCE_OVERFLOW_LIMIT &&
+                        frame_build(wb, &wl, FRAME_CLOSE, FLAG_NONE,
+                                    NULL, 0, tun->enc_nonce, tun->enc_key) == 0) {
+                        tun->enc_nonce++;
+                        send(enc_fd, wb, wl, MSG_NOSIGNAL);
+                    }
+                    return 0;
+                }
 
-            {
-                int sd = tunnel_send_data(tun, buf, (size_t)n);
-                if (sd == -2) goto do_rekey;  /* nonce near overflow */
-                if (sd < 0)   return -1;
+                {
+                    int sd = tunnel_send_data(tun, buf, (size_t)n);
+                    if (sd == -2) goto do_rekey;  /* nonce near overflow */
+                    if (sd < 0)   return -1;
+                }
+                drained++;
+                if (drained > 256) break;  /* safety limit: prevent infinite loop */
             }
         }
 
