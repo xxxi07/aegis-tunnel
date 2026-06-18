@@ -313,9 +313,25 @@ int tun_exec_script(const char *script, const char *name)
     *dst = '\0';
 
     fprintf(stderr, "[tun] exec: %s\n", cmd);
-    int ret = system(cmd);
-    if (ret != 0) {
-        fprintf(stderr, "[tun] script exited with %d\n", ret);
+
+    /* Use fork+exec to avoid system() signal-handling quirks.
+     * PostUp/PostDown are shell scripts by design (may contain
+     * ; | && etc.), so we invoke /bin/sh -c explicitly. */
+    pid_t pid = fork();
+    if (pid < 0) {
+        fprintf(stderr, "[tun] fork failed: %s\n", strerror(errno));
+        return -1;
+    }
+    if (pid == 0) {
+        /* Child: preserve stdout/stderr for script diagnostics */
+        close(STDIN_FILENO);
+        execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
+        _exit(127);
+    }
+    int status;
+    waitpid(pid, &status, 0);
+    if (WIFEXITED(status) && WEXITSTATUS(status) != 0) {
+        fprintf(stderr, "[tun] script exited with %d\n", WEXITSTATUS(status));
         return -1;
     }
     return 0;

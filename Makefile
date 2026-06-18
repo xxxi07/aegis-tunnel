@@ -39,7 +39,7 @@ ifneq ($(IS_ARM),)
 CRYPTO   += $(SRC_DIR)/crypto/neon/aegis128-plain.c \
              $(SRC_DIR)/crypto/neon/aegis128-armcrypto.c
 endif
-UTIL     := $(SRC_DIR)/util/util.c $(SRC_DIR)/util/log.c $(SRC_DIR)/util/config.c $(SRC_DIR)/util/iniconfig.c
+UTIL     := $(SRC_DIR)/util/util.c $(SRC_DIR)/util/log.c $(SRC_DIR)/util/iniconfig.c
 PROTOCOL := $(SRC_DIR)/protocol/handshake.c $(SRC_DIR)/protocol/ecdh.c $(SRC_DIR)/protocol/frame_reader.c $(SRC_DIR)/protocol/keyfile.c
 TUNNEL   := $(SRC_DIR)/tunnel/tunnel.c $(SRC_DIR)/tunnel/threadpool.c $(SRC_DIR)/tunnel/tun.c
 PROXY    := $(SRC_DIR)/proxy/socks5.c

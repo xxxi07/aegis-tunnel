@@ -73,7 +73,8 @@ typedef struct {
     uint64_t dec_nonce;               /* Nonce counter: encrypted→plaintext */
     int  keepalive_sec;               /* Keepalive interval (0 = disabled) */
     int  rekey_sec;                   /* Re-key interval (0=off, 120=WireGuard-like) */
-    const uint8_t *psk;               /* PSK for re-keying (not copied, must outlive tunnel) */
+    uint8_t session_psk[16];          /* auto-derived PSK for nonce-triggered re-key */
+    const uint8_t *psk;               /* External PSK for re-keying (may be NULL; session_psk used as fallback) */
     size_t psk_len;                   /* PSK length in bytes */
     volatile int running;             /* Set to 0 to stop the tunnel loop */
 } tunnel_t;

@@ -153,8 +153,11 @@ int handshake_rekey(int fd, const uint8_t *psk, size_t plen, session_keys_t *key
     }
     if(ecdh_derive(sh,opriv,ppub)!=0) goto out;
     uint8_t nc2[16],ns[16];random_bytes(nc2,16);random_bytes(ns,16);
-    size_t bl=plen+32+32;uint8_t *b=(uint8_t*)malloc(bl),*p=b;
-    memcpy(p,psk,plen);p+=plen;memcpy(p,sh,32);p+=32;memcpy(p,nc2,16);p+=16;memcpy(p,ns,16);
+    size_t bl = plen + 32 + 32;
+    uint8_t *b = (uint8_t*)malloc(bl), *p = b;
+    /* psk may be NULL with plen=0 (auto-derived session PSK) */
+    if (psk && plen > 0) { memcpy(p, psk, plen); p += plen; }
+    memcpy(p, sh, 32); p += 32; memcpy(p, nc2, 16); p += 16; memcpy(p, ns, 16);
     uint8_t h[32],ek[16],dk[16];sha256_h(h,b,bl);free(b);memcpy(ek,h,16);memcpy(dk,h+16,16);secure_memzero(h,32);
     if(init){memcpy(keys->enc_key,ek,16);memcpy(keys->dec_key,dk,16);}
     else    {memcpy(keys->enc_key,dk,16);memcpy(keys->dec_key,ek,16);}

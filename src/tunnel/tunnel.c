@@ -25,6 +25,7 @@
 /* ─── Nonce construction ───────────────────────────────────────── */
 
 #define NONCE_OVERFLOW_LIMIT  (UINT64_C(0xFFFFFFFFFFFFFFF0))
+#define NONCE_REKEY_MARGIN    10000  /* trigger re-key when within this many of limit */
 
 static void nonce_from_counter(uint8_t nonce[AEGIS_NONCE_LEN],
                                uint64_t counter)
@@ -113,6 +114,13 @@ void tunnel_init(tunnel_t *tun,
     tun->dec_nonce = 1;
     tun->keepalive_sec = 0;
     tun->running = 1;
+
+    /* Derive session PSK from enc_key for nonce-triggered re-key.
+     * XOR enc_key and dec_key → deterministic per-session value. */
+    for (int i = 0; i < 16; i++)
+        tun->session_psk[i] = enc_key[i] ^ dec_key[i];
+    tun->psk     = tun->session_psk;
+    tun->psk_len = 16;
 }
 
 /* ─── Tunnel: send a DATA frame (encrypt direction) ────────────── */
@@ -120,9 +128,9 @@ void tunnel_init(tunnel_t *tun,
 int tunnel_send_data(tunnel_t *tun,
                      const uint8_t *d, size_t len)
 {
-    /* Check nonce overflow */
+    /* Nonce near overflow → caller should re-key first */
     if (tun->enc_nonce >= NONCE_OVERFLOW_LIMIT) {
-        return -1;
+        return -2;  /* signal: need re-key */
     }
 
     uint8_t wire_buf[FRAME_MAX_WIRE];
@@ -221,8 +229,11 @@ int tunnel_run(tunnel_t *tun)
                 return 0;
             }
 
-            if (tunnel_send_data(tun, buf, (size_t)n) < 0)
-                return -1;
+            {
+                int sd = tunnel_send_data(tun, buf, (size_t)n);
+                if (sd == -2) goto do_rekey;  /* nonce near overflow */
+                if (sd < 0)   return -1;
+            }
         }
 
         /* ── Encrypted → Plaintext: buffered stream frame reader ── */
@@ -237,8 +248,11 @@ int tunnel_run(tunnel_t *tun)
             if (fill == 0) { fprintf(stderr, "[tunnel] enc_fd EOF (peer disconnected)\n"); return 0; }
 
             for (;;) {
+                /* Nonce near overflow → trigger re-key before it's too late */
+                if (tun->dec_nonce >= NONCE_OVERFLOW_LIMIT - NONCE_REKEY_MARGIN)
+                    goto do_rekey;
                 if (tun->dec_nonce >= NONCE_OVERFLOW_LIMIT)
-                    return -1;
+                    return -1;  /* re-key failed to run in time */
 
                 uint8_t f_type, f_flags;
                 uint8_t plaintext[FRAME_MAX_PAYLOAD];
@@ -257,8 +271,9 @@ int tunnel_run(tunnel_t *tun)
                 if (f_type == FRAME_KEYCONFIRM) continue;
                 if (f_type == FRAME_REKEY) {
                     /* Peer wants to re-key.  handshake_rekey() handles
-                     * the full ECDH exchange and replaces keys atomically. */
-                    if (tun->psk && tun->psk_len > 0) {
+                     * the full ECDH exchange and replaces keys atomically.
+                     * session_psk is always available (derived in tunnel_init). */
+                    {
                         extern int handshake_rekey(int, const uint8_t*, size_t,
                                                    session_keys_t*, uint64_t*, int);
                         session_keys_t sk;
@@ -271,6 +286,7 @@ int tunnel_run(tunnel_t *tun)
                             memcpy(tun->enc_key, sk.enc_key, AEGIS_KEY_LEN);
                             memcpy(tun->dec_key, sk.dec_key, AEGIS_KEY_LEN);
                             tun->dec_nonce = ctr;
+                            fprintf(stderr, "[tunnel] re-keyed (peer initiated)\n");
                         }
                     }
                     continue;
@@ -299,28 +315,41 @@ int tunnel_run(tunnel_t *tun)
             }
         }
 
-        /* ── Session Re-Keying (periodic ECDH, WireGuard-style) ── */
-        if (tun->rekey_sec > 0 && tun->psk && tun->psk_len > 0
-            && tun->enc_nonce < NONCE_OVERFLOW_LIMIT) {
+        /* ── Auto re-key on nonce pressure (always enabled) ── */
+        if (tun->enc_nonce >= NONCE_OVERFLOW_LIMIT - NONCE_REKEY_MARGIN)
+            goto do_rekey;
+
+        /* ── Periodic Session Re-Keying (ECDH, WireGuard-style) ── */
+        if (tun->rekey_sec > 0 && tun->enc_nonce < NONCE_OVERFLOW_LIMIT) {
             int64_t now = (int64_t)time(NULL);
             if (now - last_rekey >= tun->rekey_sec) {
-                /* Initiate re-key: new ECDH exchange, new session keys.
-                 * The peer handles FRAME_REKEY automatically in the
-                 * encrypted→plaintext path above. */
-                session_keys_t nk;
-                memcpy(nk.enc_key, tun->enc_key, AEGIS_KEY_LEN);
-                memcpy(nk.dec_key, tun->dec_key, AEGIS_KEY_LEN);
-                uint64_t ctr = tun->enc_nonce;
-                if (handshake_rekey(tun->fd[TUNNEL_ENCRYPTED_FD],
-                                    tun->psk, tun->psk_len,
-                                    &nk, &ctr, 1 /* initiator */) == 0) {
-                    memcpy(tun->enc_key, nk.enc_key, AEGIS_KEY_LEN);
-                    memcpy(tun->dec_key, nk.dec_key, AEGIS_KEY_LEN);
-                    tun->enc_nonce = ctr;
-                }
-                secure_memzero(&nk, sizeof(nk));
-                last_rekey = now;
+                goto do_rekey;
             }
+        }
+
+        continue;  /* next poll() iteration */
+
+    do_rekey:
+        /* Initiate re-key: new ECDH exchange, new session keys.
+         * The peer handles FRAME_REKEY automatically in the
+         * encrypted→plaintext path above.
+         * session_psk is always available (derived in tunnel_init). */
+        {
+            session_keys_t nk;
+            memcpy(nk.enc_key, tun->enc_key, AEGIS_KEY_LEN);
+            memcpy(nk.dec_key, tun->dec_key, AEGIS_KEY_LEN);
+            uint64_t ctr = tun->enc_nonce;
+            if (handshake_rekey(tun->fd[TUNNEL_ENCRYPTED_FD],
+                                tun->psk, tun->psk_len,
+                                &nk, &ctr, 1 /* initiator */) == 0) {
+                memcpy(tun->enc_key, nk.enc_key, AEGIS_KEY_LEN);
+                memcpy(tun->dec_key, nk.dec_key, AEGIS_KEY_LEN);
+                tun->enc_nonce = ctr;
+                last_rekey = (int64_t)time(NULL);
+                fprintf(stderr, "[tunnel] re-keyed (nonce pressure)\n");
+            }
+            secure_memzero(&nk, sizeof(nk));
+            continue;  /* back to poll() loop */
         }
     }
     return 0;
