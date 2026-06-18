@@ -6,6 +6,7 @@
 #include "tunnel/tunnel.h"
 #include "util/util.h"
 #include <errno.h>
+#include <fcntl.h>
 #include <openssl/evp.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -82,6 +83,7 @@ out:
 int handshake_client(int fd, const uint8_t our_priv[32], const uint8_t peer_pub[32], int to, session_keys_t *keys) {
     uint8_t ek[32],epk[32],repk[32],ik[16],rk[16],sh[32];int64_t rts;
     int ret = -1;
+    fprintf(stderr, "[handshake] client timeout=%ds, fd=%d, flags=0x%x\n", to, fd, fcntl(fd, F_GETFL, 0));
     set_socket_timeout(fd,to);
     if(ecdh_keygen(epk,ek)!=0)return -1;
     asym_init_key(ik,ek,our_priv,peer_pub);
