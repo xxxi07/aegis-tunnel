@@ -16,7 +16,25 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
+
+/* ─── Safe command execution (fork+exec, no shell) ──────────────── */
+
+static void run_cmdv_quiet(const char *const argv[])
+{
+    pid_t pid = fork();
+    if (pid < 0) return;
+    if (pid == 0) {
+        close(STDIN_FILENO);
+        close(STDOUT_FILENO);
+        close(STDERR_FILENO);
+        execvp(argv[0], (char *const *)argv);
+        _exit(127);
+    }
+    int status;
+    waitpid(pid, &status, 0);
+}
 
 /* ─── System helpers ─────────────────────────────────────────────── */
 
@@ -307,15 +325,25 @@ int cmd_status(void)
 int cmd_tun_down(const char *name)
 {
     if (!name) name = "tun0";
-    system("ip route flush table 51820 2>/dev/null");
-    system("ip rule del not fwmark 51820 table 51820 2>/dev/null");
-    system("ip rule del not fwmark 51820 table main 2>/dev/null");   /* legacy */
-    system("ip rule del fwmark 51820 table main 2>/dev/null");       /* legacy */
-    char cmd[128];
-    snprintf(cmd, sizeof(cmd), "ip link del %s 2>/dev/null", name);
-    system(cmd);
-    system("iptables -t nat -F POSTROUTING 2>/dev/null");
-    system("iptables -F FORWARD 2>/dev/null");
+
+    /* Flush TUN routing table */
+    run_cmdv_quiet((const char *const[]){"ip", "route", "flush", "table", "51820", NULL});
+
+    /* Remove policy routing rules */
+    run_cmdv_quiet((const char *const[]){"ip", "rule", "del", "not", "fwmark",
+                                          "51820", "table", "51820", NULL});
+    run_cmdv_quiet((const char *const[]){"ip", "rule", "del", "not", "fwmark",
+                                          "51820", "table", "main", NULL});  /* legacy */
+    run_cmdv_quiet((const char *const[]){"ip", "rule", "del", "fwmark",
+                                          "51820", "table", "main", NULL});  /* legacy */
+
+    /* Delete TUN device — name is from user input, passes as argv (no shell) */
+    run_cmdv_quiet((const char *const[]){"ip", "link", "del", name, NULL});
+
+    /* Clean iptables */
+    run_cmdv_quiet((const char *const[]){"iptables", "-t", "nat", "-F", "POSTROUTING", NULL});
+    run_cmdv_quiet((const char *const[]){"iptables", "-F", "FORWARD", NULL});
+
     printf("TUN %s removed, routes and iptables cleared.\n", name);
     return 0;
 }

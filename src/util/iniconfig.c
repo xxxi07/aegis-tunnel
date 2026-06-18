@@ -34,6 +34,7 @@ int iniconf_load(iniconf_t *cfg, const char *path)
                 *close = '\0';
                 sec = &cfg->sections[cfg->count];
                 sec->name = strdup(p + 1);
+                if (!sec->name) continue;  /* OOM — skip this section */
                 sec->count = 0;
                 cfg->count++;
                 *close = ']';
@@ -56,8 +57,10 @@ int iniconf_load(iniconf_t *cfg, const char *path)
         char *val = eq + 1;
         while (isspace((unsigned char)*val)) val++;
 
-        sec->entries[sec->count].key   = strdup(p);
-        sec->entries[sec->count].value = strdup(val);
+        char *k = strdup(p), *v = strdup(val);
+        if (!k || !v) { free(k); free(v); continue; }  /* OOM — skip this entry */
+        sec->entries[sec->count].key   = k;
+        sec->entries[sec->count].value = v;
         sec->count++;
     }
 

@@ -154,7 +154,9 @@ int handshake_rekey(int fd, const uint8_t *psk, size_t plen, session_keys_t *key
     if(ecdh_derive(sh,opriv,ppub)!=0) goto out;
     uint8_t nc2[16],ns[16];random_bytes(nc2,16);random_bytes(ns,16);
     size_t bl = plen + 32 + 32;
-    uint8_t *b = (uint8_t*)malloc(bl), *p = b;
+    uint8_t *b = (uint8_t*)malloc(bl);
+    if (!b) goto out;
+    uint8_t *p = b;
     /* psk may be NULL with plen=0 (auto-derived session PSK) */
     if (psk && plen > 0) { memcpy(p, psk, plen); p += plen; }
     memcpy(p, sh, 32); p += 32; memcpy(p, nc2, 16); p += 16; memcpy(p, ns, 16);

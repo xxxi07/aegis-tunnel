@@ -76,15 +76,39 @@ int parse_host_port(char *addr, char **host, int *port) {
     return (*port > 0 && *port <= 65535) ? 0 : -1;
 }
 int connect_to_host(const char *host, int port, int fwmark) {
-    int fd = socket(AF_INET, SOCK_STREAM, 0); if (fd < 0) { perror("socket"); return -1; }
-    /* Set fwmark BEFORE connect so the TCP SYN bypasses TUN routes */
-    if (fwmark > 0) setsockopt(fd, SOL_SOCKET, SO_MARK, &fwmark, sizeof(fwmark));
-    struct hostent *he = gethostbyname(host);
-    if (!he) { fprintf(stderr, "Error: cannot resolve '%s'\n", host); close(fd); return -1; }
-    struct sockaddr_in a; memset(&a, 0, sizeof(a));
-    a.sin_family = AF_INET; memcpy(&a.sin_addr, he->h_addr_list[0], (size_t)he->h_length);
-    a.sin_port = htons((uint16_t)port);
-    if (connect(fd, (struct sockaddr *)&a, sizeof(a)) < 0) { perror("connect"); close(fd); return -1; }
+    /* Resolve host using getaddrinfo (thread-safe, modern, IPv4/IPv6 capable) */
+    char port_str[16];
+    snprintf(port_str, sizeof(port_str), "%d", port);
+
+    struct addrinfo hints, *res, *rp;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family   = AF_INET;       /* IPv4 only for now */
+    hints.ai_socktype = SOCK_STREAM;
+
+    int gai_err = getaddrinfo(host, port_str, &hints, &res);
+    if (gai_err != 0) {
+        fprintf(stderr, "Error: cannot resolve '%s': %s\n", host, gai_strerror(gai_err));
+        return -1;
+    }
+
+    int fd = -1;
+    for (rp = res; rp != NULL; rp = rp->ai_next) {
+        fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+        if (fd < 0) continue;
+
+        /* Set fwmark BEFORE connect so the TCP SYN bypasses TUN routes */
+        if (fwmark > 0)
+            setsockopt(fd, SOL_SOCKET, SO_MARK, &fwmark, sizeof(fwmark));
+
+        if (connect(fd, rp->ai_addr, rp->ai_addrlen) == 0)
+            break;  /* success */
+
+        close(fd);
+        fd = -1;
+    }
+    freeaddrinfo(res);
+
+    if (fd < 0) { perror("connect"); return -1; }
     return fd;
 }
 int listen_on_port(int port) {
@@ -303,8 +327,9 @@ int main(int argc, char **argv) {
                 if (v) {
                     if (v[0] == '~') {
                         const char *home = get_real_home();
-                        char *exp = (char*)malloc(strlen(home) + strlen(v) + 1);
-                        sprintf(exp, "%s%s", home, v + 1);
+                        size_t explen = strlen(home) + strlen(v) + 1;
+                        char *exp = (char*)malloc(explen);
+                        if (exp) snprintf(exp, explen, "%s%s", home, v + 1);
                         privkey_file = exp;
                     } else privkey_file = strdup(v);
                 }
