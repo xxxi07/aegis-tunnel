@@ -118,18 +118,32 @@ void tunnel_init(tunnel_t *tun,
     tun->running = 1;
 
     /* ── TCP performance tuning ──
-     * Disable Nagle's algorithm (TCP_NODELAY).  Without this, small
-     * frames like ICMP echo (~100 bytes) are delayed up to 40 ms by
-     * the Nagle/delayed-ACK interaction, causing severe packet loss
-     * for latency-sensitive protocols (ping, DNS, VoIP).
      *
-     * Also increase the send buffer to reduce blocking probability
-     * when the tunnel pushes bursts of packets. */
+     * Nagle (TCP_NODELAY=1 disables it):
+     *   Without this, small frames like ICMP echo (~100 B) are
+     *   delayed up to 40 ms waiting for a peer ACK that itself is
+     *   delayed.  Disabling Nagle lets every send() emit a segment
+     *   immediately regardless of size.
+     *
+     * Delayed ACK (TCP_QUICKACK=1 disables it):
+     *   Without this the receiver holds ACKs for up to 40 ms hoping
+     *   to piggyback them on a data segment.  In a tunnel there is
+     *   almost never a return-data segment to piggyback on, so the
+     *   40 ms is pure waste that inflates RTT and shrinks the
+     *   congestion window.
+     *
+     * Buffer sizing:
+     *   256 KB send + 256 KB receive buffer gives the tunnel ~512 KB
+     *   of TCP buffer headroom, sufficient for ~5,000 typical 100 B
+     *   frames queued in either direction before pushback occurs. */
     {
-        int one = 1;
-        setsockopt(encrypted_fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+        int one  = 1;
         int sndbuf = 256 * 1024;  /* 256 KB */
-        setsockopt(encrypted_fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+        int rcvbuf = 256 * 1024;  /* 256 KB */
+        setsockopt(encrypted_fd, IPPROTO_TCP, TCP_NODELAY,  &one,    sizeof(one));
+        setsockopt(encrypted_fd, IPPROTO_TCP, TCP_QUICKACK, &one,    sizeof(one));
+        setsockopt(encrypted_fd, SOL_SOCKET,  SO_SNDBUF,    &sndbuf, sizeof(sndbuf));
+        setsockopt(encrypted_fd, SOL_SOCKET,  SO_RCVBUF,    &rcvbuf, sizeof(rcvbuf));
     }
 
     /* Derive session PSK from enc_key for nonce-triggered re-key.

@@ -93,13 +93,26 @@ int tun_set_ip(const char *name, const char *ip, const char *netmask)
 int tun_up(const char *name)
 {
     char cmd[128];
+    int ret;
+
+    /* Bring the interface up */
     snprintf(cmd, sizeof(cmd), "ip link set %s up 2>/dev/null", name);
-    int ret = system(cmd);
+    ret = system(cmd);
     if (ret != 0) {
         /* Fallback: try ifconfig */
         snprintf(cmd, sizeof(cmd), "ifconfig %s up 2>/dev/null", name);
         ret = system(cmd);
     }
+
+    /* Increase txqueuelen from default 500 to 2000.
+     * TUN tunnels aggregate all user traffic over a single TCP
+     * connection; a burst of ICMP replies, DNS responses, or TCP
+     * ACKs can easily exceed 500 packets in a few milliseconds.
+     * A larger queue absorbs bursts without kernel drops. */
+    snprintf(cmd, sizeof(cmd),
+             "ip link set %s txqueuelen 2000 2>/dev/null", name);
+    system(cmd);
+
     return (ret == 0) ? 0 : -1;
 }
 
