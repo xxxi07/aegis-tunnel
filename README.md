@@ -1,148 +1,148 @@
 # AEGIS-Tunnel
 
-基于 **AEGIS-128** 认证加密 + **X25519 ECDH** 的轻量级安全隧道，支持 TUN VPN 和 TCP 代理双模式，自动选择最优加密后端（x86 AES-NI / ARM Crypto / Pure C）。
+A lightweight secure tunnel based on **AEGIS-128** authenticated encryption and **X25519 ECDH**, supporting both TUN VPN and TCP proxy modes with automatic crypto backend selection (x86 AES-NI / ARM Crypto / Pure C).
 
-## 概述
+## Overview
 
-AEGIS-Tunnel 是一个极简的加密隧道工具，提供：
+AEGIS-Tunnel is a minimal encrypted tunnel tool providing:
 
-- **TUN VPN 模式**：WireGuard 风格的四阶段工作流（keygen → peer add → create tun → start tun）
-- **代理模式**：加密 TCP 隧道转发（类似 Stunnel/SSH -L）
-- **非对称握手**：基于 X25519 的 3-DH 密钥交换，支持多 Peer 管理
-- **自动加密后端选择**：x86 AES-NI（~92x 加速）> ARM Crypto > ARM NEON > Pure C
+- **TUN VPN mode**: WireGuard-style four-phase workflow (keygen → peer add → create tun → start tun)
+- **Proxy mode**: Encrypted TCP tunnel forwarding (similar to Stunnel / SSH -L)
+- **Asymmetric handshake**: X25519-based 3-DH key exchange with multi-peer management
+- **Automatic crypto backend selection**: x86 AES-NI (~92x speedup) > ARM Crypto > ARM NEON > Pure C
 
-## 特性
+## Features
 
-- **AEGIS-128 AEAD**：CAESAR 竞赛冠军算法，IETF CFRG 标准化中
-- **X25519 非对称握手**：3-DH 密钥交换 + 时间戳防重放，支持多 Peer
-- **TUN 虚拟网卡**：L3 VPN，支持全隧道 / 分流隧道 / 多网段路由
-- **fwmark 策略路由**：自动标记隧道自身的 TCP 连接，防止路由环路
-- **多平台加速**：x86_64 AES-NI / aarch64 ARM Crypto / ARM NEON / Pure C
-- **WireGuard 风格配置**：INI 文件管理，`peer add/delete/list` 子命令
-- **自动清理**：Ctrl+C 时自动清除路由规则和 TUN 设备
-- **~1500 行 C99 代码**（主程序 + 模式 + 配置管理），易于审计和定制
+- **AEGIS-128 AEAD**: CAESAR competition winner, being standardized by IETF CFRG
+- **X25519 asymmetric handshake**: 3-DH key exchange + timestamp replay protection, multi-peer support
+- **TUN virtual interface**: Layer 3 VPN supporting full-tunnel / split-tunnel / multi-subnet routing
+- **fwmark policy routing**: Automatically marks tunnel TCP connections to prevent routing loops
+- **Multi-platform acceleration**: x86_64 AES-NI / aarch64 ARM Crypto / ARM NEON / Pure C
+- **WireGuard-style configuration**: INI file management with `peer add/delete/list` subcommands
+- **Auto-cleanup**: Automatically removes routing rules and TUN device on Ctrl+C
+- **~1,500 lines of C99** (main + modes + config management), easy to audit and customize
 
-## 项目结构
+## Project Structure
 
 ```
 src/
-├── main.c              # 入口：参数解析 + 模式分发（519 行）
-├── main.h              # 全局变量和函数声明
-├── config_mgmt.c/h     # 配置管理：keygen / peer add/delete / create tun
-├── mode_common.c/h     # 共享模式代码：多 Peer 握手
-├── mode_psk.c          # 代理模式（TCP 隧道）
-├── mode_tun.c          # TUN VPN 模式
-├── crypto/             # AEGIS-128 加密算法
-│   ├── aegis.c/h       # 核心实现 + 运行时后端选择
-│   ├── x86/            # x86 AES-NI 加速
-│   └── neon/           # ARM Crypto + NEON 加速
-├── protocol/           # 网络协议
-│   ├── handshake.c/h   # X25519 3-DH 握手 + 密钥确认 + rekey
-│   ├── ecdh.c/h        # X25519 密钥交换（OpenSSL EVP）
-│   ├── frame_reader.c/h # TCP 流帧解析器
-│   └── keyfile.c/h     # 密钥文件 I/O
-├── tunnel/             # 隧道引擎
-│   ├── tunnel.c/h      # poll() 事件循环 + 帧加解密
-│   ├── tun.c/h         # TUN 设备管理 + 路由 + iptables
-│   └── threadpool.c/h  # 线程池（可选，默认 fork）
-├── proxy/              # SOCKS5 代理（可选）
+├── main.c              # Entry point: argument parsing + mode dispatch (495 lines)
+├── main.h              # Global variables and function declarations
+├── config_mgmt.c/h     # Config management: keygen / peer add/delete / create tun
+├── mode_common.c/h     # Shared mode code: multi-peer handshake
+├── mode_psk.c          # Proxy mode (TCP tunnel)
+├── mode_tun.c          # TUN VPN mode
+├── crypto/             # AEGIS-128 encryption
+│   ├── aegis.c/h       # Core implementation + runtime backend selection
+│   ├── x86/            # x86 AES-NI acceleration
+│   └── neon/           # ARM Crypto + NEON acceleration
+├── protocol/           # Network protocol
+│   ├── handshake.c/h   # X25519 3-DH handshake + key confirmation + rekey
+│   ├── ecdh.c/h        # X25519 key exchange (OpenSSL EVP)
+│   ├── frame_reader.c/h # TCP stream frame reader
+│   └── keyfile.c/h     # Key file I/O
+├── tunnel/             # Tunnel engine
+│   ├── tunnel.c/h      # poll() event loop + frame encrypt/decrypt
+│   ├── tun.c/h         # TUN device management + routing + iptables
+│   └── threadpool.c/h  # Thread pool (optional; fork by default)
+├── proxy/              # SOCKS5 proxy (optional)
 │   └── socks5.c/h
-└── util/               # 工具库
+└── util/               # Utilities
     ├── util.c/h        # hex_dump / random_bytes / secure_memzero
-    ├── iniconfig.c/h   # WireGuard 风格 INI 解析器
-    ├── config.c/h      # 旧版 key=value 兼容解析器
-    └── log.c/h         # 日志模块
+    ├── iniconfig.c/h   # WireGuard-style INI parser
+    ├── config.c/h      # Legacy key=value compat parser (unused)
+    └── log.c/h         # Logging module
 ```
 
-## 快速开始
+## Quick Start
 
-### 依赖
+### Dependencies
 
-- GCC >= 9.0（或 Clang >= 10.0）
-- OpenSSL >= 1.1.1（libssl-dev，用于 X25519 + SHA256）
-- Linux（TUN 模式依赖 `/dev/net/tun`、`ip` 命令、`iptables`）
+- GCC >= 9.0 (or Clang >= 10.0)
+- OpenSSL >= 1.1.1 (libssl-dev, for X25519 + SHA256)
+- Linux (TUN mode requires `/dev/net/tun`, `ip` command, `iptables`)
 
-### 编译
+### Build
 
 ```bash
-# 快速编译（Makefile）
+# Quick build (Makefile)
 make
 
-# 或使用 CMake
+# Or with CMake
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 
-# ARM 交叉编译（树莓派等）
-make                    # Makefile 自动检测 aarch64
+# ARM cross-compilation (Raspberry Pi, etc.)
+make                    # Makefile auto-detects aarch64
 ```
 
-### TUN VPN 模式（四阶段工作流）
+### TUN VPN Mode (Four-Phase Workflow)
 
 ```bash
-# 阶段 1：生成密钥对 + 基础配置
+# Phase 1: Generate keypair + base config
 ./aegis-tunnel keygen
 
-# 阶段 2：交换公钥（双方执行）
-./aegis-tunnel peer add <对端名称> <对端64位hex公钥>
+# Phase 2: Exchange public keys (both sides)
+./aegis-tunnel peer add <peer-name> <peer-64-char-hex-public-key>
 
-# 阶段 3：生成 TUN 配置文件
-./aegis-tunnel create tun -server    # 服务端
-./aegis-tunnel create tun -client    # 客户端
+# Phase 3: Generate TUN configuration
+./aegis-tunnel create tun -server    # Server side
+./aegis-tunnel create tun -client    # Client side
 
-# 阶段 4：启动 VPN（需要 root）
+# Phase 4: Start VPN (requires root)
 sudo ./aegis-tunnel start tun -server
 sudo ./aegis-tunnel start tun -client
 ```
 
-**客户端** `aegis-client.conf` 关键配置：
+**Client** `aegis-client.conf` key settings:
 
 ```ini
 [Peer]
-Endpoint = 服务器IP:9000    # ← 修改为服务器真实地址
-AllowedIPs = 0.0.0.0/0      # 全隧道；或 10.0.0.0/24 分流
+Endpoint = server-ip:9000    # ← Change to server real address
+AllowedIPs = 0.0.0.0/0       # Full tunnel; or 10.0.0.0/24 for split tunnel
 ```
 
-### 代理模式（TCP 加密隧道，兼容旧版）
+### Proxy Mode (Encrypted TCP Tunnel, Legacy Compatible)
 
 ```bash
-# 服务端：解密后转发到 127.0.0.1:8080
+# Server: decrypt and forward to 127.0.0.1:8080
 ./aegis-tunnel -l 9000 -r 127.0.0.1:8080 -m server
 
-# 客户端：监听本地 9000，加密后发到服务端
-./aegis-tunnel -l 9000 -r 服务器IP:9000 -m client
+# Client: listen locally on 9000, encrypt and send to server
+./aegis-tunnel -l 9000 -r server-ip:9000 -m client
 ```
 
-### 管理命令
+### Management Commands
 
 ```bash
-./aegis-tunnel status          # 查看密钥和 Peer 状态
-./aegis-tunnel peer list       # 列出已知 Peer
-./aegis-tunnel peer delete <名称>  # 删除 Peer
-sudo ./aegis-tunnel tun down   # 手动清理 TUN 设备和路由
+./aegis-tunnel status             # View keys and peer status
+./aegis-tunnel peer list          # List known peers
+./aegis-tunnel peer delete <name> # Remove a peer
+sudo ./aegis-tunnel tun down      # Manually remove TUN device and routes
 ```
 
-### 命令行参数
+### Command-Line Options
 
-| 参数 | 说明 | 示例 |
-|------|------|------|
-| `-l <port>` | 本地监听端口 | `-l 9000` |
-| `-r <host:port>` | 远程目标地址 | `-r 1.2.3.4:9000` |
-| `-m <mode>` | 运行模式 | `-m server` 或 `-m client` |
+| Option | Description | Example |
+|--------|-------------|---------|
+| `-l <port>` | Local listen port | `-l 9000` |
+| `-r <host:port>` | Remote target address | `-r 1.2.3.4:9000` |
+| `-m <mode>` | Run mode | `-m server` or `-m client` |
 | `-T <ip/prefix>` | TUN VPN CIDR | `-T 10.0.0.1/24` |
-| `-R <network>` | TUN 路由 (AllowedIPs) | `-R 10.0.0.0/24` |
-| `-W <iface>` | WAN 网卡（NAT 用） | `-W eth0` |
-| `-P <file>` | 私钥文件路径 | `-P /path/to/private.key` |
-| `-Q <hex\|file>` | 对端公钥 | `-Q a1b2...` 或 `-Q peer.pub` |
-| `-c <file>` | 配置文件路径 | `-c aegis.conf` |
-| `-K <sec>` | Keepalive 间隔 | `-K 30` |
-| `-t <sec>` | 握手超时 | `-t 10` |
-| `-x <max>` | 最大连接数 | `-x 64` |
-| `-v` | 详细日志 | — |
-| `-h` | 显示帮助 | — |
+| `-R <network>` | TUN route (AllowedIPs) | `-R 10.0.0.0/24` |
+| `-W <iface>` | WAN interface for NAT | `-W eth0` |
+| `-P <file>` | Private key file path | `-P /path/to/private.key` |
+| `-Q <hex\|file>` | Peer public key | `-Q a1b2...` or `-Q peer.pub` |
+| `-c <file>` | Config file path | `-c aegis.conf` |
+| `-K <sec>` | Keepalive interval | `-K 30` |
+| `-t <sec>` | Handshake timeout | `-t 10` |
+| `-x <max>` | Max connections | `-x 64` |
+| `-v` | Verbose logging | — |
+| `-h` | Show help | — |
 
-## 协议
+## Protocol
 
-### 帧格式
+### Frame Format
 
 ```
  0      1      2-3         4...(N+3)      (N+4)...(N+19)
@@ -152,76 +152,76 @@ sudo ./aegis-tunnel tun down   # 手动清理 TUN 设备和路由
 +------+------+--------+--------//----+--------//--------+
 ```
 
-- 帧头 (4 字节) 作为 AEGIS-128 关联数据（AD）
-- 16 字节认证标签覆盖帧头 + 密文
-- Nonce = 64 位小端序计数器 || 8 字节零
+- Frame header (4 bytes) passed as AEGIS-128 associated data (AD)
+- 16-byte authentication tag covers header + ciphertext
+- Nonce = little-endian 64-bit counter || 8 zero bytes
 
-### 非对称握手流程（X25519 3-DH）
+### Asymmetric Handshake (X25519 3-DH)
 
 ```
-客户端                                         服务器
+Client                                        Server
   |                                               |
   |── handshake_init(eph_pub_c, ts_c) ──────────▶|
-  |     AEGIS 加密，密钥 = SHA256(ee||es||"init") |
-  |                                               | 验证时间戳，尝试所有已知 Peer 公钥
+  |     AEGIS-encrypted, key = SHA256(ee||es||"init") |
+  |                                               | Verify timestamp, try all known peer keys
   |◀─ handshake_resp(eph_pub_s, ts_s) ──────────│
-  |     AEGIS 加密，密钥 = SHA256(shared||"resp") |
+  |     AEGIS-encrypted, key = SHA256(shared||"resp") |
   |                                               |
-  |◀══ KEY_CONFIRM ─══════════════════════════════│ (服务端先发)
-  |══▶ KEY_CONFIRM ─══════════════════════════════▶| (客户端验证)
+  |◀══ KEY_CONFIRM ─══════════════════════════════│ (server sends first)
+  |══▶ KEY_CONFIRM ─══════════════════════════════▶| (client verifies)
   |                                               |
-  |══▶ DATA (加密流量) ─══════════════════════════▶|
-  |◀══ DATA (加密流量) ─═══════════════════════════│
+  |══▶ DATA (encrypted traffic) ─════════════════▶|
+  |◀══ DATA (encrypted traffic) ─═════════════════│
 ```
 
-共享密钥：`SHA256(ee || es || se || "shared")`，其中：
-- `ee` = 临时私钥 × 对端临时公钥
-- `es` = 自身私钥 × 对端临时公钥
-- `se` = 临时私钥 × 对端静态公钥
+Shared secret: `SHA256(ee || es || se || "shared")`, where:
+- `ee` = ephemeral private key × peer ephemeral public key
+- `es` = own static private key × peer ephemeral public key
+- `se` = ephemeral private key × peer static public key
 
-## 测试
+## Testing
 
 ```bash
-make test           # 一键运行所有测试
+make test           # Run all tests at once
 
-# 或逐个运行
-./test-aegis        # AEGIS-128 算法：13 项测试
-./test-tunnel       # 帧协议 + 非对称握手：8 项测试
-./e2e-test          # 端到端握手 + 加解密：2 项测试
-./bench-aegis       # 性能基准测试
+# Or run individually
+./test-aegis        # AEGIS-128 algorithm: 13 tests
+./test-tunnel       # Frame protocol + asymmetric handshake: 8 tests
+./e2e-test          # End-to-end handshake + encrypt/decrypt: 2 tests
+./bench-aegis       # Performance benchmarks
 ```
 
-## 性能
+## Performance
 
-| 平台 | Pure C | x86 AES-NI | ARM Crypto | ARM NEON |
-|------|--------|-----------|------------|----------|
+| Platform | Pure C | x86 AES-NI | ARM Crypto | ARM NEON |
+|----------|--------|-----------|------------|----------|
 | x86_64 | ~400 MB/s | **~3,700 MB/s** | — | — |
-| 树莓派 3 (A53) | ~180 MB/s | — | — | ~350 MB/s |
-| 树莓派 4 (A72) | ~200 MB/s | — | ~800 MB/s | ~400 MB/s |
-| 树莓派 5 (A76) | ~250 MB/s | — | ~1,200 MB/s | ~500 MB/s |
+| Raspberry Pi 3 (A53) | ~180 MB/s | — | — | ~350 MB/s |
+| Raspberry Pi 4 (A72) | ~200 MB/s | — | ~800 MB/s | ~400 MB/s |
+| Raspberry Pi 5 (A76) | ~250 MB/s | — | ~1,200 MB/s | ~500 MB/s |
 | Apple M2 | ~300 MB/s | — | ~2,500 MB/s | ~600 MB/s |
 
-## 安全
+## Security
 
-- **加密**：AEGIS-128，128 位安全性
-- **密钥交换**：X25519 3-DH，每个会话独立临时密钥（前向安全性）
-- **认证**：128 位标签，2^-128 伪造概率
-- **防重放**：握手时间戳 ±60s 窗口 + 每方向 nonce 计数器单调递增
-- **时序安全**：标签比较使用常量时间算法
-- **内存安全**：敏感数据（密钥、nonce、共享密钥）使用后立即 `secure_memzero()`
+- **Encryption**: AEGIS-128, 128-bit security level
+- **Key exchange**: X25519 3-DH, fresh ephemeral keys per session (forward secrecy)
+- **Authentication**: 128-bit tag, 2^-128 forgery probability
+- **Replay protection**: Handshake timestamp ±60s window + per-direction monotonic nonce counters
+- **Timing safety**: Constant-time tag comparison
+- **Memory safety**: Sensitive data (keys, nonces, shared secrets) zeroed immediately via `secure_memzero()`
 
-## 详细文档
+## Documentation
 
-- [协议规范](docs/protocol.md)
-- [测试与使用指南](docs/testing.md)
-- [已知问题与改进计划](docs/known-issues.md)
+- [Protocol Specification](docs/protocol.md)
+- [Testing and Usage Guide](docs/testing.md)
+- [Known Issues and Improvement Plan](docs/known-issues.md)
 
-## 许可证
+## License
 
-MIT License — 详见 [LICENSE](LICENSE)
+MIT License — see [LICENSE](LICENSE)
 
-## 参考
+## References
 
-- [AEGIS 规范 (CAESAR 竞赛提交)](https://competitions.cr.yp.to/round3/aegisv11.pdf)
-- [IETF CFRG AEGIS 草案](https://github.com/cfrg/draft-irtf-cfrg-aegis-aead)
-- [WireGuard 协议设计](https://www.wireguard.com/papers/wireguard.pdf)
+- [AEGIS Specification (CAESAR submission)](https://competitions.cr.yp.to/round3/aegisv11.pdf)
+- [IETF CFRG AEGIS Draft](https://github.com/cfrg/draft-irtf-cfrg-aegis-aead)
+- [WireGuard Protocol Design](https://www.wireguard.com/papers/wireguard.pdf)

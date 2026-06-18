@@ -1,36 +1,36 @@
-# AEGIS-Tunnel 协议规范 v0.1.0
+# AEGIS-Tunnel Protocol Specification v0.2.0
 
-## 1. 概述
+## 1. Overview
 
-AEGIS-Tunnel 协议在 TCP 之上提供加密隧道功能。协议使用 AEGIS-128 认证加密算法保护数据传输，并通过 X25519 椭圆曲线 Diffie-Hellman（3-DH）非对称握手进行双向认证和会话密钥协商。
+The AEGIS-Tunnel protocol provides encrypted tunneling over TCP. It uses AEGIS-128 authenticated encryption to protect data in transit and performs mutual authentication and session key negotiation via an X25519 elliptic-curve Diffie-Hellman (3-DH) asymmetric handshake.
 
-## 2. 加密算法
+## 2. Cryptographic Algorithms
 
 ### 2.1 AEGIS-128
 
-| 参数 | 值 |
-|------|-----|
-| 密钥长度 | 16 字节（128 位） |
-| Nonce 长度 | 16 字节（128 位） |
-| 认证标签长度 | 16 字节（128 位） |
-| 明文块大小 | 16 字节 |
-| 关联数据 (AD) | 帧头 4 字节 |
+| Parameter | Value |
+|-----------|-------|
+| Key length | 16 bytes (128 bits) |
+| Nonce length | 16 bytes (128 bits) |
+| Authentication tag length | 16 bytes (128 bits) |
+| Plaintext block size | 16 bytes |
+| Associated data (AD) | Frame header (4 bytes) |
 
-AEGIS-128 是 CAESAR 竞赛的冠军算法，正在被 IETF CFRG 标准化。
+AEGIS-128 is a CAESAR competition winner being standardized by the IETF CFRG.
 
-### 2.2 Nonce 构造
+### 2.2 Nonce Construction
 
 ```
-nonce[16] = little_endian_64(counter) || 0x00 * 8
+nonce[16] = little_endian_64(counter) || 0x00 × 8
 ```
 
-每个方向维护独立的 64 位单调计数器：
-- 握手帧使用 nonce 计数器值 0
-- 数据帧从 nonce 计数器值 1 开始递增
+Each direction maintains an independent 64-bit monotonic counter:
+- Handshake frames use nonce counter value 0
+- Data frames start at nonce counter value 1 and increment
 
-## 3. 帧协议
+## 3. Frame Protocol
 
-### 3.1 线格式
+### 3.1 Wire Format
 
 ```
  0                   1                   2                   3
@@ -48,39 +48,39 @@ nonce[16] = little_endian_64(counter) || 0x00 * 8
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 ```
 
-### 3.2 字段说明
+### 3.2 Field Descriptions
 
-- **Type** (1 字节): 帧类型
+- **Type** (1 byte): Frame type
   - `0x01` — HANDSHAKE
   - `0x02` — DATA
   - `0x03` — KEEPALIVE
   - `0x04` — CLOSE
 
-- **Flags** (1 字节): 标志位
-  - `0x00` — 无标志
-  - `0x01` — 发起方方向标记
+- **Flags** (1 byte): Flag bits
+  - `0x00` — No flags
+  - `0x01` — Initiator direction marker
 
-- **Length** (2 字节, 大端序): 负载长度 (0..65535)
+- **Length** (2 bytes, big-endian): Payload length (0..65535)
 
-- **Payload** (变长): AEGIS-128 加密的负载
+- **Payload** (variable): AEGIS-128 encrypted payload
 
-- **Tag** (16 字节): AEGIS-128 认证标签
+- **Tag** (16 bytes): AEGIS-128 authentication tag
 
-### 3.3 AEGIS 参数
+### 3.3 AEGIS Parameters
 
 ```
 encrypt(payload, ad=frame_header[0..3], nonce=nonce_from_counter, key=session_key)
 ```
 
-帧头（4 字节）作为关联数据传递给 AEGIS-128。
+The 4-byte frame header is passed as associated data to AEGIS-128.
 
-## 4. 握手协议（X25519 3-DH）
+## 4. Handshake Protocol (X25519 3-DH)
 
-### 4.1 加密后端
+### 4.1 Crypto Backend
 
-握手帧使用 AEGIS-128 加密，自动选择最优后端（x86 AES-NI > ARM Crypto > ARM NEON > Pure C）。
+Handshake frames are encrypted with AEGIS-128, which automatically selects the optimal backend (x86 AES-NI > ARM Crypto > ARM NEON > Pure C).
 
-### 4.2 握手帧负载格式
+### 4.2 Handshake Frame Payload Format
 
 ```
  0                   1                   2                   3
@@ -96,92 +96,92 @@ encrypt(payload, ad=frame_header[0..3], nonce=nonce_from_counter, key=session_ke
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 ```
 
-- handshake_init: 32 字节临时公钥 + 8 字节时间戳（共 40 字节明文）
-- handshake_resp: 同格式
-- 加密后帧 = 4 字节头 + 40 字节密文 + 16 字节 tag = 60 字节线数据
+- handshake_init: 32-byte ephemeral public key + 8-byte timestamp (40 bytes plaintext)
+- handshake_resp: Same format
+- Encrypted frame = 4-byte header + 40-byte ciphertext + 16-byte tag = 60 bytes on wire
 
-### 4.3 握手流程
+### 4.3 Handshake Flow
 
 ```
-客户端                                         服务器
+Client                                        Server
   |                                               |
-  | 生成临时密钥对 (eph_sk_c, eph_pk_c)            |
+  | Generate ephemeral keypair (eph_sk_c, eph_pk_c) |
   |                                               |
   |── HANDSHAKE(eph_pk_c || ts_c) ──────────────▶|
-  |   (用 init_key 加密, nonce=0)                 | 尝试所有已知 Peer 公钥
-  |                                               | 验证时间戳 ±60s
-  |                                               | 生成临时密钥对 (eph_sk_s, eph_pk_s)
+  |   (encrypted with init_key, nonce=0)          | Try all known peer public keys
+  |                                               | Verify timestamp ±60s
+  |                                               | Generate ephemeral keypair (eph_sk_s, eph_pk_s)
   |                                               |
   |◀── HANDSHAKE(eph_pk_s || ts_s) ──────────────│
-  |   (用 resp_key 加密, nonce=0)                 |
+  |   (encrypted with resp_key, nonce=0)          |
   |                                               |
-  |  双方计算共享密钥:                             |
+  |  Both sides compute shared secret:            |
   |  ee = X25519(eph_sk, peer_eph_pk)             |
   |  es = X25519(static_sk, peer_eph_pk)          |
   |  se = X25519(eph_sk, peer_static_pk)          |
   |  shared = SHA256(ee || es || se || "shared")  |
   |                                               |
-  |◀══ KEY_CONFIRM ─══════════════════════════════│ (空帧，AEGIS 加密)
-  |══▶ KEY_CONFIRM ─══════════════════════════════▶| (空帧，AEGIS 加密)
+  |◀══ KEY_CONFIRM ─══════════════════════════════│ (empty frame, AEGIS-encrypted)
+  |══▶ KEY_CONFIRM ─══════════════════════════════▶| (empty frame, AEGIS-encrypted)
   |                                               |
-  |══▶ DATA (加密流量, nonce=1,2,3...) ──────────▶|
-  |◀══ DATA (加密流量, nonce=1,2,3...) ───────────│
+  |══▶ DATA (encrypted traffic, nonce=1,2,3...) ─▶|
+  |◀══ DATA (encrypted traffic, nonce=1,2,3...) ──│
 ```
 
-### 4.4 密钥派生
+### 4.4 Key Derivation
 
-握手初始密钥（客户端发起）：
+Handshake init key (client initiates):
 ```
 ee_init = X25519(client_static_sk, server_static_pk)
 es_init = X25519(client_eph_sk, server_static_pk)
 init_key = SHA256(ee_init || es_init || "init")[0..15]
 ```
 
-握手响应密钥（服务端回复）：
+Handshake response key (server replies):
 ```
 resp_key = SHA256(shared_secret || "resp")[0..15]
 ```
 
-会话密钥（保护数据）：
+Session keys (protect data):
 ```
 shared_secret = SHA256(ee || es || se || "shared")
 session_enc_key = shared_secret[0..15]
 session_dec_key = shared_secret[16..31]
 ```
 
-客户端使用 enc_key 加密发送方向，dec_key 解密接收方向；
-服务器端则相反（enc_key 和 dec_key 互换）。
+The client uses enc_key for the send direction and dec_key for the receive direction;
+roles are reversed on the server (enc_key and dec_key swapped).
 
-### 4.5 KEY_CONFIRM
+### 4.5 Key Confirmation
 
-握手完成后，服务端和客户端各发送一个空的 KEY_CONFIRM 帧（payload=0），用协商后的会话密钥加密。双方验证解密成功后才进入数据传输阶段，防止中间人篡改握手。
+After the handshake completes, both server and client each send an empty KEY_CONFIRM frame (payload=0), encrypted with the negotiated session keys. Both sides verify successful decryption before entering the data transfer phase, preventing man-in-the-middle tampering with the handshake.
 
-## 5. 安全考虑
+## 5. Security Considerations
 
-### 5.1 认证
+### 5.1 Authentication
 
-- 标签验证使用常量时间比较（逐字节 XOR 累积），防止时序侧信道
-- 认证失败时不返回任何错误信息（防止 Oracle 攻击）
+- Tag verification uses constant-time comparison (byte-wise XOR accumulation) to prevent timing side-channels
+- No error details are returned on authentication failure (prevents oracle attacks)
 
-### 5.2 防重放
+### 5.2 Replay Protection
 
-- 握手阶段：时间戳在 ±60 秒窗口内
-- 数据传输阶段：每方向独立的 monotonic nonce 计数器
+- Handshake phase: Timestamp within ±60-second window
+- Data transfer phase: Independent monotonic nonce counters per direction
 
-### 5.3 Nonce 重用
+### 5.3 Nonce Reuse Prevention
 
-每个 (key, nonce) 对严格保证单一使用。Nonce 计数器溢出（> 2^64 帧）
-被视为致命错误，连接必须终止。
+Each (key, nonce) pair is strictly single-use. Nonce counter overflow (> 2^64 frames)
+is handled by automatic session re-keying before the limit is reached.
 
-### 5.4 内存安全
+### 5.4 Memory Safety
 
-- 密钥、nonce、明文缓冲区使用后通过 `secure_memzero()` 清零
-- 使用 volatile 指针防止编译器优化移除清零操作
+- Keys, nonces, and plaintext buffers are zeroed via `secure_memzero()` after use
+- Volatile pointers prevent compiler optimization from eliding zeroing operations
 
-### 5.5 限制
+### 5.5 Limitations
 
-- 提供前向安全性（每次会话独立生成临时密钥对）
-- 不提供身份保护（握手帧使用 ECDH 派生密钥加密，帧头明文）
-- 最大帧负载 65535 字节
-- 不支持分片或流控制
-- Re-key 默认禁用（需显式配置 PSK 和 rekey_sec）
+- Forward secrecy is provided (fresh ephemeral keypair generated per session)
+- No identity protection (handshake frames are encrypted with ECDH-derived keys; frame headers are plaintext)
+- Maximum frame payload: 65,535 bytes
+- No fragmentation or flow control
+- Re-key is auto-triggered on nonce pressure (session PSK is derived internally)

@@ -1,135 +1,135 @@
-# AEGIS-Tunnel 已知问题与改进建议
+# AEGIS-Tunnel Known Issues and Improvement Plan
 
-## 一、代码结构问题
+## 1. Code Structure Issues
 
-### 1.1 main.c 过于臃肿 ✅ 已修复
+### 1.1 main.c Bloat ✅ Resolved
 
-已拆分为 `main.c`（519 行，参数解析 + 模式分发）、`config_mgmt.c`（448 行，配置管理子命令）、`mode_common.c`（17 行，共享握手逻辑）。
+Split into `main.c` (495 lines: argument parsing + mode dispatch), `config_mgmt.c` (448 lines: config management subcommands), and `mode_common.c` (17 lines: shared handshake logic).
 
-### 1.2 handshake.c 重复的安全清理代码 ✅ 已修复
+### 1.2 Duplicate Secure Cleanup in handshake.c ✅ Resolved
 
-已用 `goto out` 统一清理，secure_memzero 调用从 62 处减少到 16 处。
+Unified via `goto out` pattern; secure_memzero calls reduced from 62 to 16.
 
-### 1.3 mode_psk.c / mode_tun.c 重复的 try_handshake_server ✅ 已修复
+### 1.3 Duplicate try_handshake_server in mode_psk.c / mode_tun.c ✅ Resolved
 
-提取到 `src/mode_common.c`，两处共享同一实现。
+Extracted to `src/mode_common.c`; both modules share the same implementation.
 
-### 1.4 线程池已编译但未使用 ✅ 已添加编译选项
+### 1.4 Thread Pool Compiled but Unused ✅ Build Option Added
 
-Makefile 已添加 `-DWITH_THREADPOOL` 编译选项（默认注释），需要时取消注释即可启用。
-
----
-
-## 二、命名不一致 ✅ 已修复
-
-| 问题 | 之前 | 之后 |
-|------|------|------|
-| 超时函数 | `set_to()` / `set_timeout()` / `set_socket_timeout()` | 统一 `recv_all()` 使用 `poll()` 超时，移除 SO_RCVTIMEO |
-| 哈希函数 | `H()` / `sha256_or_die()` | 统一 `sha256_h()` |
-| 前缀 | `asym_` / `asymmetric_` | 统一 `asym_`（内部静态函数） |
-| 常量 | `tofu_` / `TOFU_` | 常量大写，函数小写 |
+Makefile includes `-DWITH_THREADPOOL` build option (commented out by default). Uncomment to enable.
 
 ---
 
-## 三、安全隐患
+## 2. Naming Inconsistencies ✅ Resolved
 
-### 3.1 TOFU 密钥交换用硬编码 nonce=1 ✅ 已修复
-
-`tofu_exchange_keys()` 现在接受 `uint64_t *nonce_ctr` 参数，每次使用后递增。
-
-### 3.2 TUN 模式用 system() 调用 iptables 🔶 部分修复
-
-`tun_set_nat()` 和 `tun_allow_forward()` 已改用 `fork() + execvp()`。`tun_exec_script()` 仍使用 `system()`（因为需要执行用户配置的任意脚本命令，包括管道和分号链）。后续可考虑更安全的 shell 参数化方式。
-
-### 3.3 PSK 在进程列表中可见
-
-当使用 `-k <hex>` 传递 PSK 时，PSK 出现在 `/proc/<pid>/cmdline` 中，可被同一主机的其他用户读取。
-
-**建议**：始终推荐使用 `-f <file>` 方式。未来版本可考虑通过管道或环境变量传入。
-
-### 3.4 SO_RCVTIMEO 跨平台兼容性问题 ✅ 已修复
-
-`SO_RCVTIMEO` 在某些 Linux 内核版本上对 fwmark'd socket 返回虚假的 EAGAIN。已用 `poll()` 替代：`recv_all()` 现在只在 `poll()` 确认 POLLIN 后才调用 `recv()`。
+| Issue | Before | After |
+|-------|--------|-------|
+| Timeout functions | `set_to()` / `set_timeout()` / `set_socket_timeout()` | Unified: `recv_all()` uses `poll()` timeout; SO_RCVTIMEO removed |
+| Hash functions | `H()` / `sha256_or_die()` | Unified: `sha256_h()` |
+| Prefixes | `asym_` / `asymmetric_` | Unified: `asym_` (internal static functions) |
+| Constants | `tofu_` / `TOFU_` | Constants upper-case, functions lower-case |
 
 ---
 
-## 四、功能未完成
+## 3. Security Concerns
 
-### 4.1 非对称握手不能独立使用 ✅ 已修复
+### 3.1 Hardcoded nonce=1 in TOFU Key Exchange ✅ Resolved
 
-现在默认使用 X25519 3-DH 非对称握手。PSK 仅用于 re-keying bootstrap，且 re-key 默认禁用。纯非对称模式已可用。
+`tofu_exchange_keys()` now accepts a `uint64_t *nonce_ctr` parameter, incremented after each use.
 
-### 4.2 SOCKS5 无 IPv6 支持
+### 3.2 system() Usage for iptables in TUN Mode ✅ Partially Resolved
 
-`socks5.c` 只处理 ATYP=0x01 (IPv4) 和 ATYP=0x03 (DOMAIN)，不支持 ATYP=0x04 (IPv6)。
+`tun_set_nat()` and `tun_allow_forward()` now use `fork() + execvp()`. `tun_exec_script()` now uses `fork() + execl("/bin/sh", ...)` explicitly, consistent with the iptables approach.
 
-### 4.3 无日志文件输出
+### 3.3 PSK Visible in Process List
 
-所有日志输出到 stderr，不支持写入文件、日志轮转。
+When using `-k <hex>` to pass a PSK, it appears in `/proc/<pid>/cmdline` and is readable by other users on the same host.
 
-### 4.4 客户端连接重试已实现 ✅ 已修复
+**Recommendation**: Always prefer the `-f <file>` method. Future versions could accept input via pipe or environment variable.
 
-`mode_psk.c` 和 `mode_tun.c` 的客户端模式均已实现指数退避重连（1s → 2s → 4s → ... → 30s max）。
+### 3.4 SO_RCVTIMEO Cross-Platform Compatibility ✅ Resolved
 
----
-
-## 五、测试覆盖不足
-
-### 5.1 无模糊测试
-
-帧解析器 `frame_reader.c` 是 TCP 流输入的关键路径，没有模糊测试覆盖。恶意构造的数据包可能导致缓冲区溢出。
-
-**建议**：使用 AFL/libFuzzer 对 `frame_reader_try_next()` 进行模糊测试。
-
-### 5.2 无压力测试
-
-没有并发连接、大数据量、长时运行的稳定性测试。
-
-### 5.3 ARM NEON 从未实际测试 ✅ 已在树莓派上验证
-
-`src/crypto/neon/` 下的两个加速路径已在真实 ARM 硬件上运行验证，x86_64 ↔ aarch64 跨平台握手已通过测试。
-
-### 5.4 iniconf / keyfile 模块无单元测试 🆕
-
-配置解析器 `iniconfig.c` 和密钥文件 `keyfile.c` 缺少独立的单元测试。
+`SO_RCVTIMEO` returned spurious EAGAIN on fwmark'd sockets on some Linux kernel versions. Replaced with `poll()`: `recv_all()` now only calls `recv()` after `poll()` confirms POLLIN.
 
 ---
 
-## 六、依赖问题
+## 4. Incomplete Features
+
+### 4.1 Asymmetric Handshake Could Not Be Used Independently ✅ Resolved
+
+Now defaults to X25519 3-DH asymmetric handshake. PSK is only used as additional re-keying material and is auto-derived from session keys when not explicitly provided.
+
+### 4.2 SOCKS5 Lacks IPv6 Support
+
+`socks5.c` handles only ATYP=0x01 (IPv4) and ATYP=0x03 (DOMAIN); ATYP=0x04 (IPv6) is unsupported.
+
+### 4.3 No Log File Output
+
+All log output goes to stderr; file output and log rotation are not supported.
+
+### 4.4 Client Connection Retry Implemented ✅ Resolved
+
+Both `mode_psk.c` and `mode_tun.c` client modes implement exponential backoff reconnection (1s → 2s → 4s → ... → 30s max).
+
+---
+
+## 5. Test Coverage Gaps
+
+### 5.1 No Fuzz Testing
+
+The frame parser `frame_reader.c` is the TCP stream entry point and lacks fuzz testing. Maliciously crafted packets could cause buffer overflows.
+
+**Recommendation**: Use AFL/libFuzzer against `frame_reader_try_next()`.
+
+### 5.2 No Stress Testing
+
+No concurrent connection, large data volume, or long-running stability tests.
+
+### 5.3 ARM NEON Never Tested on Hardware ✅ Verified on Raspberry Pi
+
+Both accelerated paths under `src/crypto/neon/` (Plain NEON and ARM Crypto) have been validated on real ARM hardware. x86_64 ↔ aarch64 cross-platform handshake has passed testing.
+
+### 5.4 iniconf / keyfile Modules Lack Unit Tests 🆕
+
+The INI config parser (`iniconfig.c`) and key file I/O (`keyfile.c`) modules lack independent unit tests.
+
+---
+
+## 6. Dependency Issues
 
 ### 6.1 OpenSSL EVP API
 
-项目强依赖 OpenSSL（SHA256、X25519），无法在无 OpenSSL 的嵌入式系统上编译。
+The project has a hard dependency on OpenSSL (SHA256, X25519). It cannot compile on embedded systems without OpenSSL.
 
-**建议**：未来可考虑集成轻量级实现（如 Monocypher、TweetNaCl）。
+**Recommendation**: Future versions could integrate a lightweight alternative (e.g., Monocypher, TweetNaCl).
 
-### 6.2 Linux 专有 API
+### 6.2 Linux-Specific APIs
 
-TUN 模式 (`/dev/net/tun`)、`SO_MARK` (fwmark)、`ip route`/`iptables` 命令等是 Linux 特有的，无法在 macOS/BSD 上编译。
-
----
-
-## 七、Makefile 与 CMakeLists.txt 不一致 🆕
-
-| 差异点 | Makefile | CMakeLists.txt | 状态 |
-|--------|----------|----------------|------|
-| AES-NI 编译 | 直接编译进主程序 | 作为静态库链接 | ℹ️ |
-| ARM NEON (AEGIS_HAVE_NEON) | ✅ 已添加 | ✅ 已有 | ✅ |
-| HAVE_EXPLICIT_BZERO | ❌ 缺失 | ✅ 有 | ℹ️ |
-| -lpthread | 总是链接 | 仅 test-tunnel 链接 | ℹ️ |
-| ARM -march=armv8-a+crypto | 全局 CFLAGS | 仅 crypto 目标 | ℹ️ |
+TUN mode (`/dev/net/tun`), `SO_MARK` (fwmark), `ip route`/`iptables` commands, etc. are Linux-specific and cannot compile on macOS/BSD.
 
 ---
 
-## 八、改进优先级
+## 7. Makefile vs. CMakeLists.txt Inconsistencies 🆕
 
-| 优先级 | 问题 | 影响 |
-|--------|------|------|
-| 🔴 高 | tun_exec_script() 使用 system() | shell 注入风险 |
-| 🟡 中 | SOCKS5 无 IPv6 | 功能不完整 |
-| 🟡 中 | 无日志文件输出 | 运维不便 |
-| 🟡 中 | iniconf/keyfile 无测试 | 可能回归 |
-| 🟡 中 | Makefile/CMake 行为不一致 | ARM 编译差异 |
-| 🟢 低 | 无模糊测试 | 安全边界 |
-| 🟢 低 | 无压力测试 | 稳定性未知 |
-| 🟢 低 | OpenSSL 依赖 | 嵌入式部署受限 |
+| Difference | Makefile | CMakeLists.txt | Status |
+|-----------|----------|----------------|--------|
+| AES-NI compilation | Compiled directly into main | Linked as static library | ℹ️ |
+| ARM NEON (AEGIS_HAVE_NEON) | ✅ Added | ✅ Present | ✅ |
+| HAVE_EXPLICIT_BZERO | ❌ Missing | ✅ Present | ℹ️ |
+| -lpthread | Always linked | Only for test-tunnel | ℹ️ |
+| ARM -march=armv8-a+crypto | Global CFLAGS | Crypto target only | ℹ️ |
+
+---
+
+## 8. Improvement Priorities
+
+| Priority | Issue | Impact |
+|----------|-------|--------|
+| 🔴 High | — None at this time — | — |
+| 🟡 Medium | SOCKS5 lacks IPv6 | Incomplete feature |
+| 🟡 Medium | No log file output | Operations difficulty |
+| 🟡 Medium | iniconf/keyfile lack tests | Potential regressions |
+| 🟡 Medium | Makefile/CMake behavior differences | ARM build variations |
+| 🟢 Low | No fuzz testing | Security boundary |
+| 🟢 Low | No stress testing | Stability unknown |
+| 🟢 Low | OpenSSL dependency | Embedded deployment constraints |

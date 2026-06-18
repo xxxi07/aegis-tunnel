@@ -8,24 +8,24 @@ echo " $(date '+%Y-%m-%d %H:%M:%S')"
 echo "═══════════════════════════════════════════"
 echo ""
 
-echo "── 1. 编译 ──"
+echo "── 1. Build ──"
 make clean > /dev/null 2>&1 || true
 make 2>&1 | grep "→"
 echo ""
 
-echo "── 2. AEGIS-128 算法 (12项) ──"
+echo "── 2. AEGIS-128 Algorithm (13 tests) ──"
 timeout 10 ./test-aegis 2>&1
 echo ""
 
-echo "── 3. 帧协议 + 握手 (7项) ──"
+echo "── 3. Frame Protocol + Handshake (8 tests) ──"
 timeout 10 ./test-tunnel 2>&1
 echo ""
 
-echo "── 4. 端到端握手+加解密 (2项) ──"
+echo "── 4. End-to-End Handshake + Encrypt/Decrypt (2 tests) ──"
 timeout 10 ./e2e-test 2>&1
 echo ""
 
-echo "── 5. 主程序功能验证 ──"
+echo "── 5. Main Program Validation ──"
 ./aegis-tunnel -h > /dev/null 2>&1 && echo "  help ....................... PASS" || { echo "  help ....................... FAIL"; ((FAIL++)); }
 ./aegis-tunnel 2>&1 | grep -q "Error" && echo "  parameter validation ....... PASS" || { echo "  parameter validation ....... FAIL"; ((FAIL++)); }
 ./aegis-tunnel -h 2>&1 | grep -q "\-Q" && echo "  -Q flag .................... PASS" || { echo "  -Q flag .................... FAIL"; ((FAIL++)); }
@@ -36,11 +36,11 @@ rm -rf /tmp/aegis-test-keys ~/.aegis-tunnel
 rm -rf ~/.aegis-tunnel
 echo ""
 
-echo "── 6. 性能基准 ──"
+echo "── 6. Performance Benchmark ──"
 ./bench-aegis 2>&1 | head -6
 echo ""
 
 echo "═══════════════════════════════════════════"
-if [ $FAIL -eq 0 ]; then echo " 全部通过"; else echo " $FAIL 项失败"; fi
+if [ $FAIL -eq 0 ]; then echo " All tests passed"; else echo " $FAIL test(s) failed"; fi
 echo "═══════════════════════════════════════════"
 exit $FAIL
