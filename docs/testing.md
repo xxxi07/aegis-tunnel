@@ -1,18 +1,19 @@
-# AEGIS-Tunnel Complete Testing and Usage Guide
+# AEGIS-Tunnel 完整测试与使用指南
 
-## Table of Contents
+## 目录
 
-1. [Build and Unit Tests](#1-build-and-unit-tests)
-2. [Proxy Mode: Encrypted TCP Tunnel Between Two Hosts](#2-proxy-mode-encrypted-tcp-tunnel-between-two-hosts)
-3. [TUN VPN Mode: Four-Phase Workflow](#3-tun-vpn-mode-four-phase-workflow)
-4. [Legacy Command-Line Mode (Backward Compatible)](#4-legacy-command-line-mode-backward-compatible)
-5. [Multi-Client Management](#5-multi-client-management)
-6. [Packet Capture Verification](#6-packet-capture-verification)
-7. [Troubleshooting](#7-troubleshooting)
+1. [编译与单元测试](#1-编译与单元测试)
+2. [代理模式：两台机器建立加密 TCP 隧道](#2-代理模式两台机器建立加密-tcp-隧道)
+3. [TUN VPN 模式：四阶段工作流](#3-tun-vpn-模式四阶段工作流)
+4. [SOCKS5 代理模式](#4-socks5-代理模式)
+5. [传统命令行方式（兼容旧版）](#5-传统命令行方式兼容旧版)
+6. [多客户端管理](#6-多客户端管理)
+7. [抓包验证加密](#7-抓包验证加密)
+8. [故障排查](#8-故障排查)
 
 ---
 
-## 1. Build and Unit Tests
+## 1. 编译与单元测试
 
 ```bash
 git clone https://github.com/xxxi07/aegis-tunnel.git
@@ -20,599 +21,369 @@ cd aegis-tunnel
 make
 ```
 
-**Expected output**: 6 lines of `→ xxx built`
+**预期输出**: 7 行 `→ xxx built`
 
 ```bash
-# Run all automated tests (23 total)
-./test-aegis       # AEGIS-128 encryption algorithm: 13/13
-./test-tunnel      # Frame protocol + asymmetric handshake: 8/8
-./e2e-test         # End-to-end handshake: 2/2
-./bench-aegis      # Performance benchmark (optional)
+# 运行全部自动化测试（23 项）
+./test-aegis       # AEGIS-128 加密算法: 13/13
+./test-tunnel      # 帧协议 + 非对称握手: 8/8
+./e2e-test         # 端到端握手 + 加解密: 2/2
+./bench-aegis      # 性能基准（可选）
+
+# 一键测试
+make test
 ```
 
 ---
 
-## 2. Proxy Mode: Encrypted TCP Tunnel Between Two Hosts
+## 2. 代理模式：两台机器建立加密 TCP 隧道
 
-### Scenario
+### 场景
 
 ```
-Raspberry Pi (client)               Server (x86)
-10.0.0.2                              192.168.1.100
-    │                                      │
-    │  Encrypt TCP traffic from local      │
-    │  port 9000, forward to server:8080   │
-    │                                      │
-    └──────── Encrypted TCP ──────────────▶│
-                                           │
-                                      Decrypt → 127.0.0.1:8080
+树莓派 (客户端)                    服务器 (x86)
+10.0.0.2                            192.168.1.100
+    │                                    │
+    │  把本地 9000 端口的 TCP 流量        │
+    │  加密后转发到服务器的 8080 端口     │
+    │                                    │
+    └──────── 加密 TCP ────────────────▶  │
+                                         │
+                                    解密 → 127.0.0.1:8080
 ```
 
-Proxy mode operates at the TCP layer: the client listens on a local port, encrypts incoming TCP connections and relays them to the server, which decrypts and forwards to the target address.
-
-### Step 1: Server Setup
+### 服务端操作
 
 ```bash
-# 1. Start a web service (simulating your backend)
 python3 -m http.server 8080 &
-
-# 2. Generate keypair
 ./aegis-tunnel keygen
-# Output:
-#   Public key (send to peer):
-#     a1b2c3d4e5f6...（copy this line, send to Raspberry Pi）
-#   Config: aegis.conf
+# 将输出的公钥发给客户端
 
-# 3. Add Raspberry Pi's public key (after Pi generates it and sends to you)
-./aegis-tunnel peer add pi <pi-64-char-hex-public-key>
-
-# 4. Start proxy server
+./aegis-tunnel peer add pi <客户端的64位hex公钥>
 ./aegis-tunnel -l 9000 -r 127.0.0.1:8080 -m server
 ```
 
-### Step 2: Raspberry Pi (Client) Setup
+### 客户端（树莓派）操作
 
 ```bash
-# 1. Build
-git clone https://github.com/xxxi07/aegis-tunnel.git
-cd aegis-tunnel && make
-
-# 2. Generate keypair
+make
 ./aegis-tunnel keygen
-# Output:
-#   Public key (send to peer):
-#       f6e5d4c3b2a1...（copy this line, send to server）
+# 将输出的公钥发给服务端
 
-# 3. Add server's public key
-./aegis-tunnel peer add server <server-64-char-hex-public-key>
-
-# 4. Start proxy client
+./aegis-tunnel peer add server <服务端的64位hex公钥>
 ./aegis-tunnel -l 9000 -r 192.168.1.100:9000 -m client
 ```
 
-### Step 3: Test the Proxy Tunnel
+### 测试
 
 ```bash
-# On the Raspberry Pi, access local port 9000
-# Traffic is automatically encrypted and forwarded to port 8080 on the server
 curl http://127.0.0.1:9000/
-# Expected: see the directory listing from the server's python http.server
+# 预期: 看到服务器上 python http.server 的目录列表
 ```
 
-### Proxy Mode Configuration Options
+### 代理模式参数
 
-| Option | Server | Client | Description |
-|--------|--------|--------|-------------|
-| `-l <port>` | Listen port | Listen port | Local listen port |
-| `-r <host:port>` | Forward target after decrypt | Server address | Remote address |
-| `-m <mode>` | `server` | `client` | Run mode |
-| `-K <sec>` | Optional | Optional | Keepalive interval (seconds) |
-| `-t <sec>` | Optional | Optional | Handshake timeout (seconds, default 5) |
-| `-x <max>` | Optional | — | Max concurrent connections (default 32) |
+| 参数 | 服务端 | 客户端 | 说明 |
+|------|--------|--------|------|
+| `-l <port>` | 监听端口 | 监听端口 | 本地端口 |
+| `-r <host:port>` | 解密后转发目标 | 服务端地址 | 远程地址 |
+| `-m <mode>` | `server` | `client` | 运行模式 |
+| `-K <sec>` | 可选 | 可选 | Keepalive 间隔（秒） |
+| `-t <sec>` | 可选 | 可选 | 握手超时（秒，默认5） |
+| `-x <max>` | 可选 | — | 最大并发连接数（默认32） |
 
 ---
 
-## 3. TUN VPN Mode: Four-Phase Workflow
+## 3. TUN VPN 模式：四阶段工作流
 
-### Scenario
+### 场景
 
 ```
-Raspberry Pi (client)               Server (x86)
-tun0: 10.0.0.2                        tun0: 10.0.0.1
-    │                                      │
-    │  IP packets over encrypted tunnel    │  NAT forward to eth0 → Internet
-    │                                      │
-    └──────── Encrypted TCP ──────────────▶│
-                                           │
-                                      Decrypt → TUN → NAT → eth0
+树莓派 (客户端)                    服务器 (x86)
+tun0: 10.0.0.2                       tun0: 10.0.0.1
+    │                                    │
+    │  IP 包通过加密隧道传输              │  NAT 转发到 eth0 → 互联网
+    │                                    │
+    └──────── 加密 TCP ────────────────▶  │
+                                         │
+                                    解密 → TUN → NAT → eth0
 ```
 
-TUN mode operates at the IP layer: it creates a virtual network interface, and all IP packets matching the routing rules are sent through the encrypted tunnel to the peer.
+TUN 模式在 IP 层工作：创建虚拟网卡，所有命中路由规则的 IP 包经过加密隧道发送到对端。
 
-### Phase 1: keygen — Generate Keys + Base Config
+### 阶段 1：keygen — 生成密钥 + 基础配置
 
 ```bash
-# Execute on both server and Raspberry Pi
+# 服务器和客户端都执行
 ./aegis-tunnel keygen
 ```
 
-**Generated artifacts**:
-- `~/.aegis-tunnel/private.key` — Private key (binary, permissions 400)
-- `~/.aegis-tunnel/public.key` — Public key (hex text, permissions 644)
-- `aegis.conf` — Base configuration file (current directory)
+产出：
+- `~/.aegis-tunnel/private.key` — 私钥（二进制，权限 600）
+- `~/.aegis-tunnel/public.key` — 公钥（hex 文本）
+- `aegis.conf` — 基础配置文件
 
-**aegis.conf contents**:
-```ini
-[Interface]
-PrivateKey = ~/.aegis-tunnel/private.key
-PublicKey = cc65dd6af87f...    ← This host's public key
-Port = 9000
-Mode = server
-
-[Tunnel]
-Keepalive = 30
-NATInterface = eth0
-```
-
-**Sample output**:
-```
-Public key (send to peer):
-  cc65dd6af87f0b819f6ac83f1bbc117a33fe217259d23feac2ed40e5326d0707
-
-Config: aegis.conf
-
-Next: get peer's public key, then:
-  aegis-tunnel peer add <name> <peer-hex-key>
-```
-
-### Phase 2: peer add — Exchange Public Keys
+### 阶段 2：peer add — 交换公钥
 
 ```bash
-# On the server: add Raspberry Pi's public key
-./aegis-tunnel peer add pi <pi-64-char-hex-public-key>
+# 服务器上添加客户端的公钥
+./aegis-tunnel peer add pi <客户端64位hex公钥>
 
-# On the Raspberry Pi: add server's public key
-./aegis-tunnel peer add server <server-64-char-hex-public-key>
+# 客户端上添加服务器的公钥
+./aegis-tunnel peer add server <服务器64位hex公钥>
 ```
 
-**aegis.conf after update** (server side example):
-```ini
-[Interface]
-PrivateKey = ~/.aegis-tunnel/private.key
-PublicKey = cc65dd6af87f...    ← This host's public key
-
-[Tunnel]
-Keepalive = 30
-NATInterface = eth0
-
-[Peer]
-PublicKey = f6e5d4c3b2a1...    ← Raspberry Pi's public key
-Endpoint = pi                   ← Peer identifier
-```
-
-**Verify**:
+验证：
 ```bash
 ./aegis-tunnel peer list
-# Output:
-#   Known peers:
-#     pi
-
 ./aegis-tunnel status
-# Output:
-#   Key storage: /home/user/.aegis-tunnel
-#     Private key: .../private.key (exists)
-#     Public key:  .../public.key (exists)
-#   Known peers:
-#     pi
 ```
 
-### Phase 3: create tun — Generate TUN Configuration
-
-#### 3a. Server Side
+### 阶段 3：create tun — 生成 TUN 配置
 
 ```bash
+# 服务端
 ./aegis-tunnel create tun -server
-# Output:
-#   TUN server config written to aegis-server.conf
-#
-#   Review and edit aegis-server.conf if needed, then:
-#     sudo ./aegis-tunnel start tun -server
-```
+# 输出 aegis-server.conf
 
-**Generated aegis-server.conf**:
-```ini
-# AEGIS-Tunnel TUN server config (generated from aegis.conf)
-
-[Interface]
-PrivateKey = ~/.aegis-tunnel/private.key
-PublicKey = cc65dd6af87f...
-Mode = server
-Address = 10.0.0.1/24           ← TUN virtual interface IP
-ListenPort = 9000                ← Listen port (independent of Port)
-# PostUp = iptables ...          ← Optional: uncomment to enable automatic NAT rules
-# PostDown = iptables ...
-
-[Peer]
-PublicKey = f6e5d4c3b2a1...     ← Client public key
-AllowedIPs = 10.0.0.0/24        ← Subnets the peer is allowed to access (comma-separated)
-# Endpoint = pi
-
-[Tunnel]
-Keepalive = 30
-NATInterface = eth0              ← Outbound interface for NAT
-Timeout = 10
-MaxConnections = 64
-```
-
-**Edit as needed**:
-```bash
-vim aegis-server.conf
-```
-- If the TUN subnet is not `10.0.0.0/24`, modify `Address` and `AllowedIPs`
-- Uncomment `PostUp` / `PostDown` to enable automatic NAT configuration
-- If the WAN interface is not `eth0`, change `NATInterface`
-
-#### 3b. Client Side
-
-```bash
+# 客户端
 ./aegis-tunnel create tun -client
-# Output:
-#   TUN client config written to aegis-client.conf
-#
-#   Review and edit aegis-client.conf if needed, then:
-#     sudo ./aegis-tunnel start tun -client
+# 输出 aegis-client.conf
 ```
 
-**Generated aegis-client.conf**:
+**客户端按需编辑 `aegis-client.conf`**：
 ```ini
-# AEGIS-Tunnel TUN client config (generated from aegis.conf)
-
-[Interface]
-PrivateKey = ~/.aegis-tunnel/private.key
-PublicKey = f6e5d4c3b2a1...
-Mode = client
-Address = 10.0.0.2/24           ← Client TUN IP
-
 [Peer]
-PublicKey = cc65dd6af87f...     ← Server public key
-Endpoint = server:9000           ← Server real address:port
-AllowedIPs = 0.0.0.0/0          ← Full tunnel (all traffic via VPN)
-PersistentKeepalive = 30
-
-[Tunnel]
-Keepalive = 30
-NATInterface = eth0
-Timeout = 10
-MaxConnections = 64
+Endpoint = 1.2.3.4:9000        # ← 改为服务器真实地址
+AllowedIPs = 0.0.0.0/0          # 全隧道；或 10.0.0.0/24 分流
 ```
 
-**Edit as needed**:
-```bash
-vim aegis-client.conf
-```
-- **`Endpoint`**: Change to the server's real IP or hostname + port (e.g., `1.2.3.4:9000`)
-- **`AllowedIPs`**:
-  - `0.0.0.0/0` → Full tunnel: all traffic goes through the VPN
-  - `10.0.0.0/24` → Split tunnel: only VPN subnet traffic goes through the tunnel
-  - `10.0.0.0/24,192.168.1.0/24` → Multi-subnet split tunnel
-
-### Phase 4: start tun — Launch the VPN
-
-#### 4a. Start Server
+### 阶段 4：start tun — 启动 VPN
 
 ```bash
+# 服务端
 sudo ./aegis-tunnel start tun -server
-```
 
-**Automatic operations performed**:
-1. Create TUN virtual interface `tun0`
-2. Configure IP address `10.0.0.1/24`
-3. Bring interface up
-4. Add route `10.0.0.0/24 dev tun0`
-5. Enable IP forwarding
-6. Add FORWARD firewall rules
-7. Execute PostUp script (if configured)
-8. Listen for encrypted connections (default port 9000)
-
-**Expected output**:
-```
-[crypto] x86 AES-NI backend
-[tun] created device: tun0 (fd=6)
-[tun] tun0: 10.0.0.1/24
-[tun] IP forwarding: enabled
-[tun] FORWARD rules: tun0 → ACCEPT
-[INFO ] [tun-server] tun0 (10.0.0.1/255.255.255.0) :9000 route=10.0.0.0/24 peers=1
-```
-
-#### 4b. Start Client
-
-```bash
+# 客户端
 sudo ./aegis-tunnel start tun -client
 ```
 
-**Automatic operations performed**:
-1. Create TUN virtual interface `tun0`
-2. Configure IP address `10.0.0.2/24`
-3. Bring interface up
-4. Add routes for each AllowedIPs subnet to tun0
-5. Set fwmark policy routing
-6. Execute PostUp script (if configured)
-7. Connect to server and begin encrypted communication
-
-**Expected output**:
-```
-[crypto] x86 AES-NI backend
-[tun] created device: tun0 (fd=6)
-[tun] tun0: 10.0.0.2/24
-[tun] fwmark 51820: unmarked→table 51820, marked→main
-[tun] full tunnel: 0.0.0.0/0 → tun0 (table 51820)
-[INFO ] [tun-client] tun0 (10.0.0.2/255.255.255.0) → server.com:9000 route=0.0.0.0/0 (auto-reconnect)
-```
-
-### TUN Mode Verification
+### 验证
 
 ```bash
-# 1. From the client, ping the server's TUN IP
+# ping 服务端 TUN IP（纯隧道路径）
 ping 10.0.0.1
-# Expected: responses (ICMP packets travel through encrypted tunnel)
 
-# 2. Check TUN interface status
+# 查看 TUN 网卡
 ip addr show tun0
-# Expected: shows the configured IP address
 
-# 3. Check routing table
+# 查看路由表
 ip route | grep tun0
-# Expected: shows route entries via tun0
 
-# 4. On the server, capture TUN traffic
-sudo tcpdump -i tun0 -n -c 10
-# Expected: see ICMP (ping) and subsequent business IP packets
-
-# 5. Full tunnel verification (if AllowedIPs = 0.0.0.0/0)
-curl ifconfig.me
-# Expected: shows the server's public IP (traffic goes through VPN)
-
-# 6. Split tunnel verification (if AllowedIPs = 10.0.0.0/24)
-curl ifconfig.me
-# Expected: shows the client's own public IP (regular traffic bypasses VPN)
-ping 10.0.0.1
-# Expected: responses (VPN subnet traffic goes through tunnel)
+# 全隧道校验
+curl ifconfig.me  # 应显示服务器公网 IP
 ```
 
-### TUN Mode Shutdown
+### 停止
 
 ```bash
-# Method 1: Press Ctrl+C in the running terminal (graceful shutdown, executes PostDown)
-
-# Method 2: Manually clean up residual TUN device and rules
+# Ctrl+C 优雅关闭（自动执行 PostDown + 清理路由）
+# 或手动清理
 sudo ./aegis-tunnel tun down
-# Removes tun0 device, clears routes and iptables rules
 ```
 
-### TUN Configuration Quick Reference
+### TUN 配置速查
 
-| Config Key | Section | Server | Client | Description |
-|-----------|---------|--------|--------|-------------|
-| `Address` | `[Interface]` | `10.0.0.1/24` | `10.0.0.2/24` | TUN virtual interface CIDR |
-| `ListenPort` | `[Interface]` | `9000` | — | Server listen port |
-| `PostUp` | `[Interface]` | Optional | Optional | Script to run after start (`%i` = interface name) |
-| `PostDown` | `[Interface]` | Optional | Optional | Script to run before stop |
-| `Endpoint` | `[Peer]` | Optional | **Required** | Server real address `host:port` |
-| `AllowedIPs` | `[Peer]` | `10.0.0.0/24` | `0.0.0.0/0` | Subnets routed to peer (comma-separated) |
-| `PersistentKeepalive`| `[Peer]` | — | `25` | Keepalive interval (seconds) |
-| `NATInterface` | `[Tunnel]` | `eth0` | — | NAT outbound interface |
+| 配置键 | 位置 | 服务端 | 客户端 | 说明 |
+|--------|------|--------|--------|------|
+| `Address` | `[Interface]` | `10.0.0.1/24` | `10.0.0.2/24` | TUN 虚拟 IP |
+| `ListenPort` | `[Interface]` | `9000` | — | 监听端口 |
+| `PostUp` | `[Interface]` | 可选 | 可选 | 启动后脚本（`%i` = 网卡名） |
+| `PostDown` | `[Interface]` | 可选 | 可选 | 关闭前脚本 |
+| `Endpoint` | `[Peer]` | 可选 | **必需** | 服务器真实地址 |
+| `AllowedIPs` | `[Peer]` | `10.0.0.0/24` | `0.0.0.0/0` | 路由网段（逗号分隔） |
+| `PersistentKeepalive` | `[Peer]` | — | `25` | 保活间隔（秒） |
+| `NATInterface` | `[Tunnel]` | `eth0` | — | NAT 出站网卡 |
 
 ---
 
-## 4. Legacy Command-Line Mode (Backward Compatible)
+## 4. SOCKS5 代理模式
 
-For quick testing and simple scenarios without the four-phase workflow.
+### 场景
 
-### Proxy Mode (CLI)
-
-```bash
-# Server
-./aegis-tunnel -l 9000 -r 127.0.0.1:8080 -m server -Q <client-hex-public-key>
-
-# Client
-./aegis-tunnel -l 9000 -r server-ip:9000 -m client -Q <server-hex-public-key>
-```
-
-### TUN Mode (CLI)
+不需要 root 权限的应用层代理模式。适合浏览器/curl 按需走隧道。
 
 ```bash
-# Server
-sudo ./aegis-tunnel -T 10.0.0.1/24 -W eth0 -m server -Q <client-hex-public-key>
+# 服务端
+./aegis-tunnel socks5 -server -l 9000
 
-# Client (split tunnel: only route VPN subnet)
-sudo ./aegis-tunnel -T 10.0.0.2/24 -R 10.0.0.0/24 -m client -r server-ip:9000 -Q <server-hex-public-key>
+# 客户端
+./aegis-tunnel socks5 -client -l 1080 -r 服务器IP:9000
 
-# Client (full tunnel: all traffic via VPN)
-sudo ./aegis-tunnel -T 10.0.0.2/24 -R 0.0.0.0/0 -m client -r server-ip:9000 -Q <server-hex-public-key>
+# 使用
+curl --socks5 127.0.0.1:1080 https://www.baidu.com
+# 浏览器设置 SOCKS5 代理: 127.0.0.1:1080
 ```
 
-### CLI Options Quick Reference
+### 工作原理
 
-| Option | Description | Example |
-|--------|-------------|---------|
-| `-l <port>` | Local listen port | `-l 9000` |
-| `-r <host:port>` | Remote target address | `-r 1.2.3.4:9000` |
-| `-m <mode>` | Run mode | `-m server` or `-m client` |
-| `-T <ip/prefix>` | TUN VPN mode + CIDR | `-T 10.0.0.1/24` |
-| `-R <network>` | TUN route (AllowedIPs) | `-R 10.0.0.0/24` |
-| `-W <iface>` | WAN interface for NAT | `-W eth0` |
-| `-Q <hex\|file>` | Peer public key | `-Q a1b2c3...` or `-Q peer.pub` |
-| `-P <file>` | Private key file path | `-P /path/to/private.key` |
-| `-K <sec>` | Keepalive interval | `-K 30` |
-| `-t <sec>` | Handshake timeout | `-t 10` |
-| `-x <max>` | Max connections | `-x 64` |
-| `-v` | Verbose logging | — |
-| `-c <file>` | Config file path | `-c aegis.conf` |
+```
+浏览器                                AEGIS 服务端
+  │                                       │
+  │ SOCKS5 CONNECT baidu.com:443          │
+  ▼                                       │
+客户端 socks5_accept() → 获取目标地址       │
+  │                                       │
+  │ AEGIS 握手 + 发送 CONNECT_REQUEST     │
+  │ ──────── 加密 TCP ────────────────▶   │
+  │                                       │ 收到目标地址 → connect(baidu.com:443)
+  │◀─────── 加密 TCP ─────────────────   │
+  ▼                                       ▼
+隧道转发                                隧道转发
+```
 
 ---
 
-## 5. Multi-Client Management
+## 5. 传统命令行方式（兼容旧版）
 
-The TUN server supports multiple simultaneous clients (each client needs a unique TUN IP).
-
-### Configuration
+不依赖配置文件，适合快速测试：
 
 ```bash
-# Add multiple client public keys
-./aegis-tunnel peer add client-a <public-key-A>
-./aegis-tunnel peer add client-b <public-key-B>
-./aegis-tunnel peer add client-c <public-key-C>
+# 服务端
+sudo ./aegis-tunnel -T 10.0.0.1/24 -W eth0 -m server -Q <客户端公钥hex>
+
+# 客户端（分流）
+sudo ./aegis-tunnel -T 10.0.0.2/24 -R 10.0.0.0/24 -m client -r 服务器IP:9000 -Q <服务端公钥hex>
+
+# 客户端（全隧道）
+sudo ./aegis-tunnel -T 10.0.0.2/24 -R 0.0.0.0/0 -m client -r 服务器IP:9000 -Q <服务端公钥hex>
 ```
 
-Multiple `[Peer]` sections appear in aegis.conf:
-```ini
-[Peer]
-PublicKey = aaaaaaaa...
-Endpoint = client-a
+### 命令行参数速查
 
-[Peer]
-PublicKey = bbbbbbbb...
-Endpoint = client-b
+| 参数 | 说明 | 示例 |
+|------|------|------|
+| `-l <port>` | 本地监听端口 | `-l 9000` |
+| `-r <host:port>` | 远程目标地址 | `-r 1.2.3.4:9000` |
+| `-m <mode>` | 运行模式 | `-m server` 或 `-m client` |
+| `-T <ip/prefix>` | TUN VPN CIDR | `-T 10.0.0.1/24` |
+| `-R <network>` | TUN 路由 | `-R 10.0.0.0/24` |
+| `-W <iface>` | WAN 网卡 | `-W eth0` |
+| `-P <file>` | 私钥文件 | `-P /path/to/private.key` |
+| `-Q <hex\|file>` | 对端公钥 | `-Q a1b2...` 或 `-Q peer.pub` |
+| `-c <file>` | 配置文件路径 | `-c aegis.conf` |
+| `-K <sec>` | Keepalive 间隔 | `-K 30` |
+| `-t <sec>` | 握手超时 | `-t 10` |
+| `-x <max>` | 最大连接数 | `-x 64` |
+| `-v` | 详细日志 | — |
 
-[Peer]
-PublicKey = cccccccc...
-Endpoint = client-c
+---
+
+## 6. 多客户端管理
+
+TUN 服务端支持多个客户端同时连接。
+
+### 配置
+
+```bash
+./aegis-tunnel peer add client-a <公钥A>
+./aegis-tunnel peer add client-b <公钥B>
 ```
 
-**Important**: Each client's `aegis-client.conf` must have a different `Address`:
+**重要：每个客户端的 `Address` 必须不同**：
 ```ini
-# client-a's aegis-client.conf
+# client-a
 Address = 10.0.0.2/24
 
-# client-b's aegis-client.conf
+# client-b
 Address = 10.0.0.3/24
-
-# client-c's aegis-client.conf
-Address = 10.0.0.4/24
 ```
 
-### View Status
+### 安全机制
 
-```bash
-./aegis-tunnel peer list
-# Output:
-#   Known peers:
-#     client-a
-#     client-b
-#     client-c
-
-./aegis-tunnel status
-# Output: full key and peer status
-```
+- per-IP 握手速率限制（5次/60s）
+- 握手时间戳重放检测
+- 每 120 秒自动密钥轮换
 
 ---
 
-## 6. Packet Capture Verification
+## 7. 抓包验证加密
 
-### Proxy Mode Capture
-
-```bash
-# Terminal 1: Start proxy server
-./aegis-tunnel -l 19000 -r 127.0.0.1:19999 -m server
-
-# Terminal 2: Capture tunnel port packets
-sudo tcpdump -i lo -X port 19000
-
-# Terminal 3: Send data
-echo "TOP_SECRET_DATA" | nc 127.0.0.1 19001
-```
-
-**Expected result**: tcpdump shows garbled output; search for `TOP_SECRET_DATA` yields nothing.
-
-### TUN Mode Capture
+### TUN 模式抓包
 
 ```bash
-# On the server, capture plaintext packets on the TUN interface (decrypted data entering the interface)
+# 服务器 TUN 接口抓明文（解密后进入网卡的数据）
 sudo tcpdump -i tun0 -n -c 20
 
-# On the server, capture encrypted packets on the physical NIC (tunnel traffic)
+# 服务器物理网卡抓密文（隧道流量）
 sudo tcpdump -i eth0 -n port 9000 -X -c 5
 ```
 
-**Expected results**:
-- `tun0`: normal IP packets visible (ping, TCP, etc.)
-- `eth0` port 9000: encrypted ciphertext; raw IP packet content is unrecognizable
+**预期结果**：
+- `tun0` 上看到正常 IP 包（ping、TCP 等）
+- `eth0` 端口 9000 看到加密乱码，无法识别原始内容
 
-### Encrypted Frame Format
+### 加密帧格式
 
 ```
- 0      1      2-3         4...(N+3)      (N+4)...(N+19)
-+------+------+--------+--------//----+--------//--------+
-| type | flags| length |   payload     |    tag (16 B)    |
-|  1   |  1   |  2 BE  |  0..65535 B   |                  |
-+------+------+--------+--------//----+--------//--------+
-
-0x0000:  0200 0010 a3f2 7c1d e2b5 9f4a ...   ← Frame type 0x02 (DATA)
-0x0010:  c71e d308 6bd4 f9e3 7284 1acf ...   ← Encrypted payload (AEGIS-128 ciphertext)
-0x0020:  5e2b 941f                           ← Authentication tag (16 bytes)
+0x0000:  0200 0010 a3f2 7c1d e2b5 9f4a ...   ← 帧类型 0x02 (DATA)
+0x0010:  c71e d308 6bd4 f9e3 7284 1acf ...   ← 加密负载（AEGIS-128 密文）
+0x0020:  5e2b 941f                           ← 认证标签（16 字节）
 ```
 
 ---
 
-## 7. Troubleshooting
+## 8. 故障排查
 
-### General Issues
+### 通用问题
 
-| Symptom | Cause | Solution |
-|---------|-------|----------|
-| `make` produces only one file | `.o` cache conflict | `make clean && make` |
-| `cannot find -lssl` | OpenSSL dev library missing | `sudo apt install libssl-dev` |
-| `handshake failed` | Peer public key mismatch | Verify both sides' public keys, re-run `peer add` |
-| `No peer key found` | Peer public key not added | `./aegis-tunnel peer add <name> <hex>` |
-| `bind: Address already in use` | Port occupied | `ss -tlnp \| grep 9000` to find and `kill` |
+| 现象 | 原因 | 解决 |
+|------|------|------|
+| `make` 只生成一个文件 | `.o` 缓存冲突 | `make clean && make` |
+| `cannot find -lssl` | 缺少 OpenSSL 开发库 | `sudo apt install libssl-dev` |
+| `handshake failed` | 对端公钥不匹配 | 检查双方公钥，重新 `peer add` |
+| `No peer key found` | 未添加对端公钥 | `./aegis-tunnel peer add <name> <hex>` |
+| `bind: Address already in use` | 端口被占用 | `ss -tlnp \| grep 9000` 找到并 kill |
 
-### TUN Mode Issues
+### TUN 模式专用
 
-| Symptom | Cause | Solution |
-|---------|-------|----------|
-| `TUNSETIFF: Operation not permitted` | Not running as root | Use `sudo` |
-| `/dev/net/tun: No such file` | TUN module not loaded | `sudo modprobe tun` |
-| Client cannot ping 10.0.0.1 | Route not effective or IP conflict | Check `ip route`, verify both Address values are in the same subnet |
-| Full tunnel breaks internet access | fwmark rule not effective | Check `ip rule list`, verify SO_MARK rule exists |
-| NAT not working | iptables rules not added | `sudo iptables -t nat -L POSTROUTING` to check |
-| Tunnel connection itself routed through TUN (loop) | fwmark not set | Check `ip rule` and SO_MARK configuration |
+| 现象 | 原因 | 解决 |
+|------|------|------|
+| `TUNSETIFF: Operation not permitted` | 无 root 权限 | `sudo` |
+| `/dev/net/tun: No such file` | TUN 模块未加载 | `sudo modprobe tun` |
+| ping 不通 10.0.0.1 | 路由未生效或 IP 冲突 | `ip route` 检查，确认双方在同一子网 |
+| 全隧道后无法上网 | fwmark 规则未生效 | `ip rule list` 检查 |
+| NAT 不工作 | iptables 规则未添加 | `sudo iptables -t nat -L POSTROUTING` |
+| 隧道自身连接也走了 TUN | fwmark 未设置 | 检查 `ip rule` 和 SO_MARK |
+| ping 外网丢包但 ping 10.0.0.1 正常 | 目标网站限制 ICMP | 用 `curl` TCP 测试验证 |
 
-### Config File Issues
-
-| Symptom | Cause | Solution |
-|---------|-------|----------|
-| `aegis.conf not found` | keygen not run or not in current directory | `./aegis-tunnel keygen` |
-| `Endpoint` format error | Missing port number | Use `host:port` format, e.g., `server.com:9000` |
-| `create tun` generates commented PostUp | Security consideration; auto-firewall rules disabled by default | Uncomment manually or configure iptables yourself |
-| `start tun` selects wrong config file | No explicit `-c` flag | `./aegis-tunnel start tun -server -c my-config.conf` |
-
-### Debugging Tips
+### 调试技巧
 
 ```bash
-# Enable verbose logging
+# 详细日志
 ./aegis-tunnel -v ...
 
-# Or set environment variable
-AEGIS_LOG=debug ./aegis-tunnel start tun -server
-
-# Verify keys are correct
+# 验证密钥
 ./aegis-tunnel status
 
-# Check TUN device status
+# 检查 TUN
 ip addr show tun0
 ip link show tun0
 
-# Check routes
+# 检查路由
 ip route show table main | grep tun0
 ip rule list
 
-# Check firewall
+# 检查防火墙
 sudo iptables -t nat -L POSTROUTING -v
 sudo iptables -L FORWARD -v
 
-# Manual cleanup (if tun down fails)
+# 手动清理
 sudo ip link del tun0
 sudo ip rule del fwmark 51820 table main
 sudo iptables -t nat -F POSTROUTING
 sudo iptables -F FORWARD
+
+# 强制纯 C 加密后端（排查加密问题）
+AEGIS_PURE_C=1 sudo -E ./aegis-tunnel start tun -server
 ```

@@ -1,265 +1,257 @@
-# AEGIS-Tunnel Production Readiness Roadmap
+# AEGIS-Tunnel 生产就绪改进路线图
 
-## Phase 1: Protocol Security Hardening ✅ COMPLETED
+## 阶段一：协议安全加固 ✅ 已完成
 
-### 1.1 Per-IP Handshake Rate Limiting (Anti-DoS) ✅
+### 1.1 per-IP 握手速率限制（抗 DoS） ✅
 
-Prevents ECDH computation exhaustion by limiting handshake attempts
-per source IP to 5 per 60-second window. Rejects connections before
-the expensive ECDH calculation.
+限制每个源 IP 在 60 秒窗口内最多发起 5 次握手，在进入昂贵的 ECDH 计算之前拒绝连接。
 
 ```
-Implementation: src/mode_common.c → handshake_rate_check()
-Integrated in: mode_psk_server, mode_tun_server, mode_socks5_server
-Limits: 5 handshakes / 60s / IP, ring-buffer eviction for >32 IPs
+实现: src/mode_common.c → handshake_rate_check()
+集成: mode_psk_server / mode_tun_server / mode_socks5_server
+限制: 每 IP 5 次/60s，超过 32 个 IP 时环形缓冲区淘汰
 ```
 
-### 1.2 Periodic Session Re-Key ✅
+### 1.2 定期会话密钥轮换 ✅
 
-Rotates session keys every 120 seconds (WireGuard-style). Uses the
-existing ECDH re-key mechanism that was previously disabled.
-
-```
-Implementation: tunnel_init sets rekey_sec = 120 by default
-Previous: all mode files overrode with rekey_sec = 0 (disabled)
-Mechanism: ECDH key exchange → new session keys → nonces reset to 0
-```
-
-### 1.3 Handshake Replay Hardening ✅
-
-Sliding-window replay detection using (timestamp, ephemeral_pubkey_prefix)
-pairs. Prevents exact replay of a captured handshake init message within
-the ±60 second timestamp window.
+每 120 秒自动轮换会话密钥（WireGuard 风格）。复用了已有的 ECDH re-key 机制，此前被禁用。
 
 ```
-Implementation: src/protocol/handshake.c → is_replay()
-Key: (int64_t timestamp, uint64_t eph_pub_prefix), 128 slots
-Different ephemeral keys at the same timestamp are allowed (distinct handshakes)
+实现: tunnel_init 默认设置 rekey_sec = 120
+此前: 所有 mode 文件将 rekey_sec 覆盖为 0（禁用）
+机制: ECDH 密钥交换 → 新会话密钥 → nonce 归零
+```
+
+### 1.3 握手重放防护强化 ✅
+
+基于 (时间戳, 临时公钥前缀) 组合的滑动窗口重放检测。防止已捕获的握手 init 消息在 ±60 秒窗口内被精确重放。
+
+```
+实现: src/protocol/handshake.c → is_replay()
+键: (int64_t 时间戳, uint64_t 临时公钥前缀), 128 个槽位
+同时刻不同临时公钥的握手互不干扰（不同连接的独立握手）
 ```
 
 ---
 
-## Phase 2: Operational Readiness
+## 阶段二：运维能力补全
 
-### 2.1 Daemon Mode + Pidfile
+### 2.1 守护进程模式 + pidfile
 
-**Status**: Planned
-**Effort**: 2 days
+**状态**: 计划中
+**工作量**: 2 天
 
 ```
 $ aegis-tunnel start tun -server --daemon --pidfile /run/aegis.pid
 $ aegis-tunnel stop --pidfile /run/aegis.pid
-$ aegis-tunnel reload  # SIGHUP → reload aegis.conf, hot-add peers
+$ aegis-tunnel reload  # SIGHUP → 重载 aegis.conf，热加载 peer 列表
 ```
 
-- `fork()` + `setsid()` for daemonization
-- Write PID file on startup, check for existing instance
-- `SIGHUP`: reload config without dropping connections
-- `SIGTERM`: graceful shutdown + PostDown execution
+- `fork()` + `setsid()` 实现守护进程化
+- 启动时写 pidfile，检查已有实例防止重复启动
+- `SIGHUP`: 重新加载配置，不中断现有连接
+- `SIGTERM`: 优雅关闭 + 执行 PostDown 脚本
 
-### 2.2 Logging System Upgrade
+### 2.2 日志系统升级
 
-**Status**: Planned
-**Effort**: 1 day
+**状态**: 计划中
+**工作量**: 1 天
 
-- Log levels: ERROR / WARN / INFO / DEBUG
-- Output targets: stderr | syslog | file (selectable via CLI)
-- File rotation by size (default 10 MB) or daily
-- Affects: `src/util/log.c` (~100 lines expansion)
+- 日志级别: ERROR / WARN / INFO / DEBUG
+- 输出目标: stderr | syslog | 文件（命令行可选）
+- 文件按大小轮转（默认 10 MB）或按天轮转
+- 影响: `src/util/log.c`（约 100 行扩展）
 
-### 2.3 Configuration Validation
+### 2.3 配置文件校验
 
-**Status**: Planned
-**Effort**: 1 day
+**状态**: 计划中
+**工作量**: 1 天
 
-- Validate required fields after `keygen` (PrivateKey, at least one [Peer])
-- Validate hex key format and length on `peer add`
-- Pre-flight check before `start tun` (Address format, Endpoint format)
-- Affects: `src/config_mgmt.c` → new `validate_config()` function
+- `keygen` 后校验必填项（PrivateKey、至少一个 [Peer]）
+- `peer add` 时验证 hex 公钥格式和长度
+- `start tun` 前预检查（Address 格式、Endpoint 格式）
+- 影响: `src/config_mgmt.c` → 新增 `validate_config()` 函数
 
 ---
 
-## Phase 3: TCP-over-TCP Optimization
+## 阶段三：TCP-over-TCP 优化
 
-### 3.1 TCP Connection Pooling (Multipath)
+### 3.1 TCP 连接池（多路径传输）
 
-**Status**: Planned
-**Effort**: 3 days
-**Priority**: High (addresses TCP head-of-line blocking)
-
-```
-Current:  All tunnel traffic → single TCP connection
-Proposed: N parallel TCP connections (default 4)
-          Packets distributed by (src_ip, dst_ip, sport, dport) hash
-```
-
-- Client opens N TCP connections to server
-- Each connection: independent handshake + nonce space
-- TUN outbound: hash 5-tuple → connection index
-- One connection's retransmission does not block others
-- `REKEY` frames synchronized across all connections
-- Affects: `src/mode_tun.c` → new `multipath` mode
-
-### 3.2 UDP Transport Mode (Alternative to TCP)
-
-**Status**: Planned (long-term)
-**Effort**: 1 week
-**Priority**: Medium
+**状态**: 计划中
+**工作量**: 3 天
+**优先级**: 高（解决 TCP 队头阻塞问题）
 
 ```
-Rationale: TCP congestion control inside TCP tunnel creates
-          nested control loops with unpredictable behavior
+现状:  所有隧道流量 → 单条 TCP 连接
+方案:  N 条并行 TCP 连接（默认 4）
+       按 (src_ip, dst_ip, sport, dport) 哈希分配数据包
 ```
 
-- New `src/mode_tun_udp.c`
-- UDP datagrams + application-layer retransmission
-- Simple congestion control (similar to WireGuard/QUIC)
-- Keepalive as implicit ACK
-- Eliminates TCP-over-TCP head-of-line blocking entirely
+- 客户端到服务端建立 N 条 TCP 连接
+- 每条连接: 独立握手 + 独立 nonce 空间
+- TUN 出站: 5 元组哈希 → 连接索引
+- 某条连接重传时不影响其他连接的流量
+- `REKEY` 帧在所有连接间同步
+- 影响: `src/mode_tun.c` → 新增 `multipath` 模式
+
+### 3.2 UDP 传输模式（TCP 的替代方案）
+
+**状态**: 计划中（长期）
+**工作量**: 1 周
+**优先级**: 中
+
+```
+原因: TCP 拥塞控制嵌套在 TCP 隧道内部会产生不可预测的控制环路
+```
+
+- 新文件 `src/mode_tun_udp.c`
+- UDP 数据报 + 应用层重传
+- 简易拥塞控制（类似 WireGuard/QUIC）
+- Keepalive 作为隐式 ACK
+- 彻底消除 TCP-over-TCP 的队头阻塞问题
 
 ---
 
-## Phase 4: Cross-Platform Support
+## 阶段四：跨平台支持
 
-### 4.1 macOS / BSD Port
+### 4.1 macOS / BSD 移植
 
-**Status**: Planned
-**Effort**: 3 days
+**状态**: 计划中
+**工作量**: 3 天
 
-- macOS: `/dev/tun` (different ioctl from Linux `/dev/net/tun`)
-- BSD: similar to macOS
-- Routing: `route(8)` instead of `ip(8)`
-- Firewall: `pfctl` instead of `iptables`
-- Encapsulate in `src/tunnel/tun_darwin.c` (~200 lines)
+- macOS: `/dev/tun`（与 Linux `/dev/net/tun` 不同的 ioctl 命令）
+- BSD: 与 macOS 类似
+- 路由: `route(8)` 替代 `ip(8)`
+- 防火墙: `pfctl` 替代 `iptables`
+- 封装为 `src/tunnel/tun_darwin.c`（约 200 行）
 
-### 4.2 Embedded Lightweight Mode
+### 4.2 嵌入式轻量模式
 
-**Status**: Planned
-**Effort**: 2 days
+**状态**: 计划中
+**工作量**: 2 天
 
 ```
 $ make MONOCYPHER=1
 ```
 
-- Replace OpenSSL with Monocypher (~1500 lines C, X25519 + SHA-512)
-- Conditional compilation: `#ifdef USE_MONOCYPHER`
-- Target: static binary < 500 KB
-- Suitable for: OpenWrt, Yocto, Buildroot
+- 用 Monocypher（~1500 行 C，X25519 + SHA-512）替代 OpenSSL
+- 条件编译: `#ifdef USE_MONOCYPHER`
+- 目标: 静态链接后 < 500 KB
+- 适用于: OpenWrt / Yocto / Buildroot
 
 ---
 
-## Phase 5: Testing and Verification
+## 阶段五：测试与验证
 
-### 5.1 Formal Protocol Verification
+### 5.1 形式化协议验证
 
-**Status**: Planned
-**Effort**: 1 week
+**状态**: 计划中
+**工作量**: 1 周
 
-- Model AEGIS-128 as black-box AEAD in ProVerif/Tamarin
-- Model 3-DH handshake flow
-- Verify: key secrecy, mutual authentication, forward secrecy, replay resistance
-- Deliverable: `docs/formal-verification.md` + `.pv` model files
+- 用 ProVerif/Tamarin 将 AEGIS-128 建模为黑盒 AEAD
+- 建模 3-DH 握手流程
+- 验证: 密钥保密性、双向认证、前向安全性、重放抵抗
+- 产出: `docs/formal-verification.md` + `.pv` 模型文件
 
-### 5.2 Stress Test Suite
+### 5.2 压力测试套件
 
-**Status**: Planned
-**Effort**: 2 days
+**状态**: 计划中
+**工作量**: 2 天
 
 ```
 tests/stress_test.c:
-  - Concurrency: 100 clients × 1 server
-  - Throughput: 1 Gbps sustained for 1 hour
-  - Duration: 7-day continuous tunnel_run()
-  - Chaos: network disconnect/reconnect, half-open connections,
-           malformed frame injection
+  - 并发: 100 个客户端 × 1 个服务端
+  - 吞吐: 1 Gbps 持续 1 小时
+  - 长时: 7 天不间断 tunnel_run()
+  - 混沌: 网络断开重连、半开连接、恶意帧注入
 ```
 
-### 5.3 Fuzz Testing
+### 5.3 模糊测试
 
-**Status**: Planned
-**Effort**: 2 days
+**状态**: 计划中
+**工作量**: 2 天
 
 ```
-$ make fuzz   # builds with -fsanitize=fuzzer
+$ make fuzz   # 使用 -fsanitize=fuzzer 编译
 
-Targets:
-  - frame_reader_try_next(): TCP stream frame parser
-  - frame_parse(): frame decryption + authentication
-  - socks5_accept(): SOCKS5 protocol handshake
-  - iniconf_load(): INI config file parser
+目标:
+  - frame_reader_try_next(): TCP 流帧解析器
+  - frame_parse(): 帧解密 + 认证
+  - socks5_accept(): SOCKS5 协议握手
+  - iniconf_load(): INI 配置文件解析器
 ```
 
-### 5.4 Unit Tests (iniconfig + keyfile)
+### 5.4 单元测试补全（iniconfig + keyfile）
 
-**Status**: Planned
-**Effort**: 1 day
+**状态**: 计划中
+**工作量**: 1 天
 
-- `tests/test_iniconfig.c`: section parsing, duplicate keys, edge cases
-- `tests/test_keyfile.c`: hex parse, binary format, permission checks
-- CI integration via `make test`
+- `tests/test_iniconfig.c`: 节解析、重复键、边界条件
+- `tests/test_keyfile.c`: hex 解析、二进制格式、权限检查
+- CI 集成: `make test` 中包含
 
 ---
 
-## Long-Term: Cookie-Based Anti-DoS
+## 远期计划：Cookie 抗 DoS 机制
 
-**Status**: Deferred (rate limiter is sufficient for most deployments)
+**状态**: 延后（速率限制对大多数部署已足够）
 
-### Design
+### 设计
 
-When the server is under CPU pressure (ECDH saturation), it can
-respond with a plaintext COOKIE frame instead of performing the
-expensive ECDH calculation.
-
-```
-Client                              Server
-  |                                    |
-  |── HANDSHAKE_INIT ────────────────▶|  (40 bytes, encrypted)
-  |     (eph_pub_c, ts_c)              |
-  |                                    |── [if overloaded] ──
-  |◀── COOKIE_REPLY ─────────────────|  (plaintext, no ECDH)
-  |     cookie = MAC(sk, eph_c, ip)    |
-  |                                    |
-  |── HANDSHAKE_INIT + cookie ───────▶|  (56 bytes, encrypted)
-  |     (eph_pub_c, ts_c, cookie)      |
-  |                                    |  Validate cookie → ECDH
-  |◀── HANDSHAKE_RESP ───────────────|  (normal flow)
-```
+当服务端 CPU 压力过大时（ECDH 计算饱和），可以回复明文 COOKIE
+帧而非执行昂贵的 ECDH 计算。
 
 ```
-New frame types: FRAME_COOKIE_REQUEST (0x07), FRAME_COOKIE_REPLY (0x08)
-Cookie formula: SHA256(server_static_sk || eph_pub_c[0:16] || peer_ip || timestamp)[0:16]
-Cookie lifetime: 120 seconds
-Payload format with cookie: [eph_pub(32)][ts(8)][cookie(16)] = 56 bytes
+客户端                                服务端
+  │                                      │
+  │── HANDSHAKE_INIT ──────────────────▶│  (40 字节，加密)
+  │     (eph_pub_c, ts_c)                │
+  │                                      │── [如果过载] ──
+  │◀── COOKIE_REPLY ───────────────────│  (明文，无 ECDH)
+  │     cookie = MAC(sk, eph_c, ip)      │
+  │                                      │
+  │── HANDSHAKE_INIT + cookie ─────────▶│  (56 字节，加密)
+  │     (eph_pub_c, ts_c, cookie)        │
+  │                                      │  验证 cookie → ECDH
+  │◀── HANDSHAKE_RESP ────────────────│  (正常流程)
 ```
 
-### Trigger Logic
+```
+新帧类型: FRAME_COOKIE_REQUEST (0x07), FRAME_COOKIE_REPLY (0x08)
+Cookie 公式: SHA256(server_sk || eph_pub_c[0:16] || peer_ip || timestamp)[0:16]
+Cookie 有效期: 120 秒
+带 Cookie 的 payload 格式: [eph_pub(32)][ts(8)][cookie(16)] = 56 字节
+```
+
+### 触发逻辑
 
 ```
 if (active_handshakes_in_progress > CPU_CORES * 2) {
-    send_cookie_reply();   // defer ECDH
+    send_cookie_reply();   // 延迟 ECDH
 } else {
-    do_ecdH_handshake();   // normal flow
+    do_ecdH_handshake();   // 正常流程
 }
 ```
 
 ---
 
-## Priority Summary
+## 优先级总览
 
-| Phase | Item | Priority | Effort | Status |
-|-------|------|----------|--------|--------|
-| 1.1 | Per-IP rate limiting | 🔴 Critical | 2h | ✅ Done |
-| 1.2 | Periodic re-key (120s) | 🔴 Critical | 1h | ✅ Done |
-| 1.3 | Replay hardening | 🔴 Critical | 1h | ✅ Done |
-| 2.3 | Config validation | 🟡 High | 1d | 📋 Planned |
-| 3.1 | TCP multipath | 🟡 High | 3d | 📋 Planned |
-| 2.1 | Daemon + pidfile | 🟡 High | 2d | 📋 Planned |
-| 2.2 | Logging upgrade | 🟡 Medium | 1d | 📋 Planned |
-| 5.2 | Stress tests | 🟡 Medium | 2d | 📋 Planned |
-| 5.3 | Fuzz tests | 🟡 Medium | 2d | 📋 Planned |
-| 5.4 | Unit tests | 🟡 Medium | 1d | 📋 Planned |
-| 4.1 | macOS port | 🟢 Low | 3d | 📋 Planned |
-| 4.2 | Embedded mode | 🟢 Low | 2d | 📋 Planned |
-| 3.2 | UDP transport | 🟢 Low | 1w | 📋 Planned |
-| 5.1 | Formal verification | 🟢 Low | 1w | 📋 Planned |
-| — | Cookie anti-DoS | 🟢 Later | 3d | 📝 Deferred |
+| 阶段 | 项目 | 优先级 | 工作量 | 状态 |
+|------|------|--------|--------|------|
+| 1.1 | per-IP 速率限制 | 🔴 关键 | 2h | ✅ 已完成 |
+| 1.2 | 定期 re-key (120s) | 🔴 关键 | 1h | ✅ 已完成 |
+| 1.3 | 握手重放防护 | 🔴 关键 | 1h | ✅ 已完成 |
+| 2.3 | 配置校验 | 🟡 高 | 1d | 📋 计划中 |
+| 3.1 | TCP 多路径 | 🟡 高 | 3d | 📋 计划中 |
+| 2.1 | 守护进程 + pidfile | 🟡 高 | 2d | 📋 计划中 |
+| 2.2 | 日志升级 | 🟡 中 | 1d | 📋 计划中 |
+| 5.2 | 压力测试 | 🟡 中 | 2d | 📋 计划中 |
+| 5.3 | 模糊测试 | 🟡 中 | 2d | 📋 计划中 |
+| 5.4 | 单元测试 | 🟡 中 | 1d | 📋 计划中 |
+| 4.1 | macOS 移植 | 🟢 低 | 3d | 📋 计划中 |
+| 4.2 | 嵌入式模式 | 🟢 低 | 2d | 📋 计划中 |
+| 3.2 | UDP 传输 | 🟢 低 | 1w | 📋 计划中 |
+| 5.1 | 形式化验证 | 🟢 低 | 1w | 📋 计划中 |
+| — | Cookie 抗 DoS | 🟢 延期 | 3d | 📝 已记录 |
