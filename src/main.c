@@ -36,6 +36,7 @@ volatile sig_atomic_t g_active_conns = 0;
 volatile sig_atomic_t g_running      = 1;
 int   g_max_conns = DEFAULT_MAX_CONN;
 int   g_asym_mode = 1;
+int   g_tun_multipath = 1;     /* TCP connections per tunnel (1=single) */
 uint8_t g_asym_priv[32];
 uint8_t g_asym_peers[MAX_PEERS][32];
 char   g_peer_endpoints[MAX_PEERS][256];
@@ -157,6 +158,8 @@ static void usage(const char *prog) {
         "  -x <max>        Max connections (default: 32)\n"
         "  -K <sec>        Keepalive (default: 0)\n"
         "  -W <iface>      WAN interface for NAT (default: eth0)\n"
+        "  -M <num>        Multipath TCP connections (1-8, default 1)\n"
+        "  -U              Use UDP transport (TUN mode only)\n"
         "  -v              Verbose logging\n"
         "  -h              Show this help\n"
         "\n",
@@ -221,14 +224,14 @@ int main(int argc, char **argv) {
     char *privkey_file = NULL, *peerkey_file = NULL;
     const char *mode = "server";
     int  keepalive = 0, hs_timeout = DEFAULT_HS_TIMEOUT;
-    int  tun_mode = 0;
+    int  tun_mode = 0, tun_udp = 0;
     char tun_name[16] = "tun0", tun_ip[32] = "", tun_netmask[32] = "255.255.255.0";
     char tun_route[64] = ""; char tun_nat_if[16] = "";  /* auto-detect below */
     if (!tun_nat_if[0]) strncpy(tun_nat_if, detect_default_iface(), 15);
     char tun_postup[256] = "", tun_postdown[256] = "";
 
     int opt;
-    while ((opt = getopt(argc, argv, "l:r:P:Q:C:c:m:t:x:K:T:I:N:R:W:vh")) != -1) {
+    while ((opt = getopt(argc, argv, "l:r:P:Q:C:c:m:t:x:K:T:I:N:R:W:M:Uvh")) != -1) {
         switch (opt) {
         case 'l': listen_port = atoi(optarg);           break;
         case 'r': remote_str  = optarg;                break;
@@ -264,6 +267,10 @@ int main(int argc, char **argv) {
         case 'N': strncpy(tun_netmask, optarg, 31);      break;
         case 'R': strncpy(tun_route, optarg, 63);         break;
         case 'W': strncpy(tun_nat_if, optarg, 15);        break;
+        case 'M': g_tun_multipath = atoi(optarg);
+                  if (g_tun_multipath < 1) g_tun_multipath = 1;
+                  if (g_tun_multipath > 8) g_tun_multipath = 8; break;
+        case 'U': tun_udp = 1;                          break;
         case 'v': log_set_level(LOG_DEBUG);             break;
         case 'h': usage(argv[0]); return 0;
         default:  usage(argv[0]); return 1;
@@ -536,7 +543,22 @@ int main(int argc, char **argv) {
         return ret;
     }
 
-    if (tun_mode) {
+    if (tun_mode && tun_udp) {
+        /* UDP transport mode */
+        if (!strcmp(mode, "server"))
+            ret = mode_tun_udp_server(listen_port, tun_name, tun_ip, tun_netmask,
+                                       tun_route[0]?tun_route:NULL, tun_nat_if,
+                                       tun_postup[0]?tun_postup:NULL,
+                                       tun_postdown[0]?tun_postdown:NULL,
+                                       psk, psk_len, hs_timeout, keepalive);
+        else
+            ret = mode_tun_udp_client(remote_host, remote_port,
+                                       tun_name, tun_ip, tun_netmask,
+                                       tun_route[0]?tun_route:NULL,
+                                       tun_postup[0]?tun_postup:NULL,
+                                       tun_postdown[0]?tun_postdown:NULL,
+                                       psk, psk_len, hs_timeout, keepalive);
+    } else if (tun_mode) {
         if (!strcmp(mode, "server"))
             ret = mode_tun_server(listen_port, tun_name, tun_ip, tun_netmask,
                                   tun_route[0]?tun_route:NULL, tun_nat_if,

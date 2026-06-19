@@ -48,7 +48,8 @@ LIB_SRCS := $(CRYPTO) $(UTIL) $(PROTOCOL) $(TUNNEL) $(PROXY)
 LIB_OBJS := $(LIB_SRCS:.c=.o)
 
 MODE_SRCS := $(SRC_DIR)/main.c $(SRC_DIR)/mode_psk.c $(SRC_DIR)/mode_tun.c \
-              $(SRC_DIR)/mode_socks5.c $(SRC_DIR)/config_mgmt.c $(SRC_DIR)/mode_common.c
+              $(SRC_DIR)/mode_tun_udp.c $(SRC_DIR)/mode_socks5.c \
+              $(SRC_DIR)/config_mgmt.c $(SRC_DIR)/mode_common.c
 MAIN_SRCS  := $(MODE_SRCS) $(LIB_SRCS)
 MAIN_OBJS  := $(MAIN_SRCS:.c=.o)
 

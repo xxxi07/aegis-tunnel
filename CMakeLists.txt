@@ -87,6 +87,7 @@ set(MAIN_SOURCES
     src/main.c
     src/mode_psk.c
     src/mode_tun.c
+    src/mode_tun_udp.c
     src/mode_socks5.c
     src/config_mgmt.c
     src/mode_common.c

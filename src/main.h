@@ -16,6 +16,7 @@ extern int  g_max_conns;
 #define MAX_PEERS 16
 
 extern int  g_asym_mode;
+extern int  g_tun_multipath;   /* number of parallel TCP connections */
 extern uint8_t g_asym_priv[32];
 extern uint8_t g_asym_peers[MAX_PEERS][32];
 extern char   g_peer_endpoints[MAX_PEERS][256];
@@ -53,6 +54,22 @@ int mode_socks5_client(const char *remote_host, int remote_port,
                        int listen_port,
                        const uint8_t *psk, size_t psk_len,
                        int hs_timeout, int keepalive);
+
+/* ── TUN UDP transport modes ── */
+int mode_tun_udp_server(int listen_port,
+                         const char *tun_name,
+                         const char *tun_ip, const char *tun_netmask,
+                         const char *tun_route, const char *tun_nat_if,
+                         const char *postup, const char *postdown,
+                         const uint8_t *psk, size_t psk_len,
+                         int hs_timeout, int keepalive);
+int mode_tun_udp_client(const char *remote_host, int remote_port,
+                         const char *tun_name,
+                         const char *tun_ip, const char *tun_netmask,
+                         const char *tun_route,
+                         const char *postup, const char *postdown,
+                         const uint8_t *psk, size_t psk_len,
+                         int hs_timeout, int keepalive);
 
 #endif /* MAIN_H */
 
