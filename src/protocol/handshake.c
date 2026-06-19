@@ -12,6 +12,37 @@
 #include <unistd.h>
 
 #define TIMESTAMP_WINDOW_SEC  60
+#define REPLAY_SLOTS           128   /* sliding window of seen handshakes */
+
+/*
+ * Replay cache entry.
+ * Uniquely identifies a handshake by (timestamp, first 8 bytes of
+ * initiator's ephemeral public key).  Two handshakes at the same
+ * timestamp with different ephemeral keys are distinct and allowed.
+ * WireGuard uses a similar scheme (TAI64N + hash of init message).
+ */
+typedef struct {
+    int64_t ts;
+    uint64_t eph_prefix;   /* first 8 bytes of initiator eph_pub */
+} replay_entry_t;
+
+static replay_entry_t replay_cache[REPLAY_SLOTS];
+static size_t         replay_idx = 0;
+
+static int is_replay(int64_t ts, const uint8_t eph_pub[32])
+{
+    uint64_t prefix;
+    memcpy(&prefix, eph_pub, sizeof(prefix));
+
+    for (size_t i = 0; i < REPLAY_SLOTS; i++) {
+        if (replay_cache[i].ts == ts && replay_cache[i].eph_prefix == prefix)
+            return 1;  /* exact replay of a previous handshake */
+    }
+    replay_cache[replay_idx].ts         = ts;
+    replay_cache[replay_idx].eph_prefix = prefix;
+    replay_idx = (replay_idx + 1) % REPLAY_SLOTS;
+    return 0;
+}
 
 static void sha256_h(uint8_t out[32], const uint8_t *in, size_t len) {
     EVP_MD_CTX *c = EVP_MD_CTX_new(); unsigned int o = 0;
@@ -20,7 +51,13 @@ static void sha256_h(uint8_t out[32], const uint8_t *in, size_t len) {
     EVP_DigestFinal_ex(c, out, &o);
     EVP_MD_CTX_free(c);
 }
-static int check_ts(int64_t ts) { int64_t n=timestamp_now(); if(n<0)return -1; int64_t d=(n>ts)?(n-ts):(ts-n); return d>60?-1:0; }
+static int check_ts(int64_t ts, const uint8_t eph_pub[32]) {
+    int64_t n=timestamp_now(); if(n<0)return -1;
+    int64_t d=(n>ts)?(n-ts):(ts-n);
+    if(d>TIMESTAMP_WINDOW_SEC)return -1;     /* expired */
+    if(is_replay(ts,eph_pub))return -1;       /* exact replay detected */
+    return 0;
+}
 int send_all(int fd, const uint8_t *b, size_t n) { size_t s=0; while(s<n){ ssize_t r=send(fd,b+s,n-s,0); if(r<0){if(errno==EINTR)continue;return -1;} if(r==0)return -1; s+=(size_t)r;} return 0; }
 
 #include <poll.h>
@@ -80,7 +117,7 @@ int handshake_server(int fd, const uint8_t our_priv[32], const uint8_t peer_pub[
     if(asym_hdr(fd,iepk)!=0)return -1;
     {uint8_t ee[32],es[32];ecdh_derive(ee,our_priv,iepk);ecdh_derive(es,our_priv,peer_pub);uint8_t b[68];memcpy(b,ee,32);memcpy(b+32,es,32);memcpy(b+64,"init",4);uint8_t h[32];sha256_h(h,b,68);memcpy(ik,h,16);}
     if(asym_ts(fd,iepk,ik,&its)!=0) goto out;
-    if(check_ts(its)!=0) goto out;
+    if(check_ts(its,iepk)!=0) goto out;
     if(ecdh_keygen(epk,ek)!=0) goto out;
     {uint8_t ee[32],es[32],se[32];ecdh_derive(ee,our_priv,iepk);ecdh_derive(es,our_priv,peer_pub);ecdh_derive(se,ek,peer_pub);asym_shared(sh,ee,es,se);secure_memzero(ee,32);secure_memzero(es,32);secure_memzero(se,32);}
     asym_sess(keys,sh,iepk,epk);{uint8_t t[16];memcpy(t,keys->enc_key,16);memcpy(keys->enc_key,keys->dec_key,16);memcpy(keys->dec_key,t,16);secure_memzero(t,16);}
@@ -104,7 +141,7 @@ int handshake_client(int fd, const uint8_t our_priv[32], const uint8_t peer_pub[
     {uint8_t ee[32],es[32],se[32];ecdh_derive(ee,ek,peer_pub);ecdh_derive(es,our_priv,peer_pub);ecdh_derive(se,our_priv,repk);asym_shared(sh,ee,es,se);secure_memzero(ee,32);secure_memzero(es,32);secure_memzero(se,32);}
     asym_resp(rk,sh);
     if(asym_ts(fd,repk,rk,&rts)!=0) goto out;
-    if(check_ts(rts)!=0) goto out;
+    if(check_ts(rts,repk)!=0) goto out;
     asym_sess(keys,sh,epk,repk);
     ret = 0;
 out:

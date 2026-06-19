@@ -12,6 +12,7 @@
 #include <errno.h>
 #include <netinet/in.h>
 #include <signal.h>
+#include <time.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -47,6 +48,11 @@ int mode_psk_server(int listen_port, const char *remote_host, int remote_port,
         char ip[INET_ADDRSTRLEN]; inet_ntop(AF_INET, &ca.sin_addr, ip, sizeof(ip));
         log_info("server", "#%d %s:%d", (int)g_active_conns+1, ip, ntohs(ca.sin_port));
 
+        /* Anti-DoS: rate-limit handshake attempts per source IP */
+        if (handshake_rate_check(ip, (int64_t)time(NULL)) < 0) {
+            close(client_fd); continue;
+        }
+
         pid_t pid = fork();
         if (pid < 0) { close(client_fd); continue; }
         if (pid == 0) {
@@ -62,7 +68,7 @@ int mode_psk_server(int listen_port, const char *remote_host, int remote_port,
             if (remote_fd < 0) { close(client_fd); _exit(1); }
 
             tunnel_t tun; tunnel_init(&tun, remote_fd, client_fd, keys.enc_key, keys.dec_key);
-            tun.keepalive_sec = keepalive; tun.rekey_sec = 0; tun.psk = NULL; tun.psk_len = 0;
+            tun.keepalive_sec = keepalive;
             int r = tunnel_run(&tun);
             secure_memzero(&keys, sizeof(keys));
             close(remote_fd); close(client_fd);
@@ -106,7 +112,7 @@ int mode_psk_client(int listen_port, const char *remote_host, int remote_port,
                 handshake_key_confirm_client(tunnel_fd, &keys, hs_timeout) == 0) {
 
                 tunnel_t tun; tunnel_init(&tun, local_fd, tunnel_fd, keys.enc_key, keys.dec_key);
-                tun.keepalive_sec = keepalive; tun.rekey_sec = 0; tun.psk = NULL; tun.psk_len = 0;
+                tun.keepalive_sec = keepalive;
 
                 retry_delay = 0;  /* reset on success */
                 int r = tunnel_run(&tun);

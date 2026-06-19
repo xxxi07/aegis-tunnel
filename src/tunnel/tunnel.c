@@ -115,7 +115,8 @@ void tunnel_init(tunnel_t *tun,
     tun->enc_nonce = 1;   /* 0 reserved for handshake */
     tun->dec_nonce = 1;
     tun->keepalive_sec = 0;
-    tun->running = 1;
+    tun->rekey_sec     = 120;  /* periodic re-key every 2 min (WireGuard-style) */
+    tun->running       = 1;
 
     /* ── TCP performance tuning ──
      *

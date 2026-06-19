@@ -27,6 +27,7 @@
 #include <errno.h>
 #include <netinet/in.h>
 #include <signal.h>
+#include <time.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -151,6 +152,11 @@ int mode_socks5_server(int listen_port,
         log_info("socks5-server", "#%d %s:%d", (int)g_active_conns + 1,
                  ip, ntohs(ca.sin_port));
 
+        /* Anti-DoS: rate-limit handshake attempts per source IP */
+        if (handshake_rate_check(ip, (int64_t)time(NULL)) < 0) {
+            close(client_fd); continue;
+        }
+
         pid_t pid = fork();
         if (pid < 0) { close(client_fd); continue; }
 
@@ -197,9 +203,7 @@ int mode_socks5_server(int listen_port,
             tun.enc_nonce    = 2;
             tun.dec_nonce    = 2;
             tun.keepalive_sec = keepalive;
-            tun.rekey_sec     = 0;
-            tun.psk           = NULL;
-            tun.psk_len       = 0;
+            
 
             int r = tunnel_run(&tun);
             secure_memzero(&keys, sizeof(keys));
@@ -277,9 +281,7 @@ int mode_socks5_client(const char *remote_host, int remote_port,
                 tun.enc_nonce     = 2;   /* 0=key_confirm, 1=connect_req */
                 tun.dec_nonce     = 2;
                 tun.keepalive_sec = keepalive;
-                tun.rekey_sec     = 0;
-                tun.psk           = NULL;
-                tun.psk_len       = 0;
+                
 
                 retry_delay = 0;
                 connected   = 1;

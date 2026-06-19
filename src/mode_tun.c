@@ -15,6 +15,7 @@
 #include <netinet/in.h>
 #include <poll.h>
 #include <signal.h>
+#include <time.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -217,6 +218,11 @@ int mode_tun_server(int listen_port,
                 inet_ntop(AF_INET, &ca.sin_addr, ip, sizeof(ip));
                 log_info("tun-server", "client %s:%d", ip, ntohs(ca.sin_port));
 
+                /* Anti-DoS: rate-limit handshake attempts per source IP */
+                if (handshake_rate_check(ip, (int64_t)time(NULL)) < 0) {
+                    close(client_fd); continue;
+                }
+
                 /* Parent does the handshake to learn the peer identity */
                 session_keys_t keys;
                 int peer_idx = try_handshake_server(client_fd, &keys, hs_timeout);
@@ -252,9 +258,6 @@ int mode_tun_server(int listen_port,
                     tunnel_t tun;
                     tunnel_init(&tun, sp[1], client_fd, keys.enc_key, keys.dec_key);
                     tun.keepalive_sec = keepalive;
-                    tun.rekey_sec     = 0;
-                    tun.psk           = NULL;
-                    tun.psk_len       = 0;
 
                     int r = tunnel_run(&tun);
                     secure_memzero(&keys, sizeof(keys));
@@ -452,7 +455,6 @@ int mode_tun_client(int listen_port, const char *remote_host, int remote_port,
             log_info("tun-client", "peer #%d authenticated", pi);
 
             tunnel_t tun; tunnel_init(&tun, tun_fd, tunnel_fd, keys.enc_key, keys.dec_key);
-            tun.keepalive_sec = keepalive; tun.rekey_sec = 0; tun.psk = NULL; tun.psk_len = 0;
 
             int r = tunnel_run(&tun);
             secure_memzero(&keys, sizeof(keys));

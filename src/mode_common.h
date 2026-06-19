@@ -14,4 +14,16 @@
  */
 int try_handshake_server(int fd, session_keys_t *keys, int timeout_ms);
 
+/*
+ * Per-IP handshake rate limiter (anti-DoS).
+ * Call BEFORE doing expensive ECDH handshake.
+ *
+ *   ip:   source IP string (inet_ntop format)
+ *   now:  current timestamp (from time(NULL))
+ *
+ * Returns 0 if the handshake is allowed, -1 if the IP is rate-limited.
+ * Limits: max 5 handshake attempts per minute per source IP.
+ */
+int handshake_rate_check(const char *ip, int64_t now);
+
 #endif /* MODE_COMMON_H */
