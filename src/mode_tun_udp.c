@@ -558,6 +558,11 @@ int mode_tun_udp_server(int listen_port,
         fds[1].fd = tun_fd;  fds[1].events = POLLIN; fds[1].revents = 0;
 
         int pr = poll(fds, 2, keepalive > 0 ? keepalive * 1000 : 500);
+        if (pr > 0) {
+            log_info("udp-server", "poll: udp=%d tun=%d",
+                     !!(fds[0].revents & POLLIN),
+                     !!(fds[1].revents & POLLIN));
+        }
         if (pr < 0) { if (errno == EINTR) continue; break; }
 
         /* ── UDP → TUN ── */
@@ -764,6 +769,16 @@ int mode_tun_udp_server(int listen_port,
                                     }
                                     wr += (size_t)w;
                                 }
+                            }
+                            /* Peek: is there an immediate reply? */
+                            {
+                                uint8_t peek[FRAME_MAX_PAYLOAD];
+                                ssize_t pn = read(tun_fd, peek, sizeof(peek));
+                                if (pn > 0)
+                                    log_info("udp-server", "TUN reply ready: %zd bytes, ver=%d",
+                                             pn, (peek[0] >> 4));
+                                else if (pn < 0 && errno != EAGAIN && errno != EWOULDBLOCK)
+                                    log_warn("udp-server", "TUN peek error: %s", strerror(errno));
                             }
                         }
                     }
