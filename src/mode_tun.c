@@ -251,7 +251,7 @@ static int tun_client_multipath(int tun_fd, const char *name,
             }
         }
         /* Create socketpair: sp[0]=parent, sp[1]=child */
-        if (socketpair(AF_UNIX, SOCK_STREAM, 0, sp_fds[i]) < 0) {
+        if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, sp_fds[i]) < 0) {
             close(tcp_fds[i]); tcp_fds[i] = -1;
             goto cleanup;
         }
