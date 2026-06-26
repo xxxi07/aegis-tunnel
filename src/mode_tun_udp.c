@@ -96,6 +96,26 @@ static int udp_recv(int fd, uint8_t *buf, size_t maxlen)
     return (int)n;
 }
 
+/*
+ * Receive a datagram from a specific peer.  Filters by source
+ * address; datagrams from other peers are silently discarded
+ * (returns 0 so the caller can retry / poll again).
+ * Used as a fallback when SO_REUSEPORT is unavailable.
+ */
+static int udp_recv_peer(int fd, uint8_t *buf, size_t maxlen,
+                          const struct sockaddr_in *peer)
+{
+    struct sockaddr_in src;
+    socklen_t srclen = sizeof(src);
+    ssize_t n = recvfrom(fd, buf, maxlen, 0,
+                         (struct sockaddr *)&src, &srclen);
+    if (n < 0) return -1;
+    if (src.sin_addr.s_addr != peer->sin_addr.s_addr ||
+        src.sin_port != peer->sin_port)
+        return 0;  /* not our client — silently skip */
+    return (int)n;
+}
+
 /* ─── UDP handshake: complete datagram based ──────────────────── */
 
 #define UDP_HS_DGRAM  60   /* wire size of one handshake message */
@@ -297,7 +317,11 @@ static int udp_handshake_server(int recv_fd, session_keys_t *keys, int timeout_m
         /* 8. Receive client KEY_CONFIRM */
         {
             uint8_t ckw[FRAME_HEADER_LEN + AEGIS_TAG_LEN];
-            int nr = udp_recv(recv_fd, ckw, sizeof(ckw));
+            int nr;
+            if (recv_fd >= 0)
+                nr = udp_recv(recv_fd, ckw, sizeof(ckw));
+            else
+                nr = udp_recv_peer(send_fd, ckw, sizeof(ckw), dest);
             log_info("udp-server", "recv returned %d (errno=%d)", nr, errno);
             if (nr >= (int)sizeof(ckw)) {
                 uint8_t ty, fl, dum[1]; size_t dl;
@@ -628,14 +652,15 @@ int mode_tun_udp_server(int listen_port,
             }
 
             /*
-             * UDP data path uses explicit-nonce frames and split-fd I/O:
+             * UDP data path: explicit-nonce frames.
              *   send: sendto(udp_fd, ...) → source port = listen_port
-             *   recv: recv(cfd, ...)       → filtered to this client
+             *   recv: recv(cfd) or recvfrom_peer(udp_fd) → per-client
              */
             int64_t last_ka = (int64_t)time(NULL);
+            int recv_fd = (cfd >= 0) ? cfd : udp_fd;
             struct pollfd fds[2];
-            fds[0].fd = tun_fd; fds[0].events = POLLIN;
-            fds[1].fd = cfd;    fds[1].events = POLLIN;
+            fds[0].fd = tun_fd;  fds[0].events = POLLIN;
+            fds[1].fd = recv_fd; fds[1].events = POLLIN;
 
             while (g_running) {
                 fds[0].revents = 0; fds[1].revents = 0;
@@ -655,11 +680,17 @@ int mode_tun_udp_server(int listen_port,
                     }
                 }
 
-                /* UDP → TUN: recv on cfd (filtered to this client) */
+                /* UDP → TUN */
                 if (fds[1].revents & POLLIN) {
                     for (;;) {
                         uint8_t wb[UDP_MAX_DGRAM];
-                        ssize_t n = recv(cfd, wb, sizeof(wb), 0);
+                        ssize_t n;
+                        if (cfd >= 0)
+                            n = recv(cfd, wb, sizeof(wb), 0);
+                        else {
+                            n = udp_recv_peer(udp_fd, wb, sizeof(wb), &client_addr);
+                            if (n == 0) continue;  /* wrong peer, try again */
+                        }
                         if (n < 0) { if (errno == EAGAIN || errno == EWOULDBLOCK) break; goto out; }
                         if (n == 0) goto out;
                         uint8_t ty, fl, pkt[FRAME_MAX_PAYLOAD]; size_t pl;
@@ -689,7 +720,8 @@ int mode_tun_udp_server(int listen_port,
             }
         out:
             secure_memzero(&keys, sizeof(keys));
-            close(cfd); close(udp_fd); close(tun_fd);
+            if (cfd >= 0) close(cfd);
+            close(udp_fd); close(tun_fd);
             _exit(0);
         }
         close(cfd); close(pipe_fds[0]); close(pipe_fds[1]);
