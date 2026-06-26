@@ -267,11 +267,10 @@ static int tun_client_multipath(int tun_fd, const char *name,
             /* Child: run tunnel over socketpair + TCP */
             close(sp_fds[i][0]);  /* parent end */
             close(tun_fd);
-            for (int j = 0; j < i; j++) {
-                close(sp_fds[j][0]); close(sp_fds[j][1]);
-                /* DO NOT close tcp_fds[j] — the OS may have reused
-                 * the fd number for a later path's connection */
-            }
+            /* Do NOT close sp_fds[j] or tcp_fds[j] from earlier
+             * iterations — after the parent closed those fds, the
+             * OS may have reused the same fd numbers for the
+             * current path's socketpair or TCP connection. */
             tunnel_t tun;
             tunnel_init(&tun, sp_fds[i][1], tcp_fds[i],
                         keys.enc_key, keys.dec_key);
