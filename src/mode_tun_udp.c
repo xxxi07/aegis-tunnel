@@ -494,8 +494,39 @@ int mode_tun_udp_server(int listen_port,
             if (w < (size_t)nr) { close(pipe_fds[0]); close(pipe_fds[1]); continue; }
         }
 
+        /*
+         * Create a connected UDP socket for this client.
+         *
+         * CRITICAL: we MUST bind this socket to the same port as the
+         * main listen socket (listen_port).  Otherwise the kernel
+         * assigns a random ephemeral port, and the client — whose
+         * socket is connect()'d to server:listen_port — will filter
+         * out our responses via the kernel's connected-UDP check.
+         *
+         * SO_REUSEADDR allows multiple UDP sockets to share the same
+         * local port.  The connected socket takes precedence for
+         * datagrams from its peer; unconnected datagrams still go to
+         * the main listen socket.
+         */
         int cfd = socket(AF_INET, SOCK_DGRAM, 0);
         if (cfd < 0) { close(pipe_fds[0]); close(pipe_fds[1]); continue; }
+        {
+            int reuse = 1;
+            setsockopt(cfd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+#ifdef SO_REUSEPORT
+            setsockopt(cfd, SOL_SOCKET, SO_REUSEPORT, &reuse, sizeof(reuse));
+#endif
+            struct sockaddr_in bind_addr;
+            memset(&bind_addr, 0, sizeof(bind_addr));
+            bind_addr.sin_family = AF_INET;
+            bind_addr.sin_addr.s_addr = INADDR_ANY;
+            bind_addr.sin_port = htons((uint16_t)listen_port);
+            if (bind(cfd, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) < 0) {
+                log_warn("udp-server", "bind cfd to port %d failed: %s",
+                         listen_port, strerror(errno));
+                close(cfd); close(pipe_fds[0]); close(pipe_fds[1]); continue;
+            }
+        }
         if (connect(cfd, (struct sockaddr *)&ca, sizeof(ca)) < 0) {
             close(cfd); close(pipe_fds[0]); close(pipe_fds[1]); continue;
         }
