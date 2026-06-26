@@ -217,9 +217,11 @@ static int udp_handshake_server(int fd, session_keys_t *keys, int timeout_ms,
         if (now < 0 || (now > its ? now - its : its - now) > 60)
             continue;
 
+        log_info("udp-server", "peer #%d key matched", pi);
+
         /* 4. Generate our ephemeral keypair */
         uint8_t epk[32], ek[32];
-        if (ecdh_keygen(epk, ek) != 0) continue;
+        if (ecdh_keygen(epk, ek) != 0) { log_warn("udp-server", "keygen failed"); continue; }
 
         /* 5. Compute shared secret (3-DH: ee, es, se) */
         uint8_t es[32], se[32];
@@ -242,31 +244,49 @@ static int udp_handshake_server(int fd, session_keys_t *keys, int timeout_ms,
         memcpy(keys->enc_key, h + 16, 16);  /* server enc = client dec */
 
         /* 6. Send HANDSHAKE_RESP */
-        uint8_t rk[16], rkb[36];
-        memcpy(rkb, sh, 32); memcpy(rkb + 32, "resp", 4);
-        sha256_h(h, rkb, 36); memcpy(rk, h, 16);
-        uint8_t rdgram[UDP_HS_DGRAM];
-        udp_hs_build(rdgram, epk, timestamp_now(), rk);
-        udp_send(fd, rdgram, sizeof(rdgram));
+        {
+            uint8_t rk[16], rkb[36];
+            memcpy(rkb, sh, 32); memcpy(rkb + 32, "resp", 4);
+            sha256_h(h, rkb, 36); memcpy(rk, h, 16);
+            uint8_t rdgram[UDP_HS_DGRAM];
+            udp_hs_build(rdgram, epk, timestamp_now(), rk);
+            if (udp_send(fd, rdgram, sizeof(rdgram)) != 0) {
+                log_warn("udp-server", "failed to send RESP (errno=%d)", errno);
+                continue;
+            }
+        }
+        log_info("udp-server", "RESP sent");
 
         /* 7. Send KEY_CONFIRM */
-        uint8_t kw[FRAME_MAX_WIRE]; size_t kwl;
-        frame_build(kw, &kwl, FRAME_KEYCONFIRM, 0, NULL, 0, 0, keys->enc_key);
-        udp_send(fd, kw, kwl);
+        {
+            uint8_t kw[FRAME_MAX_WIRE]; size_t kwl;
+            frame_build(kw, &kwl, FRAME_KEYCONFIRM, 0, NULL, 0, 0, keys->enc_key);
+            if (udp_send(fd, kw, kwl) != 0) {
+                log_warn("udp-server", "failed to send KEY_CONFIRM (errno=%d)", errno);
+                continue;
+            }
+        }
+        log_info("udp-server", "KEY_CONFIRM sent, waiting for client...");
 
         /* 8. Receive client KEY_CONFIRM */
-        uint8_t ckw[FRAME_HEADER_LEN + AEGIS_TAG_LEN];
-        if (udp_recv(fd, ckw, sizeof(ckw)) >= (int)sizeof(ckw)) {
-            uint8_t ty, fl, dum[1]; size_t dl;
-            if (frame_parse(ckw, sizeof(ckw), &ty, &fl, dum, &dl,
-                            0, keys->dec_key) == 0 && ty == FRAME_KEYCONFIRM) {
-                secure_memzero(ee, 32); secure_memzero(es_init, 32);
-                secure_memzero(ek, 32); secure_memzero(sh, 32);
-                log_info("udp-server", "peer #%d authenticated", pi);
-                return 0;
+        {
+            uint8_t ckw[FRAME_HEADER_LEN + AEGIS_TAG_LEN];
+            int nr = udp_recv(fd, ckw, sizeof(ckw));
+            log_info("udp-server", "recv returned %d (errno=%d)", nr, errno);
+            if (nr >= (int)sizeof(ckw)) {
+                uint8_t ty, fl, dum[1]; size_t dl;
+                if (frame_parse(ckw, sizeof(ckw), &ty, &fl, dum, &dl,
+                                0, keys->dec_key) == 0 && ty == FRAME_KEYCONFIRM) {
+                    secure_memzero(ee, 32); secure_memzero(es_init, 32);
+                    secure_memzero(ek, 32); secure_memzero(sh, 32);
+                    log_info("udp-server", "peer #%d authenticated", pi);
+                    return 0;
+                }
+                log_warn("udp-server", "KEY_CONFIRM parse failed (ty=%d)", ty);
             }
         }
     }
+    log_warn("udp-server", "no matching peer key (tried %d)", g_peer_count);
     return -1;
 }
 
@@ -293,64 +313,100 @@ static int udp_handshake_client(int fd, int peer_idx,
 
     /* 3. Send HANDSHAKE_INIT */
     udp_hs_build(dgram, epk, timestamp_now(), ik);
-    if (udp_send(fd, dgram, sizeof(dgram)) != 0) return -1;
+    if (udp_send(fd, dgram, sizeof(dgram)) != 0) {
+        log_warn("udp-client", "failed to send INIT (errno=%d)", errno);
+        return -1;
+    }
+    log_info("udp-client", "INIT sent, waiting for RESP...");
 
     /* 4. Receive HANDSHAKE_RESP (one complete datagram) */
-    if (udp_recv(fd, dgram, sizeof(dgram)) < UDP_HS_DGRAM) return -1;
+    {
+        int nr = udp_recv(fd, dgram, sizeof(dgram));
+        log_info("udp-client", "recv RESP returned %d (errno=%d)", nr, errno);
+        if (nr < UDP_HS_DGRAM) {
+            log_warn("udp-client", "short RESP: got %d, expected %d", nr, UDP_HS_DGRAM);
+            return -1;
+        }
+    }
 
     /* 5. Compute shared secret (needs repk from response, which is in the AD) */
     uint8_t repk[32];
     memcpy(repk, dgram + 4, 32);  /* server's ephemeral pubkey (plaintext in AD) */
 
-    uint8_t ee[32], es[32], se[32];
-    ecdh_derive(ee, ek, repk);                               /* eph_sk × eph_pk  */
-    ecdh_derive(es, g_asym_priv, g_asym_peers[peer_idx]);    /* static_sk × static_pk */
-    ecdh_derive(se, g_asym_priv, repk);                      /* static_sk × eph_pk */
-
-    uint8_t sb[102]; memcpy(sb, ee, 32); memcpy(sb + 32, es, 32);
-    memcpy(sb + 64, se, 32); memcpy(sb + 96, "shared", 6);
-    uint8_t sh[32]; sha256_h(sh, sb, 102);
-
-    /* 6. Derive resp_key and decrypt/verify the response */
-    uint8_t rk_buf[36], rk[16];
-    memcpy(rk_buf, sh, 32); memcpy(rk_buf + 32, "resp", 4);
-    sha256_h(h, rk_buf, 36); memcpy(rk, h, 16);
-
-    int64_t rts;
-    if (udp_hs_parse(dgram, repk, &rts, rk) != 0) return -1;
-
-    int64_t now = timestamp_now();
-    if (now < 0 || (now > rts ? now - rts : rts - now) > 60) return -1;
-
-    /* 7. Session keys: SHA256(sh(32) || "session"(7)) = 39 bytes */
     {
-        uint8_t sk[39];
-        memcpy(sk, sh, 32);
-        memcpy(sk + 32, "session", 7);
-        sha256_h(h, sk, 39);
+        uint8_t ee[32], es[32], se[32];
+        ecdh_derive(ee, ek, repk);                               /* eph_sk × eph_pk  */
+        ecdh_derive(es, g_asym_priv, g_asym_peers[peer_idx]);    /* static_sk × static_pk */
+        ecdh_derive(se, g_asym_priv, repk);                      /* static_sk × eph_pk */
+
+        uint8_t sb[102]; memcpy(sb, ee, 32); memcpy(sb + 32, es, 32);
+        memcpy(sb + 64, se, 32); memcpy(sb + 96, "shared", 6);
+        uint8_t sh[32]; sha256_h(sh, sb, 102);
+
+        /* 6. Derive resp_key and decrypt/verify the response */
+        uint8_t rk_buf[36], rk[16];
+        memcpy(rk_buf, sh, 32); memcpy(rk_buf + 32, "resp", 4);
+        sha256_h(h, rk_buf, 36); memcpy(rk, h, 16);
+
+        int64_t rts;
+        if (udp_hs_parse(dgram, repk, &rts, rk) != 0) {
+            log_warn("udp-client", "RESP parse/auth failed");
+            secure_memzero(ee, 32); secure_memzero(es, 32);
+            secure_memzero(se, 32); secure_memzero(sh, 32);
+            return -1;
+        }
+
+        int64_t now = timestamp_now();
+        if (now < 0 || (now > rts ? now - rts : rts - now) > 60) {
+            log_warn("udp-client", "RESP timestamp out of window");
+            secure_memzero(ee, 32); secure_memzero(es, 32);
+            secure_memzero(se, 32); secure_memzero(sh, 32);
+            return -1;
+        }
+
+        /* 7. Session keys: SHA256(sh(32) || "session"(7)) = 39 bytes */
+        {
+            uint8_t sk[39];
+            memcpy(sk, sh, 32);
+            memcpy(sk + 32, "session", 7);
+            sha256_h(h, sk, 39);
+        }
+        memcpy(keys->enc_key, h, 16);
+        memcpy(keys->dec_key, h + 16, 16);
+
+        secure_memzero(ee, 32); secure_memzero(es, 32);
+        secure_memzero(se, 32); secure_memzero(sh, 32);
     }
-    memcpy(keys->enc_key, h, 16);
-    memcpy(keys->dec_key, h + 16, 16);
+
+    log_info("udp-client", "RESP verified, waiting for server KEY_CONFIRM...");
 
     /* 8. Receive server KEY_CONFIRM */
     {
         uint8_t kw[FRAME_HEADER_LEN + AEGIS_TAG_LEN];
-        if (udp_recv(fd, kw, sizeof(kw)) < (int)sizeof(kw)) return -1;
+        int nr = udp_recv(fd, kw, sizeof(kw));
+        log_info("udp-client", "recv KEY_CONFIRM returned %d (errno=%d)", nr, errno);
+        if (nr < (int)sizeof(kw)) {
+            log_warn("udp-client", "short KEY_CONFIRM: got %d, expected %zu", nr, sizeof(kw));
+            return -1;
+        }
         uint8_t ty, fl, dum[1]; size_t dl;
         if (frame_parse(kw, sizeof(kw), &ty, &fl, dum, &dl,
-                        0, keys->dec_key) != 0 || ty != FRAME_KEYCONFIRM)
+                        0, keys->dec_key) != 0 || ty != FRAME_KEYCONFIRM) {
+            log_warn("udp-client", "KEY_CONFIRM parse failed (ty=%d)", ty);
             return -1;
+        }
     }
 
     /* 9. Send KEY_CONFIRM */
     {
         uint8_t kw[FRAME_MAX_WIRE]; size_t kwl;
         frame_build(kw, &kwl, FRAME_KEYCONFIRM, 0, NULL, 0, 0, keys->enc_key);
-        udp_send(fd, kw, kwl);
+        if (udp_send(fd, kw, kwl) != 0) {
+            log_warn("udp-client", "failed to send KEY_CONFIRM (errno=%d)", errno);
+            return -1;
+        }
     }
 
-    secure_memzero(ee, 32); secure_memzero(es, 32);
-    secure_memzero(se, 32); secure_memzero(sh, 32);
     log_info("udp-client", "handshake complete");
     return 0;
 }
