@@ -2,22 +2,22 @@
  * mode_tun_udp.c — TUN VPN over UDP transport
  *
  * Eliminates TCP-over-TCP head-of-line blocking by using UDP
- * datagrams instead of TCP streams for data transport.
+ * datagrams instead of TCP streams.
  *
- * Handshake reuses the existing TCP-based 3-DH code by using
- * connected UDP sockets (connect() on UDP → send/recv work).
+ * Handshake: custom UDP implementation (cannot reuse TCP handshake
+ * because TCP uses stream-oriented recv_all in multiple steps, which
+ * would truncate UDP datagrams).
  *
- * Data path:  each TUN IP packet → one AEGIS frame → one UDP
- * datagram.  Lost datagrams are handled by inner protocols —
- * guest TCP retransmissions cover any UDP loss.
+ * Data path: each TUN IP packet → one AEGIS frame → one UDP datagram.
  *
  * Usage:
- *   Server:  aegis-tunnel start tun -server -u
- *   Client:  aegis-tunnel start tun -client -u -r server:9000
+ *   Server:  aegis-tunnel start tun -server -U
+ *   Client:  aegis-tunnel start tun -client -U -r server:9000
  */
 
 #include "main.h"
 #include "mode_common.h"
+#include "protocol/ecdh.h"
 #include "protocol/handshake.h"
 #include "tunnel/tun.h"
 #include "tunnel/tunnel.h"
@@ -29,6 +29,7 @@
 #include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <openssl/evp.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdio.h>
@@ -39,10 +40,18 @@
 #include <time.h>
 #include <unistd.h>
 
+static void sha256_h(uint8_t out[32], const uint8_t *in, size_t len) {
+    EVP_MD_CTX *c = EVP_MD_CTX_new(); unsigned int o = 0;
+    EVP_DigestInit_ex(c, EVP_sha256(), NULL);
+    EVP_DigestUpdate(c, in, len);
+    EVP_DigestFinal_ex(c, out, &o);
+    EVP_MD_CTX_free(c);
+}
+
 #define UDP_MAX_DGRAM  65535
 #define UDP_KEEPALIVE  25
 
-/* ─── Shared TUN helpers (same as mode_tun.c) ─────────────────── */
+/* ─── Shared TUN helpers ──────────────────────────────────────── */
 
 static void tun_setup_routing(const char *name, const char *allowed_ips,
                                const char *nat_if, int is_server)
@@ -56,15 +65,245 @@ static void tun_setup_routing(const char *name, const char *allowed_ips,
         tun_allow_forward(name);
     }
 }
-
-static void tun_run_postup(const char *script, const char *name)
-{
-    if (script && script[0]) { tun_exec_script(script, name); }
+static void tun_run_postup(const char *script, const char *name) {
+    if (script && script[0]) tun_exec_script(script, name);
+}
+static void tun_run_postdown(const char *script, const char *name) {
+    if (script && script[0]) tun_exec_script(script, name);
 }
 
-static void tun_run_postdown(const char *script, const char *name)
+/* ─── UDP I/O helpers ─────────────────────────────────────────── */
+
+static int udp_send(int fd, const uint8_t *data, size_t len)
 {
-    if (script && script[0]) { tun_exec_script(script, name); }
+    ssize_t n = send(fd, data, len, 0);
+    return (n == (ssize_t)len) ? 0 : -1;
+}
+
+static int udp_recv(int fd, uint8_t *buf, size_t maxlen)
+{
+    ssize_t n = recv(fd, buf, maxlen, 0);
+    if (n < 0) return -1;
+    return (int)n;
+}
+
+/* ─── UDP handshake: complete datagram based ──────────────────── */
+
+#define UDP_HS_DGRAM  60   /* wire size of one handshake message */
+
+/*
+ * Build a HANDSHAKE init/resp datagram (60 bytes on wire).
+ *   payload = [eph_pub(32)][timestamp(8)] = 40 bytes
+ *   encrypted with the given key → [header(4)][ct(40)][tag(16)] = 60
+ */
+static int udp_hs_build(uint8_t out[UDP_HS_DGRAM],
+                         const uint8_t eph_pub[32], int64_t ts,
+                         const uint8_t key[16])
+{
+    uint8_t payload[40];
+    memcpy(payload, eph_pub, 32);
+    uint64_t tb = (uint64_t)ts;
+    for (int i = 0; i < 8; i++) payload[32 + 7 - i] = (uint8_t)(tb >> (i * 8));
+
+    uint8_t ad[36];
+    out[0] = FRAME_HANDSHAKE; out[1] = FLAG_NONE; out[2] = 0; out[3] = 8;
+    memcpy(ad, out, 4); memcpy(ad + 4, eph_pub, 32);
+
+    uint8_t n[16] = {0};
+    aegis_encrypt(out + 4, out + 44, payload, 40, ad, 36, n, key);
+    return 0;
+}
+
+/*
+ * Parse a HANDSHAKE init/resp datagram.
+ * On success fills eph_pub[32] and *ts (timestamp).
+ * key[16] is the decryption key for this direction.
+ */
+static int udp_hs_parse(const uint8_t dgram[UDP_HS_DGRAM],
+                         uint8_t eph_pub[32], int64_t *ts,
+                         const uint8_t key[16])
+{
+    if (dgram[0] != FRAME_HANDSHAKE) return -1;
+    uint8_t ad[36];
+    memcpy(ad, dgram, 4);
+    memcpy(eph_pub, dgram + 4, 32);
+    memcpy(ad + 4, eph_pub, 32);
+
+    uint8_t pt[40], n[16] = {0};
+    if (aegis_decrypt(pt, dgram + 4, 40, ad, 36, n, key,
+                      dgram + 44) != 0) return -1;
+
+    /* eph_pub = pt[0..31] (already filled) */
+    uint64_t tb = 0;
+    for (int i = 0; i < 8; i++) tb = (tb << 8) | pt[32 + i];
+    *ts = (int64_t)tb;
+    return 0;
+}
+
+/* ─── Full UDP handshake (server side) ────────────────────────── */
+
+static int udp_handshake_server(int fd, session_keys_t *keys, int timeout_ms)
+{
+    (void)timeout_ms;
+    uint8_t dgram[UDP_HS_DGRAM];
+
+    /* 1. Receive HANDSHAKE_INIT (one complete datagram) */
+    if (udp_recv(fd, dgram, sizeof(dgram)) < UDP_HS_DGRAM) return -1;
+
+    /* 2. Extract initiator's ephemeral pubkey (plaintext part of header) */
+    uint8_t iepk[32];
+    memcpy(iepk, dgram + 4, 32);
+
+    /* 3. Try each known peer key */
+    for (int pi = 0; pi < g_peer_count; pi++) {
+        /* Compute init_key = SHA256(X25519(sk,iepk) || X25519(sk,pk) || "init") */
+        uint8_t ee[32], es_init[32], ik[16];
+        ecdh_derive(ee, g_asym_priv, iepk);
+        ecdh_derive(es_init, g_asym_priv, g_asym_peers[pi]);
+        uint8_t b[68]; memcpy(b, ee, 32); memcpy(b + 32, es_init, 32);
+        memcpy(b + 64, "init", 4);
+        uint8_t h[32]; sha256_h(h, b, 68); memcpy(ik, h, 16);
+
+        /* Try decrypting datagram with this init_key */
+        int64_t its;
+        if (udp_hs_parse(dgram, iepk, &its, ik) != 0)
+            continue;  /* wrong peer key */
+
+        /* Verify timestamp */
+        int64_t now = timestamp_now();
+        if (now < 0 || (now > its ? now - its : its - now) > 60)
+            continue;
+
+        /* 4. Generate our ephemeral keypair */
+        uint8_t epk[32], ek[32];
+        if (ecdh_keygen(epk, ek) != 0) continue;
+
+        /* 5. Compute shared secret (3-DH: ee, es, se) */
+        uint8_t es[32], se[32];
+        ecdh_derive(ee, g_asym_priv, iepk);                   /* our_sk × their_eph */
+        ecdh_derive(es, g_asym_priv, g_asym_peers[pi]);       /* our_sk × their_sk  */
+        ecdh_derive(se, ek, g_asym_peers[pi]);                /* our_eph × their_sk */
+        uint8_t sb[102]; memcpy(sb, ee, 32);
+        memcpy(sb + 32, es, 32); memcpy(sb + 64, se, 32);
+        memcpy(sb + 96, "shared", 6);
+        uint8_t sh[32]; sha256_h(sh, sb, 102);
+
+        /* Session keys */
+        uint8_t sk[36]; memcpy(sk, sh, 32);
+        memcpy(sk + 32, "session", 7);
+        sha256_h(h, sk, 36);
+        memcpy(keys->dec_key, h, 16);       /* server dec = client enc */
+        memcpy(keys->enc_key, h + 16, 16);  /* server enc = client dec */
+
+        /* 6. Send HANDSHAKE_RESP */
+        uint8_t rk[16], rkb[36];
+        memcpy(rkb, sh, 32); memcpy(rkb + 32, "resp", 4);
+        sha256_h(h, rkb, 36); memcpy(rk, h, 16);
+        uint8_t rdgram[UDP_HS_DGRAM];
+        udp_hs_build(rdgram, epk, timestamp_now(), rk);
+        udp_send(fd, rdgram, sizeof(rdgram));
+
+        /* 7. Send KEY_CONFIRM */
+        uint8_t kw[FRAME_MAX_WIRE]; size_t kwl;
+        frame_build(kw, &kwl, FRAME_KEYCONFIRM, 0, NULL, 0, 0, keys->enc_key);
+        udp_send(fd, kw, kwl);
+
+        /* 8. Receive client KEY_CONFIRM */
+        uint8_t ckw[FRAME_HEADER_LEN + AEGIS_TAG_LEN];
+        if (udp_recv(fd, ckw, sizeof(ckw)) >= (int)sizeof(ckw)) {
+            uint8_t ty, fl, dum[1]; size_t dl;
+            if (frame_parse(ckw, sizeof(ckw), &ty, &fl, dum, &dl,
+                            0, keys->dec_key) == 0 && ty == FRAME_KEYCONFIRM) {
+                secure_memzero(ee, 32); secure_memzero(es_init, 32);
+                secure_memzero(ek, 32); secure_memzero(sh, 32);
+                log_info("udp-server", "peer #%d authenticated", pi);
+                return 0;
+            }
+        }
+    }
+    return -1;
+}
+
+/* ─── Full UDP handshake (client side) ────────────────────────── */
+
+static int udp_handshake_client(int fd, int peer_idx,
+                                 session_keys_t *keys, int timeout_ms)
+{
+    (void)timeout_ms;
+    uint8_t dgram[UDP_HS_DGRAM];
+    uint8_t h[32];
+
+    /* 1. Generate ephemeral keypair */
+    uint8_t ek[32], epk[32];
+    if (ecdh_keygen(epk, ek) != 0) return -1;
+
+    /* 2. Compute init_key: SHA256(X25519(eph, pk) || X25519(sk, pk) || "init") */
+    uint8_t ee_init[32], es_init[32], ik[16];
+    ecdh_derive(ee_init, ek, g_asym_peers[peer_idx]);            /* eph_sk × static_pk */
+    ecdh_derive(es_init, g_asym_priv, g_asym_peers[peer_idx]);   /* static_sk × static_pk */
+    uint8_t b[68]; memcpy(b, ee_init, 32); memcpy(b + 32, es_init, 32);
+    memcpy(b + 64, "init", 4);
+    sha256_h(h, b, 68); memcpy(ik, h, 16);
+
+    /* 3. Send HANDSHAKE_INIT */
+    udp_hs_build(dgram, epk, timestamp_now(), ik);
+    if (udp_send(fd, dgram, sizeof(dgram)) != 0) return -1;
+
+    /* 4. Receive HANDSHAKE_RESP (one complete datagram) */
+    if (udp_recv(fd, dgram, sizeof(dgram)) < UDP_HS_DGRAM) return -1;
+
+    /* 5. Compute shared secret (needs repk from response, which is in the AD) */
+    uint8_t repk[32];
+    memcpy(repk, dgram + 4, 32);  /* server's ephemeral pubkey (plaintext in AD) */
+
+    uint8_t ee[32], es[32], se[32];
+    ecdh_derive(ee, ek, repk);                               /* eph_sk × eph_pk  */
+    ecdh_derive(es, g_asym_priv, g_asym_peers[peer_idx]);    /* static_sk × static_pk */
+    ecdh_derive(se, g_asym_priv, repk);                      /* static_sk × eph_pk */
+
+    uint8_t sb[102]; memcpy(sb, ee, 32); memcpy(sb + 32, es, 32);
+    memcpy(sb + 64, se, 32); memcpy(sb + 96, "shared", 6);
+    uint8_t sh[32]; sha256_h(sh, sb, 102);
+
+    /* 6. Derive resp_key and decrypt/verify the response */
+    uint8_t rk_buf[36], rk[16];
+    memcpy(rk_buf, sh, 32); memcpy(rk_buf + 32, "resp", 4);
+    sha256_h(h, rk_buf, 36); memcpy(rk, h, 16);
+
+    int64_t rts;
+    if (udp_hs_parse(dgram, repk, &rts, rk) != 0) return -1;
+
+    int64_t now = timestamp_now();
+    if (now < 0 || (now > rts ? now - rts : rts - now) > 60) return -1;
+
+    /* 7. Session keys */
+    uint8_t sk[36]; memcpy(sk, sh, 32);
+    memcpy(sk + 32, "session", 7);
+    sha256_h(h, sk, 36);
+    memcpy(keys->enc_key, h, 16);
+    memcpy(keys->dec_key, h + 16, 16);
+
+    /* 8. Receive server KEY_CONFIRM */
+    {
+        uint8_t kw[FRAME_HEADER_LEN + AEGIS_TAG_LEN];
+        if (udp_recv(fd, kw, sizeof(kw)) < (int)sizeof(kw)) return -1;
+        uint8_t ty, fl, dum[1]; size_t dl;
+        if (frame_parse(kw, sizeof(kw), &ty, &fl, dum, &dl,
+                        0, keys->dec_key) != 0 || ty != FRAME_KEYCONFIRM)
+            return -1;
+    }
+
+    /* 9. Send KEY_CONFIRM */
+    {
+        uint8_t kw[FRAME_MAX_WIRE]; size_t kwl;
+        frame_build(kw, &kwl, FRAME_KEYCONFIRM, 0, NULL, 0, 0, keys->enc_key);
+        udp_send(fd, kw, kwl);
+    }
+
+    secure_memzero(ee, 32); secure_memzero(es, 32);
+    secure_memzero(se, 32); secure_memzero(sh, 32);
+    log_info("udp-client", "handshake complete");
+    return 0;
 }
 
 /* ════════════════════════════════════════════════════════════════
@@ -112,7 +351,6 @@ int mode_tun_udp_server(int listen_port,
     (void)psk; (void)psk_len;
 
     while (g_running) {
-        /* Wait for handshake init from any client */
         uint8_t hdr[64];
         struct sockaddr_in ca; socklen_t alen = sizeof(ca);
         ssize_t nr = recvfrom(udp_fd, hdr, sizeof(hdr), 0,
@@ -120,7 +358,6 @@ int mode_tun_udp_server(int listen_port,
         if (nr < 0) { if (errno == EINTR) continue; break; }
         if (nr < 40 || hdr[0] != FRAME_HANDSHAKE) continue;
 
-        /* Create connected UDP socket for this client */
         int cfd = socket(AF_INET, SOCK_DGRAM, 0);
         if (cfd < 0) continue;
         if (connect(cfd, (struct sockaddr *)&ca, sizeof(ca)) < 0) {
@@ -131,10 +368,9 @@ int mode_tun_udp_server(int listen_port,
         inet_ntop(AF_INET, &ca.sin_addr, ip, sizeof(ip));
         log_info("udp-server", "handshake from %s:%d", ip, ntohs(ca.sin_port));
 
-        /* Re-inject the first datagram into the connected socket */
+        /* Re-inject first datagram into connected socket */
         if (send(cfd, hdr, (size_t)nr, 0) < 0) { close(cfd); continue; }
 
-        /* Fork: child handles this client */
         pid_t pid = fork();
         if (pid < 0) { close(cfd); continue; }
 
@@ -142,28 +378,12 @@ int mode_tun_udp_server(int listen_port,
             close(udp_fd);
             signal(SIGCHLD, SIG_DFL);
 
-            /* Handshake using connected UDP (reuses TCP handshake code) */
             session_keys_t keys;
-            if (try_handshake_server(cfd, &keys, hs_timeout) < 0) {
+            if (udp_handshake_server(cfd, &keys, hs_timeout) < 0) {
                 log_warn("udp-server", "handshake failed");
                 close(cfd); _exit(1);
             }
-            if (handshake_key_confirm_server(cfd, &keys, hs_timeout) != 0) {
-                secure_memzero(&keys, sizeof(keys));
-                close(cfd); _exit(1);
-            }
-            {
-                uint8_t kw[FRAME_HEADER_LEN + AEGIS_TAG_LEN];
-                if (recv_all(cfd, kw, sizeof(kw)) == 0) {
-                    uint8_t ty, fl, dum[1]; size_t dl;
-                    if (frame_parse(kw, sizeof(kw), &ty, &fl, dum, &dl, 0, keys.dec_key) == 0
-                        && ty == FRAME_KEYCONFIRM) {
-                        /* Client KEY_CONFIRM OK */
-                    }
-                }
-            }
 
-            /* Data loop: TUN ↔ UDP */
             uint64_t enc_nonce = 1, dec_nonce = 1;
             int64_t last_ka = (int64_t)time(NULL);
             struct pollfd fds[2];
@@ -175,30 +395,25 @@ int mode_tun_udp_server(int listen_port,
                 int pr = poll(fds, 2, keepalive > 0 ? keepalive * 1000 : 500);
                 if (pr < 0) { if (errno == EINTR) continue; break; }
 
-                /* TUN → UDP */
                 if (fds[0].revents & POLLIN) {
                     for (;;) {
                         uint8_t pkt[FRAME_MAX_PAYLOAD];
                         ssize_t n = read(tun_fd, pkt, sizeof(pkt));
                         if (n < 0) { if (errno == EAGAIN || errno == EWOULDBLOCK) break; goto out; }
                         if (n <= 0) goto out;
-
                         uint8_t wb[FRAME_MAX_WIRE]; size_t wl;
                         if (frame_build(wb, &wl, FRAME_DATA, 0, pkt, (size_t)n, enc_nonce, keys.enc_key) == 0) {
-                            enc_nonce++;
-                            send(cfd, wb, wl, 0);
+                            enc_nonce++; send(cfd, wb, wl, 0);
                         }
                     }
                 }
 
-                /* UDP → TUN */
                 if (fds[1].revents & POLLIN) {
                     for (;;) {
                         uint8_t wb[UDP_MAX_DGRAM];
                         ssize_t n = recv(cfd, wb, sizeof(wb), 0);
                         if (n < 0) { if (errno == EAGAIN || errno == EWOULDBLOCK) break; goto out; }
                         if (n == 0) goto out;
-
                         uint8_t ty, fl, pkt[FRAME_MAX_PAYLOAD]; size_t pl;
                         if (frame_parse(wb, (size_t)n, &ty, &fl, pkt, &pl, dec_nonce, keys.dec_key) == 0) {
                             dec_nonce++;
@@ -211,18 +426,15 @@ int mode_tun_udp_server(int listen_port,
                                 }
                             }
                         }
-                        if (dec_nonce >= UINT64_C(0xFFFFFFFFFFFFFFF0) - 10000) break; /* would need re-key */
                     }
                 }
 
-                /* Keepalive */
                 {
                     int64_t now = (int64_t)time(NULL);
                     if (keepalive > 0 && now - last_ka >= keepalive) {
                         uint8_t kw[FRAME_MAX_WIRE]; size_t kwl;
                         if (frame_build(kw, &kwl, FRAME_KEEPALIVE, 0, NULL, 0, enc_nonce, keys.enc_key) == 0) {
-                            enc_nonce++;
-                            send(cfd, kw, kwl, 0);
+                            enc_nonce++; send(cfd, kw, kwl, 0);
                         }
                         last_ka = now;
                     }
@@ -274,17 +486,13 @@ int mode_tun_udp_client(const char *remote_host, int remote_port,
              name, tun_ip && tun_ip[0] ? tun_ip : "dhcp", tun_netmask,
              remote_host, remote_port);
 
-    /* Reconnect loop */
     while (g_running) {
-        /* Create UDP socket + connect to server */
         int udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
         if (udp_fd < 0) { sleep(1); continue; }
 
-        /* Resolve server address */
         struct addrinfo hints, *res;
         memset(&hints, 0, sizeof(hints));
-        hints.ai_family = AF_INET;
-        hints.ai_socktype = SOCK_DGRAM;
+        hints.ai_family = AF_INET; hints.ai_socktype = SOCK_DGRAM;
         char ps[16]; snprintf(ps, sizeof(ps), "%d", remote_port);
         if (getaddrinfo(remote_host, ps, &hints, &res) != 0 || !res) {
             close(udp_fd); sleep(2); continue;
@@ -294,17 +502,14 @@ int mode_tun_udp_client(const char *remote_host, int remote_port,
         }
         freeaddrinfo(res);
 
-        /* Handshake over connected UDP */
         session_keys_t keys;
-        if (handshake_client(udp_fd, g_asym_priv, g_asym_peers[0], hs_timeout, &keys) != 0 ||
-            handshake_key_confirm_client(udp_fd, &keys, hs_timeout) != 0) {
+        if (udp_handshake_client(udp_fd, 0, &keys, hs_timeout) != 0) {
             log_warn("udp-client", "handshake failed");
             close(udp_fd); sleep(2); continue;
         }
 
         log_info("udp-client", "connected");
 
-        /* Data loop */
         uint64_t enc_nonce = 1, dec_nonce = 1;
         int64_t last_ka = (int64_t)time(NULL);
         struct pollfd fds[2];
@@ -324,8 +529,7 @@ int mode_tun_udp_client(const char *remote_host, int remote_port,
                     if (n <= 0) goto disconnect;
                     uint8_t wb[FRAME_MAX_WIRE]; size_t wl;
                     if (frame_build(wb, &wl, FRAME_DATA, 0, pkt, (size_t)n, enc_nonce, keys.enc_key) == 0) {
-                        enc_nonce++;
-                        send(udp_fd, wb, wl, 0);
+                        enc_nonce++; send(udp_fd, wb, wl, 0);
                     }
                 }
             }
@@ -356,8 +560,7 @@ int mode_tun_udp_client(const char *remote_host, int remote_port,
                 if (keepalive > 0 && now - last_ka >= keepalive) {
                     uint8_t kw[FRAME_MAX_WIRE]; size_t kwl;
                     if (frame_build(kw, &kwl, FRAME_KEEPALIVE, 0, NULL, 0, enc_nonce, keys.enc_key) == 0) {
-                        enc_nonce++;
-                        send(udp_fd, kw, kwl, 0);
+                        enc_nonce++; send(udp_fd, kw, kwl, 0);
                     }
                     last_ka = now;
                 }
@@ -366,7 +569,7 @@ int mode_tun_udp_client(const char *remote_host, int remote_port,
     disconnect:
         secure_memzero(&keys, sizeof(keys));
         close(udp_fd);
-        log_info("udp-client", "disconnected, reconnecting in 2s...");
+        log_info("udp-client", "disconnected, reconnecting...");
         sleep(2);
     }
 
