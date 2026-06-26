@@ -96,46 +96,75 @@ static int udp_recv(int fd, uint8_t *buf, size_t maxlen)
  *   payload = [eph_pub(32)][timestamp(8)] = 40 bytes
  *   encrypted with the given key → [header(4)][ct(40)][tag(16)] = 60
  */
+/*
+ * Build a HANDSHAKE init/resp datagram (60 bytes on wire).
+ *
+ * Matches the TCP handshake wire format (handshake.c asym_send):
+ *   [type:1][flags:1][len:2 BE][eph_pub:32 CLEAR][enc_ts:8][tag:16]
+ *
+ * The ephemeral public key is sent in the clear (bytes 4..35).
+ * Only the 8-byte timestamp is encrypted.  The receiver extracts
+ * the plaintext eph_pub to compute the decryption key before
+ * attempting to decrypt the timestamp — this works because the
+ * eph_pub is part of the AD, and AEGIS authenticates the AD.
+ */
 static int udp_hs_build(uint8_t out[UDP_HS_DGRAM],
                          const uint8_t eph_pub[32], int64_t ts,
                          const uint8_t key[16])
 {
-    uint8_t payload[40];
-    memcpy(payload, eph_pub, 32);
-    uint64_t tb = (uint64_t)ts;
-    for (int i = 0; i < 8; i++) payload[32 + 7 - i] = (uint8_t)(tb >> (i * 8));
+    /* Header */
+    out[0] = FRAME_HANDSHAKE;   /* type */
+    out[1] = FLAG_NONE;         /* flags */
+    out[2] = 0;                 /* length hi — 8 bytes of encrypted timestamp */
+    out[3] = 8;                 /* length lo */
 
+    /* eph_pub in the clear at bytes 4..35 (same as TCP handshake) */
+    memcpy(out + 4, eph_pub, 32);
+
+    /* AD = header(4) || eph_pub_plaintext(32) = 36 bytes */
     uint8_t ad[36];
-    out[0] = FRAME_HANDSHAKE; out[1] = FLAG_NONE; out[2] = 0; out[3] = 8;
-    memcpy(ad, out, 4); memcpy(ad + 4, eph_pub, 32);
+    memcpy(ad, out, 4);
+    memcpy(ad + 4, eph_pub, 32);
+
+    /* Encrypt timestamp only (8 bytes at offset 36, tag at offset 44) */
+    uint8_t tsb[8];
+    uint64_t tb = (uint64_t)ts;
+    for (int i = 0; i < 8; i++) tsb[7 - i] = (uint8_t)(tb >> (i * 8));
 
     uint8_t n[16] = {0};
-    aegis_encrypt(out + 4, out + 44, payload, 40, ad, 36, n, key);
+    aegis_encrypt(out + 36, out + 44, tsb, 8, ad, 36, n, key);
     return 0;
 }
 
 /*
  * Parse a HANDSHAKE init/resp datagram.
+ *
+ * Reads the plaintext eph_pub from bytes 4..35, builds the AD,
+ * then decrypts the timestamp at bytes 36..43 using the given key.
  * On success fills eph_pub[32] and *ts (timestamp).
- * key[16] is the decryption key for this direction.
  */
 static int udp_hs_parse(const uint8_t dgram[UDP_HS_DGRAM],
                          uint8_t eph_pub[32], int64_t *ts,
                          const uint8_t key[16])
 {
     if (dgram[0] != FRAME_HANDSHAKE) return -1;
+
+    /* eph_pub is plaintext at bytes 4..35 */
+    memcpy(eph_pub, dgram + 4, 32);
+
+    /* AD = header(4) || eph_pub_plaintext(32) = 36 bytes */
     uint8_t ad[36];
     memcpy(ad, dgram, 4);
-    memcpy(eph_pub, dgram + 4, 32);
     memcpy(ad + 4, eph_pub, 32);
 
-    uint8_t pt[40], n[16] = {0};
-    if (aegis_decrypt(pt, dgram + 4, 40, ad, 36, n, key,
+    /* Decrypt timestamp (8 bytes of ciphertext at offset 36, tag at 44) */
+    uint8_t tsb[8], n[16] = {0};
+    if (aegis_decrypt(tsb, dgram + 36, 8, ad, 36, n, key,
                       dgram + 44) != 0) return -1;
 
-    /* eph_pub = pt[0..31] (already filled) */
+    /* Parse timestamp from big-endian */
     uint64_t tb = 0;
-    for (int i = 0; i < 8; i++) tb = (tb << 8) | pt[32 + i];
+    for (int i = 0; i < 8; i++) tb = (tb << 8) | tsb[i];
     *ts = (int64_t)tb;
     return 0;
 }
