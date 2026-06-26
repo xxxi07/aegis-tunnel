@@ -361,7 +361,11 @@ static int udp_handshake_client(int fd, int peer_idx,
 
     {
         uint8_t ee[32], es[32], se[32];
-        ecdh_derive(ee, ek, repk);                               /* eph_sk × eph_pk  */
+        /* 3-DH must match server's computation (handshake.c asym_shared):
+         *   ee = X25519(eph_c, static_s)     ← was incorrectly eph_c × eph_s
+         *   es = X25519(static_c, static_s)
+         *   se = X25519(static_c, eph_s) */
+        ecdh_derive(ee, ek, g_asym_peers[peer_idx]);             /* eph_sk × static_pk */
         ecdh_derive(es, g_asym_priv, g_asym_peers[peer_idx]);    /* static_sk × static_pk */
         ecdh_derive(se, g_asym_priv, repk);                      /* static_sk × eph_pk */
 
