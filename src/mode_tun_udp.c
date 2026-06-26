@@ -564,6 +564,7 @@ int mode_tun_udp_server(int listen_port,
         /* ── UDP → TUN ── */
         if (fds[0].revents & POLLIN) {
             for (;;) {
+                if (!g_running) break;
                 uint8_t buf[UDP_MAX_DGRAM];
                 struct sockaddr_in sender;
                 socklen_t slen = sizeof(sender);
@@ -669,12 +670,20 @@ int mode_tun_udp_server(int listen_port,
                                 }
                                 log_info("udp-server", "KEY_CONFIRM sent, waiting...");
 
-                                /* Receive client KEY_CONFIRM */
+                                /* Receive client KEY_CONFIRM (with g_running poll) */
                                 {
                                     uint8_t ckw[FRAME_HEADER_LEN + AEGIS_TAG_LEN];
-                                    /* Blocking recvfrom — only this handshake matters now */
-                                    ssize_t cnr = recvfrom(udp_fd, ckw, sizeof(ckw), 0,
-                                                           (struct sockaddr *)&sender, &slen);
+                                    ssize_t cnr = -1;
+                                    while (g_running) {
+                                        struct pollfd pfd;
+                                        pfd.fd = udp_fd; pfd.events = POLLIN;
+                                        int pr = poll(&pfd, 1, 500);
+                                        if (pr < 0) { if (errno == EINTR) continue; break; }
+                                        if (pr == 0) continue;  /* timeout — check g_running */
+                                        cnr = recvfrom(udp_fd, ckw, sizeof(ckw), 0,
+                                                       (struct sockaddr *)&sender, &slen);
+                                        break;
+                                    }
                                     if (cnr >= (ssize_t)sizeof(ckw)) {
                                         uint8_t ty, fl, dum[1]; size_t dl;
                                         if (frame_parse(ckw, sizeof(ckw), &ty, &fl,
@@ -757,6 +766,7 @@ int mode_tun_udp_server(int listen_port,
         /* ── TUN → UDP ── */
         if (fds[1].revents & POLLIN) {
             for (;;) {
+                if (!g_running) break;
                 uint8_t pkt[FRAME_MAX_PAYLOAD];
                 ssize_t n = read(tun_fd, pkt, sizeof(pkt));
                 if (n < 0) {
