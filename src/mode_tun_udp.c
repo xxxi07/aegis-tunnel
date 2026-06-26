@@ -142,13 +142,27 @@ static int udp_hs_parse(const uint8_t dgram[UDP_HS_DGRAM],
 
 /* ─── Full UDP handshake (server side) ────────────────────────── */
 
-static int udp_handshake_server(int fd, session_keys_t *keys, int timeout_ms)
+/*
+ * Server-side UDP handshake.
+ *
+ * If first_dgram is non-NULL, it contains the already-read HANDSHAKE_INIT
+ * datagram (passed from the parent via a pipe, since the parent consumes
+ * it from the shared UDP socket via recvfrom to learn the client address).
+ * Otherwise the function reads the first datagram from fd directly.
+ */
+static int udp_handshake_server(int fd, session_keys_t *keys, int timeout_ms,
+                                 const uint8_t *first_dgram, size_t first_len)
 {
     (void)timeout_ms;
     uint8_t dgram[UDP_HS_DGRAM];
 
-    /* 1. Receive HANDSHAKE_INIT (one complete datagram) */
-    if (udp_recv(fd, dgram, sizeof(dgram)) < UDP_HS_DGRAM) return -1;
+    /* 1. Get HANDSHAKE_INIT (either pre-read or from socket) */
+    if (first_dgram) {
+        if (first_len < UDP_HS_DGRAM) return -1;
+        memcpy(dgram, first_dgram, UDP_HS_DGRAM);
+    } else {
+        if (udp_recv(fd, dgram, sizeof(dgram)) < UDP_HS_DGRAM) return -1;
+    }
 
     /* 2. Extract initiator's ephemeral pubkey (plaintext part of header) */
     uint8_t iepk[32];
@@ -351,35 +365,80 @@ int mode_tun_udp_server(int listen_port,
     (void)psk; (void)psk_len;
 
     while (g_running) {
-        uint8_t hdr[64];
+        uint8_t hdr[UDP_HS_DGRAM];
         struct sockaddr_in ca; socklen_t alen = sizeof(ca);
         ssize_t nr = recvfrom(udp_fd, hdr, sizeof(hdr), 0,
                               (struct sockaddr *)&ca, &alen);
         if (nr < 0) { if (errno == EINTR) continue; break; }
-        if (nr < 40 || hdr[0] != FRAME_HANDSHAKE) continue;
+        if (nr < UDP_HS_DGRAM || hdr[0] != FRAME_HANDSHAKE) continue;
 
-        int cfd = socket(AF_INET, SOCK_DGRAM, 0);
-        if (cfd < 0) continue;
-        if (connect(cfd, (struct sockaddr *)&ca, sizeof(ca)) < 0) {
-            close(cfd); continue;
+        /* Anti-DoS: rate-limit handshake attempts per source IP */
+        {
+            char rip[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, &ca.sin_addr, rip, sizeof(rip));
+            if (handshake_rate_check(rip, (int64_t)time(NULL)) < 0)
+                continue;
         }
 
-        char ip[INET_ADDRSTRLEN];
-        inet_ntop(AF_INET, &ca.sin_addr, ip, sizeof(ip));
-        log_info("udp-server", "handshake from %s:%d", ip, ntohs(ca.sin_port));
+        /*
+         * Pass the first datagram to the child via a pipe.
+         * We cannot use send() on a connected UDP socket to "re-inject"
+         * the datagram — send() delivers to the peer, not to our own
+         * receive queue.  A pipe is the correct IPC primitive here.
+         */
+        int pipe_fds[2];
+        if (pipe(pipe_fds) < 0) continue;
 
-        /* Re-inject first datagram into connected socket */
-        if (send(cfd, hdr, (size_t)nr, 0) < 0) { close(cfd); continue; }
+        /* Write the pre-read datagram into the pipe */
+        {
+            size_t w = 0;
+            while (w < (size_t)nr) {
+                ssize_t nw = write(pipe_fds[1], hdr + w, (size_t)nr - w);
+                if (nw < 0) {
+                    if (errno == EINTR) continue;
+                    break;
+                }
+                w += (size_t)nw;
+            }
+            if (w < (size_t)nr) { close(pipe_fds[0]); close(pipe_fds[1]); continue; }
+        }
+
+        int cfd = socket(AF_INET, SOCK_DGRAM, 0);
+        if (cfd < 0) { close(pipe_fds[0]); close(pipe_fds[1]); continue; }
+        if (connect(cfd, (struct sockaddr *)&ca, sizeof(ca)) < 0) {
+            close(cfd); close(pipe_fds[0]); close(pipe_fds[1]); continue;
+        }
+
+        {
+            char ip[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, &ca.sin_addr, ip, sizeof(ip));
+            log_info("udp-server", "handshake from %s:%d", ip, ntohs(ca.sin_port));
+        }
 
         pid_t pid = fork();
-        if (pid < 0) { close(cfd); continue; }
+        if (pid < 0) {
+            close(cfd); close(pipe_fds[0]); close(pipe_fds[1]); continue;
+        }
 
         if (pid == 0) {
+            close(pipe_fds[1]);   /* child doesn't write */
             close(udp_fd);
             signal(SIGCHLD, SIG_DFL);
 
+            /* Read the first datagram from the pipe */
+            uint8_t first_dgram[UDP_HS_DGRAM];
+            size_t rd = 0;
+            while (rd < UDP_HS_DGRAM) {
+                ssize_t n = read(pipe_fds[0], first_dgram + rd, UDP_HS_DGRAM - rd);
+                if (n < 0) { if (errno == EINTR) continue; close(pipe_fds[0]); close(cfd); _exit(1); }
+                if (n == 0) { close(pipe_fds[0]); close(cfd); _exit(1); }
+                rd += (size_t)n;
+            }
+            close(pipe_fds[0]);
+
             session_keys_t keys;
-            if (udp_handshake_server(cfd, &keys, hs_timeout) < 0) {
+            if (udp_handshake_server(cfd, &keys, hs_timeout,
+                                      first_dgram, UDP_HS_DGRAM) < 0) {
                 log_warn("udp-server", "handshake failed");
                 close(cfd); _exit(1);
             }
@@ -450,7 +509,7 @@ int mode_tun_udp_server(int listen_port,
             close(cfd); close(tun_fd);
             _exit(0);
         }
-        close(cfd);
+        close(cfd); close(pipe_fds[0]); close(pipe_fds[1]);
         while (waitpid(-1, NULL, WNOHANG) > 0) {}
     }
 
