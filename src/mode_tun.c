@@ -269,7 +269,8 @@ static int tun_client_multipath(int tun_fd, const char *name,
             close(tun_fd);
             for (int j = 0; j < i; j++) {
                 close(sp_fds[j][0]); close(sp_fds[j][1]);
-                if (tcp_fds[j] >= 0) close(tcp_fds[j]);
+                /* DO NOT close tcp_fds[j] — the OS may have reused
+                 * the fd number for a later path's connection */
             }
             tunnel_t tun;
             tunnel_init(&tun, sp_fds[i][1], tcp_fds[i],
