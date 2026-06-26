@@ -529,6 +529,9 @@ int mode_tun_udp_server(int listen_port,
     int udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (udp_fd < 0) { close(tun_fd); return 1; }
     {
+        /* Non-blocking: drain loop must break on EAGAIN, not hang */
+        int fl = fcntl(udp_fd, F_GETFL, 0);
+        if (fl >= 0) fcntl(udp_fd, F_SETFL, fl | O_NONBLOCK);
         int reuse = 1;
         setsockopt(udp_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
         struct sockaddr_in sa; memset(&sa, 0, sizeof(sa));
@@ -931,6 +934,13 @@ int mode_tun_udp_client(const char *remote_host, int remote_port,
         }
 
         log_info("udp-client", "connected");
+
+        /* Non-blocking for the data-path drain loop.  Handshake needed
+         * blocking recv() — now we switch to poll-driven I/O. */
+        {
+            int fl = fcntl(udp_fd, F_GETFL, 0);
+            if (fl >= 0) fcntl(udp_fd, F_SETFL, fl | O_NONBLOCK);
+        }
 
         /*
          * UDP data path uses explicit-nonce frames: each datagram
