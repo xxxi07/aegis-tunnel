@@ -103,7 +103,10 @@ static void tun_run_postdown(const char *script, const char *name)
  */
 
 /* Extract destination IPv4 address from an IP packet.
- * Returns the 32-bit address in network byte order, or 0 on error. */
+ * Returns the 32-bit address in host byte order, or 0 on error.
+ * IP headers use network byte order (big-endian); ntohl() converts
+ * to host byte order so the result can be compared with g_peer_tun_ips
+ * (which is also stored in host byte order via bit-shift construction). */
 static uint32_t ip_dst_addr(const uint8_t *pkt, size_t len)
 {
     if (len < 20) return 0;
@@ -112,8 +115,8 @@ static uint32_t ip_dst_addr(const uint8_t *pkt, size_t len)
     int ihl = (int)(ver_ihl & 0x0f) * 4;
     if (ihl < 20 || (size_t)ihl > len) return 0;
     uint32_t addr;
-    memcpy(&addr, pkt + 16, 4);                   /* dst at offset 16 */
-    return addr;
+    memcpy(&addr, pkt + 16, 4);                   /* dst at offset 16 (network order) */
+    return ntohl(addr);                           /* convert to host byte order */
 }
 
 /* Find the client slot whose peer_ip matches the given address.
