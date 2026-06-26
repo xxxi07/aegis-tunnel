@@ -539,27 +539,43 @@ int mode_tun_udp_server(int listen_port,
         }
 
         /*
-         * Create a connected UDP socket for receiving from this client.
+         * Create a per-client connected UDP socket.
          *
-         * Sending still uses the original udp_fd (via sendto) so the
-         * source port remains listen_port.  The client's socket is
-         * connect()'d to server:listen_port; recv() on a connected UDP
-         * socket silently drops datagrams from any other source port.
+         * We MUST bind cfd to listen_port so it can RECEIVE datagrams
+         * addressed to server:listen_port.  Without this, incoming
+         * datagrams go to udp_fd (the only socket bound to :listen_port)
+         * and recv(cfd) never sees them.
          *
-         * We do NOT bind cfd here — binding two UDP sockets to the
-         * exact same (INADDR_ANY, listen_port) requires SO_REUSEPORT
-         * (Linux ≥ 3.9), which may not be available.  Instead the
-         * child keeps udp_fd open and uses sendto() for all outgoing
-         * traffic, guaranteeing the correct source port.
+         * SO_REUSEADDR alone is insufficient for binding two sockets to
+         * the exact same (INADDR_ANY, listen_port).  SO_REUSEPORT (15,
+         * Linux ≥ 3.9) is required.  On kernels without SO_REUSEPORT
+         * the bind will fail; we fall back to manual recvfrom+filtering
+         * on udp_fd by passing cfd=-1 to the handshake.
          */
         int cfd = socket(AF_INET, SOCK_DGRAM, 0);
         if (cfd < 0) { close(pipe_fds[0]); close(pipe_fds[1]); continue; }
-        /* connect() on a UDP socket sets the default destination AND
-         * installs a kernel-level filter: recv() only returns datagrams
-         * from the connected (peer_addr, peer_port).  This gives us
-         * per-client receive isolation without SO_REUSEPORT. */
-        if (connect(cfd, (struct sockaddr *)&ca, sizeof(ca)) < 0) {
-            close(cfd); close(pipe_fds[0]); close(pipe_fds[1]); continue;
+        {
+            int reuse = 1;
+            setsockopt(cfd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+            setsockopt(cfd, SOL_SOCKET, 15 /* SO_REUSEPORT */, &reuse, sizeof(reuse));
+            struct sockaddr_in bind_addr;
+            memset(&bind_addr, 0, sizeof(bind_addr));
+            bind_addr.sin_family = AF_INET;
+            bind_addr.sin_addr.s_addr = INADDR_ANY;
+            bind_addr.sin_port = htons((uint16_t)listen_port);
+            if (bind(cfd, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) < 0) {
+                /* SO_REUSEPORT not available → can't use connected socket
+                 * for receiving.  Fall back: use udp_fd for everything,
+                 * filtering incoming datagrams by source address. */
+                log_info("udp-server", "SO_REUSEPORT unavailable, using recvfrom fallback");
+                close(cfd);
+                cfd = -1;
+            }
+        }
+        if (cfd >= 0) {
+            if (connect(cfd, (struct sockaddr *)&ca, sizeof(ca)) < 0) {
+                close(cfd); close(pipe_fds[0]); close(pipe_fds[1]); continue;
+            }
         }
 
         {
