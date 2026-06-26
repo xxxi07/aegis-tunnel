@@ -284,6 +284,11 @@ static int tun_client_multipath(int tun_fd, const char *name,
         /* Parent: keep sp[0], discard sp[1] and tcp_fd (tcp is now owned by child) */
         close(sp_fds[i][1]);
         if (i > 0 || first_fd < 0) close(tcp_fds[i]);
+        /* Non-blocking: SEQPACKET reads must not stall the parent poll loop */
+        {
+            int fl = fcntl(sp_fds[i][0], F_GETFL, 0);
+            if (fl >= 0) fcntl(sp_fds[i][0], F_SETFL, fl | O_NONBLOCK);
+        }
         tcp_fds[i] = -1;
         pids[i]  = pid;
         opened++;
