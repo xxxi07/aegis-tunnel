@@ -231,10 +231,13 @@ static int udp_handshake_server(int fd, session_keys_t *keys, int timeout_ms,
         memcpy(sb + 96, "shared", 6);
         uint8_t sh[32]; sha256_h(sh, sb, 102);
 
-        /* Session keys */
-        uint8_t sk[36]; memcpy(sk, sh, 32);
-        memcpy(sk + 32, "session", 7);
-        sha256_h(h, sk, 36);
+        /* Session keys: SHA256(sh(32) || "session"(7)) = 39 bytes */
+        {
+            uint8_t sk[39];
+            memcpy(sk, sh, 32);
+            memcpy(sk + 32, "session", 7);
+            sha256_h(h, sk, 39);
+        }
         memcpy(keys->dec_key, h, 16);       /* server dec = client enc */
         memcpy(keys->enc_key, h + 16, 16);  /* server enc = client dec */
 
@@ -319,10 +322,13 @@ static int udp_handshake_client(int fd, int peer_idx,
     int64_t now = timestamp_now();
     if (now < 0 || (now > rts ? now - rts : rts - now) > 60) return -1;
 
-    /* 7. Session keys */
-    uint8_t sk[36]; memcpy(sk, sh, 32);
-    memcpy(sk + 32, "session", 7);
-    sha256_h(h, sk, 36);
+    /* 7. Session keys: SHA256(sh(32) || "session"(7)) = 39 bytes */
+    {
+        uint8_t sk[39];
+        memcpy(sk, sh, 32);
+        memcpy(sk + 32, "session", 7);
+        sha256_h(h, sk, 39);
+    }
     memcpy(keys->enc_key, h, 16);
     memcpy(keys->dec_key, h + 16, 16);
 
