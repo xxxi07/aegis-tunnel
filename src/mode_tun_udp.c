@@ -208,35 +208,18 @@ static int udp_hs_parse(const uint8_t dgram[UDP_HS_DGRAM],
  * it from the shared UDP socket via recvfrom to learn the client address).
  * Otherwise the function reads the first datagram from fd directly.
  */
-/*
- * When send_fd >= 0 and dest is non-NULL, all outgoing datagrams are
- * sent via sendto(send_fd, ..., dest) so the source port matches the
- * main listen socket.  recv_fd is used for all incoming datagrams.
- */
-static int udp_handshake_server(int recv_fd, session_keys_t *keys, int timeout_ms,
-                                 const uint8_t *first_dgram, size_t first_len,
-                                 int send_fd, const struct sockaddr_in *dest)
+static int udp_handshake_server(int fd, session_keys_t *keys, int timeout_ms,
+                                 const uint8_t *first_dgram, size_t first_len)
 {
     (void)timeout_ms;
     uint8_t dgram[UDP_HS_DGRAM];
-    /* Pick the right send helper */
-    int (*hs_send)(int, const uint8_t*, size_t, const struct sockaddr_in*);
-    if (send_fd >= 0 && dest)
-        hs_send = (void*)udp_sendto;
-    else
-        hs_send = (void*)udp_send;
-    (void)hs_send;  /* used via the function pointer below */
-#define SEND(data, len) \
-    ((send_fd >= 0 && dest) \
-        ? udp_sendto(send_fd, (data), (len), dest) \
-        : udp_send(recv_fd, (data), (len)))
 
     /* 1. Get HANDSHAKE_INIT (either pre-read or from socket) */
     if (first_dgram) {
         if (first_len < UDP_HS_DGRAM) return -1;
         memcpy(dgram, first_dgram, UDP_HS_DGRAM);
     } else {
-        if (udp_recv(recv_fd, dgram, sizeof(dgram)) < UDP_HS_DGRAM) return -1;
+        if (udp_recv(fd, dgram, sizeof(dgram)) < UDP_HS_DGRAM) return -1;
     }
 
     /* 2. Extract initiator's ephemeral pubkey (plaintext part of header) */
@@ -296,7 +279,7 @@ static int udp_handshake_server(int recv_fd, session_keys_t *keys, int timeout_m
             sha256_h(h, rkb, 36); memcpy(rk, h, 16);
             uint8_t rdgram[UDP_HS_DGRAM];
             udp_hs_build(rdgram, epk, timestamp_now(), rk);
-            if (SEND(rdgram, sizeof(rdgram)) != 0) {
+            if (udp_send(fd, rdgram, sizeof(rdgram)) != 0) {
                 log_warn("udp-server", "failed to send RESP (errno=%d)", errno);
                 continue;
             }
@@ -307,7 +290,7 @@ static int udp_handshake_server(int recv_fd, session_keys_t *keys, int timeout_m
         {
             uint8_t kw[FRAME_MAX_WIRE]; size_t kwl;
             frame_build(kw, &kwl, FRAME_KEYCONFIRM, 0, NULL, 0, 0, keys->enc_key);
-            if (SEND(kw, kwl) != 0) {
+            if (udp_send(fd, kw, kwl) != 0) {
                 log_warn("udp-server", "failed to send KEY_CONFIRM (errno=%d)", errno);
                 continue;
             }
@@ -318,10 +301,7 @@ static int udp_handshake_server(int recv_fd, session_keys_t *keys, int timeout_m
         {
             uint8_t ckw[FRAME_HEADER_LEN + AEGIS_TAG_LEN];
             int nr;
-            if (recv_fd >= 0)
-                nr = udp_recv(recv_fd, ckw, sizeof(ckw));
-            else
-                nr = udp_recv_peer(send_fd, ckw, sizeof(ckw), dest);
+            nr = udp_recv(fd, ckw, sizeof(ckw));
             log_info("udp-server", "recv returned %d (errno=%d)", nr, errno);
             if (nr >= (int)sizeof(ckw)) {
                 uint8_t ty, fl, dum[1]; size_t dl;
@@ -491,9 +471,18 @@ int mode_tun_udp_server(int listen_port,
     tun_setup_routing(name, tun_route, tun_nat_if, 1 /* server */);
     tun_run_postup(postup, name);
 
+    /*
+     * Main listen socket.  Set SO_REUSEPORT BEFORE bind() so that
+     * per-client connected sockets (cfd) can later bind to the same
+     * (INADDR_ANY, listen_port).  Linux requires SO_REUSEPORT on ALL
+     * sockets that share the exact same address:port combination.
+     */
     int udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (udp_fd < 0) { close(tun_fd); return 1; }
     {
+        int reuse = 1;
+        setsockopt(udp_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+        setsockopt(udp_fd, SOL_SOCKET, 15 /* SO_REUSEPORT */, &reuse, sizeof(reuse));
         struct sockaddr_in sa; memset(&sa, 0, sizeof(sa));
         sa.sin_family = AF_INET;
         sa.sin_addr.s_addr = INADDR_ANY;
@@ -526,80 +515,64 @@ int mode_tun_udp_server(int listen_port,
         }
 
         /*
-         * Pass the first datagram AND the client address to the child
-         * via a pipe.  We write:
-         *   1. struct sockaddr_in (client address — 16 bytes)
-         *   2. handshake datagram (UDP_HS_DGRAM bytes)
-         * The child needs the address for sendto() on the shared udp_fd,
-         * which preserves the listen port as the source port.
+         * Pass the first datagram to the child via a pipe.
          */
         int pipe_fds[2];
         if (pipe(pipe_fds) < 0) continue;
 
-        /* Write client address + datagram into the pipe */
+        /* Write the pre-read datagram into the pipe */
         {
             size_t w = 0;
-            /* 1. Client address */
-            {
-                const uint8_t *p = (const uint8_t *)&ca;
-                size_t addrlen = sizeof(ca);
-                while (w < addrlen) {
-                    ssize_t nw = write(pipe_fds[1], p + w, addrlen - w);
-                    if (nw < 0) { if (errno == EINTR) continue; break; }
-                    w += (size_t)nw;
+            while (w < (size_t)nr) {
+                ssize_t nw = write(pipe_fds[1], hdr + w, (size_t)nr - w);
+                if (nw < 0) {
+                    if (errno == EINTR) continue;
+                    break;
                 }
-                if (w < addrlen) { close(pipe_fds[0]); close(pipe_fds[1]); continue; }
+                w += (size_t)nw;
             }
-            /* 2. Datagram */
-            {
-                size_t dw = 0;
-                while (dw < (size_t)nr) {
-                    ssize_t nw = write(pipe_fds[1], hdr + dw, (size_t)nr - dw);
-                    if (nw < 0) { if (errno == EINTR) continue; break; }
-                    dw += (size_t)nw;
-                }
-                if (dw < (size_t)nr) { close(pipe_fds[0]); close(pipe_fds[1]); continue; }
-            }
+            if (w < (size_t)nr) { close(pipe_fds[0]); close(pipe_fds[1]); continue; }
         }
 
         /*
-         * Create a per-client connected UDP socket.
-         *
-         * We MUST bind cfd to listen_port so it can RECEIVE datagrams
-         * addressed to server:listen_port.  Without this, incoming
-         * datagrams go to udp_fd (the only socket bound to :listen_port)
-         * and recv(cfd) never sees them.
-         *
-         * SO_REUSEADDR alone is insufficient for binding two sockets to
-         * the exact same (INADDR_ANY, listen_port).  SO_REUSEPORT (15,
-         * Linux ≥ 3.9) is required.  On kernels without SO_REUSEPORT
-         * the bind will fail; we fall back to manual recvfrom+filtering
-         * on udp_fd by passing cfd=-1 to the handshake.
+         * Per-client connected UDP socket.
+         * Both udp_fd and cfd need SO_REUSEPORT set BEFORE bind().
+         * On Linux ≥ 3.9 the connected socket receives only its
+         * peer's datagrams; the unconnected udp_fd gets the rest.
          */
         int cfd = socket(AF_INET, SOCK_DGRAM, 0);
         if (cfd < 0) { close(pipe_fds[0]); close(pipe_fds[1]); continue; }
         {
             int reuse = 1;
-            setsockopt(cfd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
-            setsockopt(cfd, SOL_SOCKET, 15 /* SO_REUSEPORT */, &reuse, sizeof(reuse));
-            struct sockaddr_in bind_addr;
-            memset(&bind_addr, 0, sizeof(bind_addr));
-            bind_addr.sin_family = AF_INET;
-            bind_addr.sin_addr.s_addr = INADDR_ANY;
-            bind_addr.sin_port = htons((uint16_t)listen_port);
-            if (bind(cfd, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) < 0) {
-                /* SO_REUSEPORT not available → can't use connected socket
-                 * for receiving.  Fall back: use udp_fd for everything,
-                 * filtering incoming datagrams by source address. */
-                log_info("udp-server", "SO_REUSEPORT unavailable, using recvfrom fallback");
-                close(cfd);
-                cfd = -1;
+            int ok = 1;
+            if (setsockopt(cfd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) < 0)
+                ok = 0;
+            if (setsockopt(cfd, SOL_SOCKET, 15 /* SO_REUSEPORT */, &reuse, sizeof(reuse)) < 0) {
+                /* setsockopt SO_REUSEPORT may fail with ENOPROTOOPT on
+                 * kernels that don't support it.  Without it, bind()
+                 * will also fail — there is no viable fallback that
+                 * avoids racing with the parent's recvfrom on udp_fd. */
+                log_warn("udp-server", "SO_REUSEPORT not supported by kernel");
+                ok = 0;
+            }
+            if (ok) {
+                struct sockaddr_in bind_addr;
+                memset(&bind_addr, 0, sizeof(bind_addr));
+                bind_addr.sin_family = AF_INET;
+                bind_addr.sin_addr.s_addr = INADDR_ANY;
+                bind_addr.sin_port = htons((uint16_t)listen_port);
+                if (bind(cfd, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) < 0) {
+                    log_warn("udp-server", "bind cfd:9000 failed: %s", strerror(errno));
+                    ok = 0;
+                }
+            }
+            if (!ok) {
+                close(cfd); close(pipe_fds[0]); close(pipe_fds[1]);
+                continue;
             }
         }
-        if (cfd >= 0) {
-            if (connect(cfd, (struct sockaddr *)&ca, sizeof(ca)) < 0) {
-                close(cfd); close(pipe_fds[0]); close(pipe_fds[1]); continue;
-            }
+        if (connect(cfd, (struct sockaddr *)&ca, sizeof(ca)) < 0) {
+            close(cfd); close(pipe_fds[0]); close(pipe_fds[1]); continue;
         }
 
         {
@@ -645,29 +618,25 @@ int mode_tun_udp_server(int listen_port,
 
             session_keys_t keys;
             if (udp_handshake_server(cfd, &keys, hs_timeout,
-                                      first_dgram, UDP_HS_DGRAM,
-                                      udp_fd, &client_addr) < 0) {
+                                      first_dgram, UDP_HS_DGRAM) < 0) {
                 log_warn("udp-server", "handshake failed");
                 close(cfd); close(udp_fd); _exit(1);
             }
 
-            /*
-             * UDP data path: explicit-nonce frames.
-             *   send: sendto(udp_fd, ...) → source port = listen_port
-             *   recv: recv(cfd) or recvfrom_peer(udp_fd) → per-client
-             */
+            /* cfd is bound to :listen_port and connected to the client.
+             * send(cfd) → source port = listen_port ✓  (client sees server:9000)
+             * recv(cfd) → only this client's datagrams  ✓  (kernel filter) */
             int64_t last_ka = (int64_t)time(NULL);
-            int recv_fd = (cfd >= 0) ? cfd : udp_fd;
             struct pollfd fds[2];
-            fds[0].fd = tun_fd;  fds[0].events = POLLIN;
-            fds[1].fd = recv_fd; fds[1].events = POLLIN;
+            fds[0].fd = tun_fd; fds[0].events = POLLIN;
+            fds[1].fd = cfd;    fds[1].events = POLLIN;
 
             while (g_running) {
                 fds[0].revents = 0; fds[1].revents = 0;
                 int pr = poll(fds, 2, keepalive > 0 ? keepalive * 1000 : 500);
                 if (pr < 0) { if (errno == EINTR) continue; break; }
 
-                /* TUN → UDP: sendto on udp_fd (correct source port) */
+                /* TUN → UDP */
                 if (fds[0].revents & POLLIN) {
                     for (;;) {
                         uint8_t pkt[FRAME_MAX_PAYLOAD];
@@ -676,7 +645,7 @@ int mode_tun_udp_server(int listen_port,
                         if (n <= 0) goto out;
                         uint8_t wb[FRAME_EXPLICIT_MAX_WIRE]; size_t wl;
                         if (frame_build_explicit(wb, &wl, FRAME_DATA, 0, pkt, (size_t)n, keys.enc_key) == 0)
-                            udp_sendto(udp_fd, wb, wl, &client_addr);
+                            send(cfd, wb, wl, 0);
                     }
                 }
 
@@ -684,13 +653,7 @@ int mode_tun_udp_server(int listen_port,
                 if (fds[1].revents & POLLIN) {
                     for (;;) {
                         uint8_t wb[UDP_MAX_DGRAM];
-                        ssize_t n;
-                        if (cfd >= 0)
-                            n = recv(cfd, wb, sizeof(wb), 0);
-                        else {
-                            n = udp_recv_peer(udp_fd, wb, sizeof(wb), &client_addr);
-                            if (n == 0) continue;  /* wrong peer, try again */
-                        }
+                        ssize_t n = recv(cfd, wb, sizeof(wb), 0);
                         if (n < 0) { if (errno == EAGAIN || errno == EWOULDBLOCK) break; goto out; }
                         if (n == 0) goto out;
                         uint8_t ty, fl, pkt[FRAME_MAX_PAYLOAD]; size_t pl;
@@ -707,21 +670,20 @@ int mode_tun_udp_server(int listen_port,
                     }
                 }
 
-                /* Keepalive — also via sendto on udp_fd */
+                /* Keepalive */
                 {
                     int64_t now = (int64_t)time(NULL);
                     if (keepalive > 0 && now - last_ka >= keepalive) {
                         uint8_t kw[FRAME_EXPLICIT_MAX_WIRE]; size_t kwl;
                         if (frame_build_explicit(kw, &kwl, FRAME_KEEPALIVE, 0, NULL, 0, keys.enc_key) == 0)
-                            udp_sendto(udp_fd, kw, kwl, &client_addr);
+                            send(cfd, kw, kwl, 0);
                         last_ka = now;
                     }
                 }
             }
         out:
             secure_memzero(&keys, sizeof(keys));
-            if (cfd >= 0) close(cfd);
-            close(udp_fd); close(tun_fd);
+            close(cfd); close(udp_fd); close(tun_fd);
             _exit(0);
         }
         close(cfd); close(pipe_fds[0]); close(pipe_fds[1]);
