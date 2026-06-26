@@ -719,21 +719,34 @@ int mode_tun_udp_server(int listen_port,
                 /* ── Data frame from known client ── */
                 {
                     int si = session_find(sessions, session_count, &sender);
-                    if (si < 0) continue;  /* unknown client — drop */
+                    if (si < 0) {
+                        /* Unknown client — maybe a stale handshake retry */
+                        if (buf[0] != FRAME_HANDSHAKE)
+                            log_info("udp-server", "data from unknown %s:%d (type=%d, len=%zd)",
+                                     inet_ntop(AF_INET, &sender.sin_addr,
+                                               (char[INET_ADDRSTRLEN]){}, INET_ADDRSTRLEN),
+                                     ntohs(sender.sin_port), buf[0], nr);
+                        continue;
+                    }
 
                     uint8_t ty, fl, pkt[FRAME_MAX_PAYLOAD]; size_t pl;
                     if (frame_parse_explicit(buf, (size_t)nr, &ty, &fl,
                                               pkt, &pl, sessions[si].dec_key) == 0) {
                         sessions[si].last_seen = (int64_t)time(NULL);
                         if (ty == FRAME_DATA && pl > 0) {
-                            size_t wr = 0;
-                            while (wr < pl) {
-                                ssize_t w = write(tun_fd, pkt + wr, pl - wr);
-                                if (w < 0) {
-                                    if (errno == EAGAIN || errno == EINTR) continue;
-                                    break;
+                            ssize_t ww = write(tun_fd, pkt, pl);
+                            if (ww < 0)
+                                log_warn("udp-server", "TUN write error: %s", strerror(errno));
+                            else if ((size_t)ww < pl) {
+                                size_t wr = (size_t)ww;
+                                while (wr < pl) {
+                                    ssize_t w = write(tun_fd, pkt + wr, pl - wr);
+                                    if (w < 0) {
+                                        if (errno == EAGAIN || errno == EINTR) continue;
+                                        break;
+                                    }
+                                    wr += (size_t)w;
                                 }
-                                wr += (size_t)w;
                             }
                         }
                     }
@@ -754,6 +767,7 @@ int mode_tun_udp_server(int listen_port,
 
                 /* Route by destination IP in the IP header */
                 uint32_t dst = ip_dst_addr(pkt, (size_t)n);
+                int sent = 0;
                 for (int si = 0; si < session_count; si++) {
                     if (!sessions[si].active) continue;
                     if (dst != 0 && sessions[si].tun_ip != 0 &&
@@ -762,11 +776,16 @@ int mode_tun_udp_server(int listen_port,
                     uint8_t wb[FRAME_EXPLICIT_MAX_WIRE]; size_t wl;
                     if (frame_build_explicit(wb, &wl, FRAME_DATA, 0,
                                               pkt, (size_t)n,
-                                              sessions[si].enc_key) == 0)
+                                              sessions[si].enc_key) == 0) {
                         sendto(udp_fd, wb, wl, 0,
                                (struct sockaddr *)&sessions[si].addr,
                                sizeof(sessions[si].addr));
+                        sent++;
+                    }
                 }
+                if (sent == 0)
+                    log_info("udp-server", "TUN pkt dst=0x%x, no matching session (%d active)",
+                             dst, session_count);
             }
         }
 
