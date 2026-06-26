@@ -449,6 +449,61 @@ static int udp_handshake_client(int fd, int peer_idx,
  * TUN UDP Server
  * ════════════════════════════════════════════════════════════════ */
 
+/*
+ * ═══════════════════════════════════════════════════════════════════
+ * TUN UDP Server — WireGuard-style single-process poll loop
+ *
+ * Architecture (WireGuard-like):
+ *   - Single UDP socket bound to listen_port.
+ *   - No fork(), no connected sockets, no SO_REUSEPORT.
+ *   - recvfrom() / sendto() for all I/O.
+ *   - Per-client session table keyed by (IP, port) for data frames.
+ *   - Handshake processed synchronously in the main loop.
+ *
+ * Poll set:  [ udp_fd, tun_fd ]
+ *
+ *   udp_fd readable → recvfrom → HANDSHAKE? → process handshake
+ *                               → DATA?      → lookup session, decrypt → TUN
+ *   tun_fd readable → read IP pkt → route by dst IP → encrypt → sendto
+ * ═══════════════════════════════════════════════════════════════════
+ */
+
+#define UDP_MAX_CLIENTS 64
+
+typedef struct {
+    struct sockaddr_in addr;     /* client's last-known address */
+    uint8_t  enc_key[16];       /* server→client encrypt key */
+    uint8_t  dec_key[16];       /* client→server decrypt key */
+    uint32_t tun_ip;            /* peer's TUN IP (host byte order) */
+    int64_t  last_seen;         /* last activity timestamp */
+    int      active;            /* 1 = handshake complete, session live */
+} udp_session_t;
+
+/* Extract destination IPv4 address from an IP packet (host byte order). */
+static uint32_t ip_dst_addr(const uint8_t *pkt, size_t len)
+{
+    if (len < 20) return 0;
+    if ((pkt[0] >> 4) != 4) return 0;
+    int ihl = (int)(pkt[0] & 0x0f) * 4;
+    if (ihl < 20 || (size_t)ihl > len) return 0;
+    uint32_t addr;
+    memcpy(&addr, pkt + 16, 4);
+    return ntohl(addr);
+}
+
+/* Find session by client address (exact match on IP + port). */
+static int session_find(const udp_session_t *sessions, int count,
+                         const struct sockaddr_in *addr)
+{
+    for (int i = 0; i < count; i++) {
+        if (!sessions[i].active) continue;
+        if (sessions[i].addr.sin_addr.s_addr == addr->sin_addr.s_addr &&
+            sessions[i].addr.sin_port        == addr->sin_port)
+            return i;
+    }
+    return -1;
+}
+
 int mode_tun_udp_server(int listen_port,
                          const char *tun_name,
                          const char *tun_ip, const char *tun_netmask,
@@ -471,18 +526,12 @@ int mode_tun_udp_server(int listen_port,
     tun_setup_routing(name, tun_route, tun_nat_if, 1 /* server */);
     tun_run_postup(postup, name);
 
-    /*
-     * Main listen socket.  Set SO_REUSEPORT BEFORE bind() so that
-     * per-client connected sockets (cfd) can later bind to the same
-     * (INADDR_ANY, listen_port).  Linux requires SO_REUSEPORT on ALL
-     * sockets that share the exact same address:port combination.
-     */
+    /* Single UDP socket — WireGuard uses exactly one. */
     int udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (udp_fd < 0) { close(tun_fd); return 1; }
     {
         int reuse = 1;
         setsockopt(udp_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
-        setsockopt(udp_fd, SOL_SOCKET, 15 /* SO_REUSEPORT */, &reuse, sizeof(reuse));
         struct sockaddr_in sa; memset(&sa, 0, sizeof(sa));
         sa.sin_family = AF_INET;
         sa.sin_addr.s_addr = INADDR_ANY;
@@ -498,197 +547,256 @@ int mode_tun_udp_server(int listen_port,
 
     (void)psk; (void)psk_len;
 
+    /* ── Session table ── */
+    udp_session_t sessions[UDP_MAX_CLIENTS];
+    int           session_count = 0;
+    memset(sessions, 0, sizeof(sessions));
+
+    /* ── Main poll loop ── */
     while (g_running) {
-        uint8_t hdr[UDP_HS_DGRAM];
-        struct sockaddr_in ca; socklen_t alen = sizeof(ca);
-        ssize_t nr = recvfrom(udp_fd, hdr, sizeof(hdr), 0,
-                              (struct sockaddr *)&ca, &alen);
-        if (nr < 0) { if (errno == EINTR) continue; break; }
-        if (nr < UDP_HS_DGRAM || hdr[0] != FRAME_HANDSHAKE) continue;
+        struct pollfd fds[2];
+        fds[0].fd = udp_fd;  fds[0].events = POLLIN; fds[0].revents = 0;
+        fds[1].fd = tun_fd;  fds[1].events = POLLIN; fds[1].revents = 0;
 
-        /* Anti-DoS: rate-limit handshake attempts per source IP */
-        {
-            char rip[INET_ADDRSTRLEN];
-            inet_ntop(AF_INET, &ca.sin_addr, rip, sizeof(rip));
-            if (handshake_rate_check(rip, (int64_t)time(NULL)) < 0)
-                continue;
-        }
+        int pr = poll(fds, 2, keepalive > 0 ? keepalive * 1000 : 500);
+        if (pr < 0) { if (errno == EINTR) continue; break; }
 
-        /*
-         * Pass the first datagram to the child via a pipe.
-         */
-        int pipe_fds[2];
-        if (pipe(pipe_fds) < 0) continue;
-
-        /* Write the pre-read datagram into the pipe */
-        {
-            size_t w = 0;
-            while (w < (size_t)nr) {
-                ssize_t nw = write(pipe_fds[1], hdr + w, (size_t)nr - w);
-                if (nw < 0) {
-                    if (errno == EINTR) continue;
-                    break;
-                }
-                w += (size_t)nw;
-            }
-            if (w < (size_t)nr) { close(pipe_fds[0]); close(pipe_fds[1]); continue; }
-        }
-
-        /*
-         * Per-client connected UDP socket.
-         * Both udp_fd and cfd need SO_REUSEPORT set BEFORE bind().
-         * On Linux ≥ 3.9 the connected socket receives only its
-         * peer's datagrams; the unconnected udp_fd gets the rest.
-         */
-        int cfd = socket(AF_INET, SOCK_DGRAM, 0);
-        if (cfd < 0) { close(pipe_fds[0]); close(pipe_fds[1]); continue; }
-        {
-            int reuse = 1;
-            int ok = 1;
-            if (setsockopt(cfd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) < 0)
-                ok = 0;
-            if (setsockopt(cfd, SOL_SOCKET, 15 /* SO_REUSEPORT */, &reuse, sizeof(reuse)) < 0) {
-                /* setsockopt SO_REUSEPORT may fail with ENOPROTOOPT on
-                 * kernels that don't support it.  Without it, bind()
-                 * will also fail — there is no viable fallback that
-                 * avoids racing with the parent's recvfrom on udp_fd. */
-                log_warn("udp-server", "SO_REUSEPORT not supported by kernel");
-                ok = 0;
-            }
-            if (ok) {
-                struct sockaddr_in bind_addr;
-                memset(&bind_addr, 0, sizeof(bind_addr));
-                bind_addr.sin_family = AF_INET;
-                bind_addr.sin_addr.s_addr = INADDR_ANY;
-                bind_addr.sin_port = htons((uint16_t)listen_port);
-                if (bind(cfd, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) < 0) {
-                    log_warn("udp-server", "bind cfd:9000 failed: %s", strerror(errno));
-                    ok = 0;
-                }
-            }
-            if (!ok) {
-                close(cfd); close(pipe_fds[0]); close(pipe_fds[1]);
-                continue;
-            }
-        }
-        if (connect(cfd, (struct sockaddr *)&ca, sizeof(ca)) < 0) {
-            close(cfd); close(pipe_fds[0]); close(pipe_fds[1]); continue;
-        }
-
-        {
-            char ip[INET_ADDRSTRLEN];
-            inet_ntop(AF_INET, &ca.sin_addr, ip, sizeof(ip));
-            log_info("udp-server", "handshake from %s:%d", ip, ntohs(ca.sin_port));
-        }
-
-        pid_t pid = fork();
-        if (pid < 0) {
-            close(cfd); close(pipe_fds[0]); close(pipe_fds[1]); continue;
-        }
-
-        if (pid == 0) {
-            close(pipe_fds[1]);   /* child doesn't write */
-            /* Keep udp_fd open — we use it for sending (sendto) so the
-             * source port remains the well-known listen_port.  cfd is
-             * used for receiving (recv), filtered to this client. */
-            signal(SIGCHLD, SIG_DFL);
-
-            /* Read client address + first datagram from the pipe */
-            struct sockaddr_in client_addr;
-            uint8_t first_dgram[UDP_HS_DGRAM];
-            {
-                size_t rd = 0;
-                size_t addrlen = sizeof(client_addr);
-                uint8_t *p = (uint8_t *)&client_addr;
-                while (rd < addrlen) {
-                    ssize_t n = read(pipe_fds[0], p + rd, addrlen - rd);
-                    if (n < 0) { if (errno == EINTR) continue; close(pipe_fds[0]); close(cfd); close(udp_fd); _exit(1); }
-                    if (n == 0) { close(pipe_fds[0]); close(cfd); close(udp_fd); _exit(1); }
-                    rd += (size_t)n;
-                }
-                rd = 0;
-                while (rd < UDP_HS_DGRAM) {
-                    ssize_t n = read(pipe_fds[0], first_dgram + rd, UDP_HS_DGRAM - rd);
-                    if (n < 0) { if (errno == EINTR) continue; close(pipe_fds[0]); close(cfd); close(udp_fd); _exit(1); }
-                    if (n == 0) { close(pipe_fds[0]); close(cfd); close(udp_fd); _exit(1); }
-                    rd += (size_t)n;
-                }
-            }
-            close(pipe_fds[0]);
-
-            session_keys_t keys;
-            if (udp_handshake_server(cfd, &keys, hs_timeout,
-                                      first_dgram, UDP_HS_DGRAM) < 0) {
-                log_warn("udp-server", "handshake failed");
-                close(cfd); close(udp_fd); _exit(1);
-            }
-
-            /* cfd is bound to :listen_port and connected to the client.
-             * send(cfd) → source port = listen_port ✓  (client sees server:9000)
-             * recv(cfd) → only this client's datagrams  ✓  (kernel filter) */
-            int64_t last_ka = (int64_t)time(NULL);
-            struct pollfd fds[2];
-            fds[0].fd = tun_fd; fds[0].events = POLLIN;
-            fds[1].fd = cfd;    fds[1].events = POLLIN;
-
-            while (g_running) {
-                fds[0].revents = 0; fds[1].revents = 0;
-                int pr = poll(fds, 2, keepalive > 0 ? keepalive * 1000 : 500);
-                if (pr < 0) { if (errno == EINTR) continue; break; }
-
-                /* TUN → UDP */
-                if (fds[0].revents & POLLIN) {
-                    for (;;) {
-                        uint8_t pkt[FRAME_MAX_PAYLOAD];
-                        ssize_t n = read(tun_fd, pkt, sizeof(pkt));
-                        if (n < 0) { if (errno == EAGAIN || errno == EWOULDBLOCK) break; goto out; }
-                        if (n <= 0) goto out;
-                        uint8_t wb[FRAME_EXPLICIT_MAX_WIRE]; size_t wl;
-                        if (frame_build_explicit(wb, &wl, FRAME_DATA, 0, pkt, (size_t)n, keys.enc_key) == 0)
-                            send(cfd, wb, wl, 0);
-                    }
+        /* ── UDP → TUN ── */
+        if (fds[0].revents & POLLIN) {
+            for (;;) {
+                uint8_t buf[UDP_MAX_DGRAM];
+                struct sockaddr_in sender;
+                socklen_t slen = sizeof(sender);
+                ssize_t nr = recvfrom(udp_fd, buf, sizeof(buf), 0,
+                                      (struct sockaddr *)&sender, &slen);
+                if (nr < 0) {
+                    if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+                    continue;  /* drop malformed */
                 }
 
-                /* UDP → TUN */
-                if (fds[1].revents & POLLIN) {
-                    for (;;) {
-                        uint8_t wb[UDP_MAX_DGRAM];
-                        ssize_t n = recv(cfd, wb, sizeof(wb), 0);
-                        if (n < 0) { if (errno == EAGAIN || errno == EWOULDBLOCK) break; goto out; }
-                        if (n == 0) goto out;
-                        uint8_t ty, fl, pkt[FRAME_MAX_PAYLOAD]; size_t pl;
-                        if (frame_parse_explicit(wb, (size_t)n, &ty, &fl, pkt, &pl, keys.dec_key) == 0) {
-                            if (ty == FRAME_DATA && pl > 0) {
-                                size_t wr = 0;
-                                while (wr < pl) {
-                                    ssize_t w = write(tun_fd, pkt + wr, pl - wr);
-                                    if (w < 0) { if (errno == EAGAIN || errno == EINTR) continue; break; }
-                                    wr += (size_t)w;
+                /* ── Handshake ── */
+                if (nr >= UDP_HS_DGRAM && buf[0] == FRAME_HANDSHAKE) {
+                    char rip[INET_ADDRSTRLEN];
+                    inet_ntop(AF_INET, &sender.sin_addr, rip, sizeof(rip));
+                    if (handshake_rate_check(rip, (int64_t)time(NULL)) < 0)
+                        continue;
+
+                    log_info("udp-server", "handshake from %s:%d",
+                             rip, ntohs(sender.sin_port));
+
+                    /* Process handshake synchronously (like WireGuard).
+                     * This blocks the poll loop for ~1 RTT, but handshakes
+                     * are infrequent and complete in < 100 ms. */
+                    {
+                        session_keys_t keys;
+                        int ok = 0, peer_matched = -1;
+
+                        /* === Server-side handshake inline === */
+                        {
+                            uint8_t dgram[UDP_HS_DGRAM];
+                            memcpy(dgram, buf, UDP_HS_DGRAM);
+                            uint8_t iepk[32];
+                            memcpy(iepk, dgram + 4, 32);
+                            uint8_t h[32];
+
+                            for (int pi = 0; pi < g_peer_count; pi++) {
+                                uint8_t ee[32], es_init[32], ik[16];
+                                ecdh_derive(ee, g_asym_priv, iepk);
+                                ecdh_derive(es_init, g_asym_priv, g_asym_peers[pi]);
+                                {
+                                    uint8_t b[68]; memcpy(b, ee, 32);
+                                    memcpy(b + 32, es_init, 32);
+                                    memcpy(b + 64, "init", 4);
+                                    sha256_h(h, b, 68); memcpy(ik, h, 16);
                                 }
+
+                                int64_t its;
+                                if (udp_hs_parse(dgram, iepk, &its, ik) != 0)
+                                    continue;
+                                int64_t now = timestamp_now();
+                                if (now < 0 || (now > its ? now - its : its - now) > 60)
+                                    continue;
+
+                                log_info("udp-server", "peer #%d key matched", pi);
+                                peer_matched = pi;
+
+                                uint8_t epk[32], ek[32];
+                                if (ecdh_keygen(epk, ek) != 0) continue;
+
+                                /* 3-DH shared secret */
+                                uint8_t es[32], se[32];
+                                ecdh_derive(ee, g_asym_priv, iepk);
+                                ecdh_derive(es, g_asym_priv, g_asym_peers[pi]);
+                                ecdh_derive(se, ek, g_asym_peers[pi]);
+                                uint8_t sh[32];
+                                {
+                                    uint8_t sb[102]; memcpy(sb, ee, 32);
+                                    memcpy(sb + 32, es, 32);
+                                    memcpy(sb + 64, se, 32);
+                                    memcpy(sb + 96, "shared", 6);
+                                    sha256_h(sh, sb, 102);
+                                }
+
+                                /* Session keys */
+                                {
+                                    uint8_t sk[39]; memcpy(sk, sh, 32);
+                                    memcpy(sk + 32, "session", 7);
+                                    sha256_h(h, sk, 39);
+                                }
+                                memcpy(keys.dec_key, h, 16);
+                                memcpy(keys.enc_key, h + 16, 16);
+
+                                /* Send RESP */
+                                {
+                                    uint8_t rk[16], rkb[36];
+                                    memcpy(rkb, sh, 32);
+                                    memcpy(rkb + 32, "resp", 4);
+                                    sha256_h(h, rkb, 36); memcpy(rk, h, 16);
+                                    uint8_t rdgram[UDP_HS_DGRAM];
+                                    udp_hs_build(rdgram, epk, timestamp_now(), rk);
+                                    sendto(udp_fd, rdgram, sizeof(rdgram), 0,
+                                           (struct sockaddr *)&sender, sizeof(sender));
+                                }
+                                log_info("udp-server", "RESP sent");
+
+                                /* Send KEY_CONFIRM */
+                                {
+                                    uint8_t kw[FRAME_MAX_WIRE]; size_t kwl;
+                                    frame_build(kw, &kwl, FRAME_KEYCONFIRM, 0,
+                                                NULL, 0, 0, keys.enc_key);
+                                    sendto(udp_fd, kw, kwl, 0,
+                                           (struct sockaddr *)&sender, sizeof(sender));
+                                }
+                                log_info("udp-server", "KEY_CONFIRM sent, waiting...");
+
+                                /* Receive client KEY_CONFIRM */
+                                {
+                                    uint8_t ckw[FRAME_HEADER_LEN + AEGIS_TAG_LEN];
+                                    /* Blocking recvfrom — only this handshake matters now */
+                                    ssize_t cnr = recvfrom(udp_fd, ckw, sizeof(ckw), 0,
+                                                           (struct sockaddr *)&sender, &slen);
+                                    if (cnr >= (ssize_t)sizeof(ckw)) {
+                                        uint8_t ty, fl, dum[1]; size_t dl;
+                                        if (frame_parse(ckw, sizeof(ckw), &ty, &fl,
+                                                        dum, &dl, 0, keys.dec_key) == 0 &&
+                                            ty == FRAME_KEYCONFIRM) {
+                                            ok = 1;
+                                        }
+                                    }
+                                }
+
+                                secure_memzero(ee, 32); secure_memzero(es_init, 32);
+                                secure_memzero(ek, 32); secure_memzero(sh, 32);
+                                break;  /* done with this peer */
+                            }
+                        }
+
+                        if (ok && peer_matched >= 0) {
+                            log_info("udp-server", "peer #%d authenticated", peer_matched);
+
+                            /* Add/update session in table */
+                            int si = session_find(sessions, session_count, &sender);
+                            if (si < 0 && session_count < UDP_MAX_CLIENTS) {
+                                si = session_count++;
+                                sessions[si].addr = sender;
+                                sessions[si].tun_ip = g_peer_tun_ips[peer_matched];
+                            }
+                            if (si >= 0) {
+                                memcpy(sessions[si].enc_key, keys.enc_key, 16);
+                                memcpy(sessions[si].dec_key, keys.dec_key, 16);
+                                sessions[si].last_seen = (int64_t)time(NULL);
+                                sessions[si].active = 1;
+                            }
+                        } else {
+                            log_warn("udp-server", "handshake failed (peer %d)",
+                                     peer_matched);
+                        }
+                        secure_memzero(&keys, sizeof(keys));
+                    }
+                    continue;
+                }
+
+                /* ── Data frame from known client ── */
+                {
+                    int si = session_find(sessions, session_count, &sender);
+                    if (si < 0) continue;  /* unknown client — drop */
+
+                    uint8_t ty, fl, pkt[FRAME_MAX_PAYLOAD]; size_t pl;
+                    if (frame_parse_explicit(buf, (size_t)nr, &ty, &fl,
+                                              pkt, &pl, sessions[si].dec_key) == 0) {
+                        sessions[si].last_seen = (int64_t)time(NULL);
+                        if (ty == FRAME_DATA && pl > 0) {
+                            size_t wr = 0;
+                            while (wr < pl) {
+                                ssize_t w = write(tun_fd, pkt + wr, pl - wr);
+                                if (w < 0) {
+                                    if (errno == EAGAIN || errno == EINTR) continue;
+                                    break;
+                                }
+                                wr += (size_t)w;
                             }
                         }
                     }
                 }
+            }
+        }
 
-                /* Keepalive */
-                {
-                    int64_t now = (int64_t)time(NULL);
-                    if (keepalive > 0 && now - last_ka >= keepalive) {
-                        uint8_t kw[FRAME_EXPLICIT_MAX_WIRE]; size_t kwl;
-                        if (frame_build_explicit(kw, &kwl, FRAME_KEEPALIVE, 0, NULL, 0, keys.enc_key) == 0)
-                            send(cfd, kw, kwl, 0);
-                        last_ka = now;
-                    }
+        /* ── TUN → UDP ── */
+        if (fds[1].revents & POLLIN) {
+            for (;;) {
+                uint8_t pkt[FRAME_MAX_PAYLOAD];
+                ssize_t n = read(tun_fd, pkt, sizeof(pkt));
+                if (n < 0) {
+                    if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+                    goto srv_out;
+                }
+                if (n <= 0) goto srv_out;
+
+                /* Route by destination IP in the IP header */
+                uint32_t dst = ip_dst_addr(pkt, (size_t)n);
+                for (int si = 0; si < session_count; si++) {
+                    if (!sessions[si].active) continue;
+                    if (dst != 0 && sessions[si].tun_ip != 0 &&
+                        dst != sessions[si].tun_ip) continue;
+
+                    uint8_t wb[FRAME_EXPLICIT_MAX_WIRE]; size_t wl;
+                    if (frame_build_explicit(wb, &wl, FRAME_DATA, 0,
+                                              pkt, (size_t)n,
+                                              sessions[si].enc_key) == 0)
+                        sendto(udp_fd, wb, wl, 0,
+                               (struct sockaddr *)&sessions[si].addr,
+                               sizeof(sessions[si].addr));
                 }
             }
-        out:
-            secure_memzero(&keys, sizeof(keys));
-            close(cfd); close(udp_fd); close(tun_fd);
-            _exit(0);
         }
-        close(cfd); close(pipe_fds[0]); close(pipe_fds[1]);
-        while (waitpid(-1, NULL, WNOHANG) > 0) {}
+
+        /* ── Keepalive / stale session cleanup ── */
+        {
+            int64_t now = (int64_t)time(NULL);
+            for (int si = 0; si < session_count; si++) {
+                if (!sessions[si].active) continue;
+                if (keepalive > 0 && now - sessions[si].last_seen >= keepalive) {
+                    uint8_t kw[FRAME_EXPLICIT_MAX_WIRE]; size_t kwl;
+                    if (frame_build_explicit(kw, &kwl, FRAME_KEEPALIVE, 0,
+                                              NULL, 0, sessions[si].enc_key) == 0)
+                        sendto(udp_fd, kw, kwl, 0,
+                               (struct sockaddr *)&sessions[si].addr,
+                               sizeof(sessions[si].addr));
+                    sessions[si].last_seen = now;
+                }
+                /* Remove sessions idle for > 5 minutes */
+                if (now - sessions[si].last_seen > 300) {
+                    secure_memzero(&sessions[si], sizeof(sessions[si]));
+                    sessions[si].active = 0;
+                }
+            }
+        }
     }
+
+srv_out:
+    /* Clean up active sessions */
+    for (int si = 0; si < session_count; si++)
+        secure_memzero(&sessions[si], sizeof(sessions[si]));
 
     tun_run_postdown(postdown, name);
     tun_teardown(name, 1);
