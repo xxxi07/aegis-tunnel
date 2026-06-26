@@ -235,6 +235,8 @@ static int tun_client_multipath(int tun_fd, const char *name,
             tcp_fds[i] = first_fd;
             memcpy(&keys, first_keys, sizeof(keys));
         } else {
+            /* Stagger connections to avoid server-side fork() storms */
+            if (i > 1) usleep(80000);  /* 80ms between additional paths */
             tcp_fds[i] = connect_to_host(host, port, TUN_FWMARK);
             if (tcp_fds[i] < 0) {
                 log_error("tun-client", "path %d/%d: cannot connect", i + 1, npaths);
@@ -274,6 +276,7 @@ static int tun_client_multipath(int tun_fd, const char *name,
                         keys.enc_key, keys.dec_key);
             tun.keepalive_sec = keepalive;
             int r = tunnel_run(&tun);
+            if (r != 0) fprintf(stderr, "[mp-child %d] tunnel_run returned %d (errno=%d)\n", i, r, errno);
             close(sp_fds[i][1]); close(tcp_fds[i]);
             _exit(r == 0 ? 0 : 1);
         }
