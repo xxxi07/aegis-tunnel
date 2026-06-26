@@ -206,7 +206,7 @@ int main(int argc, char **argv) {
             optind = 0;  /* reset getopt for shifted argv */
         }
         /* socks5 -server | -client */
-        if (!strcmp(argv[1], "socks5") && argc >= 3) {
+        if (argc >= 3 && !strcmp(argv[1], "socks5")) {
             if (!strcmp(argv[2], "-server"))      socks5_force = 1;
             else if (!strcmp(argv[2], "-client")) socks5_force = 2;
             else {
