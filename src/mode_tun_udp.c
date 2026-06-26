@@ -749,6 +749,7 @@ int mode_tun_udp_server(int listen_port,
                     if (frame_parse_explicit(buf, (size_t)nr, &ty, &fl,
                                               pkt, &pl, sessions[si].dec_key) == 0) {
                         sessions[si].last_seen = (int64_t)time(NULL);
+                        log_info("udp-server", "UDP→TUN: ty=%d, %zu bytes", ty, pl);
                         if (ty == FRAME_DATA && pl > 0) {
                             ssize_t ww = write(tun_fd, pkt, pl);
                             if (ww < 0)
@@ -772,31 +773,48 @@ int mode_tun_udp_server(int listen_port,
 
         /* ── TUN → UDP ── */
         if (fds[1].revents & POLLIN) {
+            log_info("udp-server", "TUN readable (revents=0x%x)", fds[1].revents);
             for (;;) {
                 if (!g_running) break;
                 uint8_t pkt[FRAME_MAX_PAYLOAD];
                 ssize_t n = read(tun_fd, pkt, sizeof(pkt));
                 if (n < 0) {
                     if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+                    log_warn("udp-server", "TUN read error: %s", strerror(errno));
                     goto srv_out;
                 }
-                if (n <= 0) goto srv_out;
+                if (n <= 0) {
+                    log_info("udp-server", "TUN read EOF (n=%zd)", n);
+                    goto srv_out;
+                }
+
+                log_info("udp-server", "TUN→UDP: read %zd bytes, ver=%d",
+                         n, (pkt[0] >> 4));
 
                 /* Route by destination IP in the IP header */
                 uint32_t dst = ip_dst_addr(pkt, (size_t)n);
                 int sent = 0;
                 for (int si = 0; si < session_count; si++) {
                     if (!sessions[si].active) continue;
+                    log_info("udp-server", "  session[%d] active, tun_ip=0x%x, dst=0x%x",
+                             si, sessions[si].tun_ip, dst);
                     if (dst != 0 && sessions[si].tun_ip != 0 &&
-                        dst != sessions[si].tun_ip) continue;
+                        dst != sessions[si].tun_ip) {
+                        log_info("udp-server", "  → skip (dst mismatch)");
+                        continue;
+                    }
 
                     uint8_t wb[FRAME_EXPLICIT_MAX_WIRE]; size_t wl;
                     if (frame_build_explicit(wb, &wl, FRAME_DATA, 0,
                                               pkt, (size_t)n,
                                               sessions[si].enc_key) == 0) {
-                        sendto(udp_fd, wb, wl, 0,
+                        ssize_t sn = sendto(udp_fd, wb, wl, 0,
                                (struct sockaddr *)&sessions[si].addr,
                                sizeof(sessions[si].addr));
+                        log_info("udp-server", "  → sendto → %s:%d returned %zd (errno=%d)",
+                                 inet_ntop(AF_INET, &sessions[si].addr.sin_addr,
+                                           (char[INET_ADDRSTRLEN]){}, INET_ADDRSTRLEN),
+                                 ntohs(sessions[si].addr.sin_port), sn, errno);
                         sent++;
                     }
                 }
