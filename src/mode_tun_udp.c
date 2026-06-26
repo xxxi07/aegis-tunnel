@@ -583,6 +583,21 @@ int mode_tun_udp_client(const char *remote_host, int remote_port,
         int udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
         if (udp_fd < 0) { sleep(1); continue; }
 
+        /*
+         * Set SO_MARK BEFORE any packets are sent (including DNS
+         * during getaddrinfo, which uses its own sockets and cannot
+         * be marked — but the connect() handshake datagrams must
+         * bypass the TUN routing table).
+         *
+         * fwmark policy (set up by tun_set_fwmark_rule):
+         *   unmarked packets → TUN table (VPN routes)
+         *   marked  packets  → main table (physical NIC)
+         */
+        {
+            int mark = 51820;
+            setsockopt(udp_fd, SOL_SOCKET, SO_MARK, &mark, sizeof(mark));
+        }
+
         struct addrinfo hints, *res;
         memset(&hints, 0, sizeof(hints));
         hints.ai_family = AF_INET; hints.ai_socktype = SOCK_DGRAM;
