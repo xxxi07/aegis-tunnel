@@ -491,14 +491,13 @@ static uint32_t ip_dst_addr(const uint8_t *pkt, size_t len)
     return ntohl(addr);
 }
 
-/* Find session by client address (exact match on IP + port). */
+/* Find session by client IP address (port ignored — NAT may rebind). */
 static int session_find(const udp_session_t *sessions, int count,
                          const struct sockaddr_in *addr)
 {
     for (int i = 0; i < count; i++) {
         if (!sessions[i].active) continue;
-        if (sessions[i].addr.sin_addr.s_addr == addr->sin_addr.s_addr &&
-            sessions[i].addr.sin_port        == addr->sin_port)
+        if (sessions[i].addr.sin_addr.s_addr == addr->sin_addr.s_addr)
             return i;
     }
     return -1;
@@ -707,10 +706,10 @@ int mode_tun_udp_server(int listen_port,
                             int si = session_find(sessions, session_count, &sender);
                             if (si < 0 && session_count < UDP_MAX_CLIENTS) {
                                 si = session_count++;
-                                sessions[si].addr = sender;
                                 sessions[si].tun_ip = g_peer_tun_ips[peer_matched];
                             }
                             if (si >= 0) {
+                                sessions[si].addr = sender;  /* update port (NAT rebinding) */
                                 memcpy(sessions[si].enc_key, keys.enc_key, 16);
                                 memcpy(sessions[si].dec_key, keys.dec_key, 16);
                                 sessions[si].last_seen = (int64_t)time(NULL);
@@ -736,6 +735,14 @@ int mode_tun_udp_server(int listen_port,
                                                (char[INET_ADDRSTRLEN]){}, INET_ADDRSTRLEN),
                                      ntohs(sender.sin_port), buf[0], nr);
                         continue;
+                    }
+
+                    /* Update port — client may have reconnected from a new port */
+                    if (sessions[si].addr.sin_port != sender.sin_port) {
+                        log_info("udp-server", "client port changed %d→%d, updating",
+                                 ntohs(sessions[si].addr.sin_port),
+                                 ntohs(sender.sin_port));
+                        sessions[si].addr.sin_port = sender.sin_port;
                     }
 
                     uint8_t ty, fl, pkt[FRAME_MAX_PAYLOAD]; size_t pl;
