@@ -246,7 +246,7 @@ int mode_tun_server(int listen_port,
 
                 /* Create socketpair: sp[0] = parent, sp[1] = child */
                 int sp[2];
-                if (socketpair(AF_UNIX, SOCK_STREAM, 0, sp) < 0) {
+                if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, sp) < 0) {
                     secure_memzero(&keys, sizeof(keys));
                     close(client_fd); continue;
                 }
