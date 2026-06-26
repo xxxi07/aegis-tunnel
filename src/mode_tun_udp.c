@@ -384,7 +384,12 @@ int mode_tun_udp_server(int listen_port,
                 close(cfd); _exit(1);
             }
 
-            uint64_t enc_nonce = 1, dec_nonce = 1;
+            /*
+             * UDP data path uses explicit-nonce frames: each datagram
+             * carries its own 8-byte nonce embedded in the wire format.
+             * A lost datagram does NOT desynchronise the nonce counters
+             * — the receiver extracts the nonce from the datagram itself.
+             */
             int64_t last_ka = (int64_t)time(NULL);
             struct pollfd fds[2];
             fds[0].fd = tun_fd; fds[0].events = POLLIN;
@@ -395,19 +400,20 @@ int mode_tun_udp_server(int listen_port,
                 int pr = poll(fds, 2, keepalive > 0 ? keepalive * 1000 : 500);
                 if (pr < 0) { if (errno == EINTR) continue; break; }
 
+                /* TUN → UDP: one IP packet → one explicit-nonce frame */
                 if (fds[0].revents & POLLIN) {
                     for (;;) {
                         uint8_t pkt[FRAME_MAX_PAYLOAD];
                         ssize_t n = read(tun_fd, pkt, sizeof(pkt));
                         if (n < 0) { if (errno == EAGAIN || errno == EWOULDBLOCK) break; goto out; }
                         if (n <= 0) goto out;
-                        uint8_t wb[FRAME_MAX_WIRE]; size_t wl;
-                        if (frame_build(wb, &wl, FRAME_DATA, 0, pkt, (size_t)n, enc_nonce, keys.enc_key) == 0) {
-                            enc_nonce++; send(cfd, wb, wl, 0);
-                        }
+                        uint8_t wb[FRAME_EXPLICIT_MAX_WIRE]; size_t wl;
+                        if (frame_build_explicit(wb, &wl, FRAME_DATA, 0, pkt, (size_t)n, keys.enc_key) == 0)
+                            send(cfd, wb, wl, 0);
                     }
                 }
 
+                /* UDP → TUN: extract nonce from wire, decrypt, forward */
                 if (fds[1].revents & POLLIN) {
                     for (;;) {
                         uint8_t wb[UDP_MAX_DGRAM];
@@ -415,8 +421,7 @@ int mode_tun_udp_server(int listen_port,
                         if (n < 0) { if (errno == EAGAIN || errno == EWOULDBLOCK) break; goto out; }
                         if (n == 0) goto out;
                         uint8_t ty, fl, pkt[FRAME_MAX_PAYLOAD]; size_t pl;
-                        if (frame_parse(wb, (size_t)n, &ty, &fl, pkt, &pl, dec_nonce, keys.dec_key) == 0) {
-                            dec_nonce++;
+                        if (frame_parse_explicit(wb, (size_t)n, &ty, &fl, pkt, &pl, keys.dec_key) == 0) {
                             if (ty == FRAME_DATA && pl > 0) {
                                 size_t wr = 0;
                                 while (wr < pl) {
@@ -429,13 +434,13 @@ int mode_tun_udp_server(int listen_port,
                     }
                 }
 
+                /* Keepalive — also uses explicit nonce */
                 {
                     int64_t now = (int64_t)time(NULL);
                     if (keepalive > 0 && now - last_ka >= keepalive) {
-                        uint8_t kw[FRAME_MAX_WIRE]; size_t kwl;
-                        if (frame_build(kw, &kwl, FRAME_KEEPALIVE, 0, NULL, 0, enc_nonce, keys.enc_key) == 0) {
-                            enc_nonce++; send(cfd, kw, kwl, 0);
-                        }
+                        uint8_t kw[FRAME_EXPLICIT_MAX_WIRE]; size_t kwl;
+                        if (frame_build_explicit(kw, &kwl, FRAME_KEEPALIVE, 0, NULL, 0, keys.enc_key) == 0)
+                            send(cfd, kw, kwl, 0);
                         last_ka = now;
                     }
                 }
@@ -510,7 +515,11 @@ int mode_tun_udp_client(const char *remote_host, int remote_port,
 
         log_info("udp-client", "connected");
 
-        uint64_t enc_nonce = 1, dec_nonce = 1;
+        /*
+         * UDP data path uses explicit-nonce frames: each datagram
+         * carries its own 8-byte nonce.  Packet loss or reordering
+         * does not desynchronise the nonce counters.
+         */
         int64_t last_ka = (int64_t)time(NULL);
         struct pollfd fds[2];
         fds[0].fd = tun_fd; fds[0].events = POLLIN;
@@ -521,19 +530,20 @@ int mode_tun_udp_client(const char *remote_host, int remote_port,
             int pr = poll(fds, 2, keepalive > 0 ? keepalive * 1000 : 500);
             if (pr < 0) { if (errno == EINTR) continue; break; }
 
+            /* TUN → UDP: one IP packet → one explicit-nonce frame */
             if (fds[0].revents & POLLIN) {
                 for (;;) {
                     uint8_t pkt[FRAME_MAX_PAYLOAD];
                     ssize_t n = read(tun_fd, pkt, sizeof(pkt));
                     if (n < 0) { if (errno == EAGAIN || errno == EWOULDBLOCK) break; goto disconnect; }
                     if (n <= 0) goto disconnect;
-                    uint8_t wb[FRAME_MAX_WIRE]; size_t wl;
-                    if (frame_build(wb, &wl, FRAME_DATA, 0, pkt, (size_t)n, enc_nonce, keys.enc_key) == 0) {
-                        enc_nonce++; send(udp_fd, wb, wl, 0);
-                    }
+                    uint8_t wb[FRAME_EXPLICIT_MAX_WIRE]; size_t wl;
+                    if (frame_build_explicit(wb, &wl, FRAME_DATA, 0, pkt, (size_t)n, keys.enc_key) == 0)
+                        send(udp_fd, wb, wl, 0);
                 }
             }
 
+            /* UDP → TUN: extract nonce from wire, decrypt, forward */
             if (fds[1].revents & POLLIN) {
                 for (;;) {
                     uint8_t wb[UDP_MAX_DGRAM];
@@ -541,8 +551,7 @@ int mode_tun_udp_client(const char *remote_host, int remote_port,
                     if (n < 0) { if (errno == EAGAIN || errno == EWOULDBLOCK) break; goto disconnect; }
                     if (n == 0) goto disconnect;
                     uint8_t ty, fl, pkt[FRAME_MAX_PAYLOAD]; size_t pl;
-                    if (frame_parse(wb, (size_t)n, &ty, &fl, pkt, &pl, dec_nonce, keys.dec_key) == 0) {
-                        dec_nonce++;
+                    if (frame_parse_explicit(wb, (size_t)n, &ty, &fl, pkt, &pl, keys.dec_key) == 0) {
                         if (ty == FRAME_DATA && pl > 0) {
                             size_t wr = 0;
                             while (wr < pl) {
@@ -555,13 +564,13 @@ int mode_tun_udp_client(const char *remote_host, int remote_port,
                 }
             }
 
+            /* Keepalive — also uses explicit nonce */
             {
                 int64_t now = (int64_t)time(NULL);
                 if (keepalive > 0 && now - last_ka >= keepalive) {
-                    uint8_t kw[FRAME_MAX_WIRE]; size_t kwl;
-                    if (frame_build(kw, &kwl, FRAME_KEEPALIVE, 0, NULL, 0, enc_nonce, keys.enc_key) == 0) {
-                        enc_nonce++; send(udp_fd, kw, kwl, 0);
-                    }
+                    uint8_t kw[FRAME_EXPLICIT_MAX_WIRE]; size_t kwl;
+                    if (frame_build_explicit(kw, &kwl, FRAME_KEEPALIVE, 0, NULL, 0, keys.enc_key) == 0)
+                        send(udp_fd, kw, kwl, 0);
                     last_ka = now;
                 }
             }

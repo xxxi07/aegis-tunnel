@@ -32,6 +32,12 @@
 #define DEFAULT_MAX_CONN   32
 #define DEFAULT_HS_TIMEOUT  5
 
+/* MPTCP protocol number — defined in netinet/in.h on Linux ≥ 5.6.
+ * Define fallback for older kernel headers or non-Linux platforms. */
+#ifndef IPPROTO_MPTCP
+#define IPPROTO_MPTCP      262
+#endif
+
 volatile sig_atomic_t g_active_conns = 0;
 volatile sig_atomic_t g_running      = 1;
 int   g_max_conns = DEFAULT_MAX_CONN;
@@ -112,6 +118,106 @@ int connect_to_host(const char *host, int port, int fwmark) {
     if (fd < 0) { perror("connect"); return -1; }
     return fd;
 }
+/*
+ * MPTCP-aware connect: tries IPPROTO_MPTCP first (Linux ≥ 5.6).
+ * If MPTCP is unavailable (kernel too old or not enabled), silently
+ * falls back to regular TCP.  The kernel manages subflow creation,
+ * scheduling, and reordering — the application sees a single reliable
+ * byte stream, identical to TCP.
+ *
+ * Requires both endpoints to use MPTCP for actual multipath.
+ * An MPTCP socket connected to a TCP-only peer degrades to single-path TCP.
+ */
+int connect_to_host_mptcp(const char *host, int port, int fwmark)
+{
+    char port_str[16];
+    snprintf(port_str, sizeof(port_str), "%d", port);
+
+    struct addrinfo hints, *res, *rp;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family   = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = IPPROTO_MPTCP;  /* kernel hint — may be ignored */
+
+    int gai_err = getaddrinfo(host, port_str, &hints, &res);
+    if (gai_err != 0) {
+        /* Retry without MPTCP hint if the resolver rejected it */
+        hints.ai_protocol = 0;
+        gai_err = getaddrinfo(host, port_str, &hints, &res);
+        if (gai_err != 0) {
+            fprintf(stderr, "Error: cannot resolve '%s': %s\n", host, gai_strerror(gai_err));
+            return -1;
+        }
+    }
+
+    int fd = -1;
+    int tried_mptcp = 0, tried_tcp = 0;
+
+    for (rp = res; rp != NULL; rp = rp->ai_next) {
+        /* Try MPTCP first, then fall back to TCP */
+        if (!tried_mptcp) {
+            fd = socket(rp->ai_family, rp->ai_socktype, IPPROTO_MPTCP);
+            if (fd >= 0) tried_mptcp = 1;
+        }
+        if (fd < 0 && !tried_tcp) {
+            fd = socket(rp->ai_family, rp->ai_socktype, IPPROTO_TCP);
+            if (fd >= 0) tried_tcp = 1;
+        }
+        if (fd < 0) continue;
+
+        if (fwmark > 0)
+            setsockopt(fd, SOL_SOCKET, SO_MARK, &fwmark, sizeof(fwmark));
+
+        if (connect(fd, rp->ai_addr, rp->ai_addrlen) == 0)
+            break;
+
+        close(fd);
+        fd = -1;
+    }
+    freeaddrinfo(res);
+
+    if (fd < 0) { perror("connect"); return -1; }
+    if (tried_mptcp)
+        fprintf(stderr, "[mptcp] connected to %s:%d (MPTCP)\n", host, port);
+    return fd;
+}
+
+/*
+ * MPTCP-aware listen: creates a listener that accepts both MPTCP
+ * and regular TCP connections.  Falls back to TCP if MPTCP is
+ * unavailable.  An MPTCP listener transparently handles both types
+ * of clients — no special handling needed in accept().
+ */
+int listen_on_port_mptcp(int port)
+{
+    int fd = socket(AF_INET, SOCK_STREAM, IPPROTO_MPTCP);
+    if (fd < 0) {
+        /* MPTCP not available — fall back to regular TCP */
+        fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (fd < 0) { perror("socket"); return -1; }
+    } else {
+        fprintf(stderr, "[mptcp] listener on port %d (MPTCP enabled)\n", port);
+    }
+
+    int opt = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &opt, sizeof(opt));
+
+    struct sockaddr_in a;
+    memset(&a, 0, sizeof(a));
+    a.sin_family = AF_INET;
+    a.sin_addr.s_addr = INADDR_ANY;
+    a.sin_port = htons((uint16_t)port);
+
+    if (bind(fd, (struct sockaddr *)&a, sizeof(a)) < 0) {
+        perror("bind"); close(fd); return -1;
+    }
+    if (listen(fd, SOMAXCONN) < 0) {
+        perror("listen"); close(fd); return -1;
+    }
+    return fd;
+}
+
 int listen_on_port(int port) {
     int fd = socket(AF_INET, SOCK_STREAM, 0); if (fd < 0) { perror("socket"); return -1; }
     int opt = 1; setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
@@ -158,7 +264,8 @@ static void usage(const char *prog) {
         "  -x <max>        Max connections (default: 32)\n"
         "  -K <sec>        Keepalive (default: 0)\n"
         "  -W <iface>      WAN interface for NAT (default: eth0)\n"
-        "  -M <num>        Multipath TCP connections (1-8, default 1)\n"
+        "  -M <num>        Use MPTCP for multipath (1-8 subflows, default 1)\n"
+        "                   Requires Linux ≥ 5.6, falls back to TCP\n"
         "  -U              Use UDP transport (TUN mode only)\n"
         "  -v              Verbose logging\n"
         "  -h              Show this help\n"
@@ -269,7 +376,8 @@ int main(int argc, char **argv) {
         case 'W': strncpy(tun_nat_if, optarg, 15);        break;
         case 'M': g_tun_multipath = atoi(optarg);
                   if (g_tun_multipath < 1) g_tun_multipath = 1;
-                  if (g_tun_multipath > 8) g_tun_multipath = 8; break;
+                  if (g_tun_multipath > 8) g_tun_multipath = 8;
+                  break;
         case 'U': tun_udp = 1;                          break;
         case 'v': log_set_level(LOG_DEBUG);             break;
         case 'h': usage(argv[0]); return 0;

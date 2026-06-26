@@ -11,30 +11,17 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
-#include <fcntl.h>
 #include <netinet/in.h>
-#include <poll.h>
 #include <signal.h>
 #include <time.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
-#include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 #define TUN_FWMARK       51820
-#define MAX_TUN_CLIENTS     64
-#define MAX_MULTIPATH         8   /* max parallel TCP connections */
-
-/* ─── TUN client slot (parent-side) ────────────────────────────── */
-
-typedef struct {
-    int  local_fd;          /* parent end of socketpair */
-    pid_t pid;              /* child process id */
-    uint32_t peer_ip;       /* peer's TUN IP (network byte order) */
-} tun_client_t;
 
 /*
  * Set up routing based on role (server vs client).
@@ -80,61 +67,29 @@ static void tun_run_postdown(const char *script, const char *name)
     }
 }
 
-/* ─── TUN Server (multi-client packet routing) ────────────────── */
+/* ─── TUN Server (multi-client, fork-per-connection) ────────────── */
 
 /*
  * Architecture:
  *
- *   Parent:  owns tun_fd + listen_fd + local end of each socketpair.
- *            Runs a poll() loop that routes packets between the TUN
- *            device and per-client socketpairs based on IP header.
+ *   Parent:  owns tun_fd + listen_fd (MPTCP-capable).
+ *            Accepts connections and forks a child for each.
  *
- *   Child N: owns remote end of socketpair (plaintext_fd) + TCP
- *            encrypted_fd to client N.  Runs the standard tunnel
- *            event loop.  Sees a "virtual TUN" via the socketpair.
+ *   Child N: shares tun_fd (via fork inheritance) and owns the
+ *            TCP/MPTCP encrypted_fd to client N.  Runs the standard
+ *            tunnel event loop (tunnel_run) which polls tun_fd and
+ *            encrypted_fd.  The kernel TUN driver ensures each IP
+ *            packet is delivered to exactly one reader.
  *
- *   socketpair           tun_fd
- *   ┌─────────┐          ┌─────┐
- *   │ parent  │◄────────►│ TUN │
- *   │  poll() │          └─────┘
- *   │         │── sp[0] ──► child 1  ── TCP ──► client A (10.0.0.2)
- *   │         │── sp[0] ──► child 2  ── TCP ──► client B (10.0.0.3)
- *   └─────────┘
+ *             tun_fd (shared)
+ *              ┌─────┐
+ *   Parent ───►│ TUN │◄── child 1 ── TCP/MPTCP ──► client A (10.0.0.2)
+ *   (accept)   └─────┘◄── child 2 ── TCP/MPTCP ──► client B (10.0.0.3)
+ *
+ *   With MPTCP: a single client may have multiple subflows over
+ *   different network paths — all handled transparently by the
+ *   kernel.  Each MPTCP connection still appears as one fd.
  */
-
-/* Extract destination IPv4 address from an IP packet.
- * Returns the 32-bit address in host byte order, or 0 on error.
- * IP headers use network byte order (big-endian); ntohl() converts
- * to host byte order so the result can be compared with g_peer_tun_ips
- * (which is also stored in host byte order via bit-shift construction). */
-static uint32_t ip_dst_addr(const uint8_t *pkt, size_t len)
-{
-    if (len < 20) return 0;
-    uint8_t ver_ihl = pkt[0];
-    if ((ver_ihl >> 4) != 4) return 0;           /* IPv4 only */
-    int ihl = (int)(ver_ihl & 0x0f) * 4;
-    if (ihl < 20 || (size_t)ihl > len) return 0;
-    uint32_t addr;
-    memcpy(&addr, pkt + 16, 4);                   /* dst at offset 16 (network order) */
-    return ntohl(addr);                           /* convert to host byte order */
-}
-
-/* Find the client slot whose peer_ip matches the given address.
- * Uses round-robin when multiple slots share the same IP (multipath). */
-static int find_client_by_ip(const tun_client_t *clients, int count, uint32_t ip)
-{
-    static int rr_counter = 0;
-    int matches[MAX_TUN_CLIENTS];
-    int m = 0;
-
-    for (int i = 0; i < count; i++) {
-        if (clients[i].local_fd != -1 && clients[i].peer_ip == ip)
-            matches[m++] = i;
-    }
-    if (m == 0) return -1;
-    rr_counter++;
-    return matches[rr_counter % m];  /* round-robin across matches */
-}
 
 int mode_tun_server(int listen_port,
                     const char *tun_name,
@@ -161,7 +116,9 @@ int mode_tun_server(int listen_port,
     tun_setup_routing(name, tun_route, tun_nat_if, 1 /* server */);
     tun_run_postup(postup, name);
 
-    int listen_fd = listen_on_port(listen_port);
+    /* MPTCP listener: accepts both MPTCP and regular TCP clients.
+     * Falls back to TCP if MPTCP is unavailable (kernel < 5.6). */
+    int listen_fd = listen_on_port_mptcp(listen_port);
     if (listen_fd < 0) { close(tun_fd); return 1; }
 
     log_info("tun-server", "%s (%s/%s) :%d route=%s peers=%d",
@@ -206,192 +163,6 @@ int mode_tun_server(int listen_port,
     tun_run_postdown(postdown, name);
     tun_teardown(name, 1 /* server */);
     close(listen_fd); close(tun_fd);
-    return 0;
-}
-
-/* ─── Multipath TUN Client ────────────────────────────────────── */
-/*
- * Opens N parallel TCP connections to the server, each with its
- * own handshake and nonce space.  Outbound packets are distributed
- * across connections by a simple polynomial hash of the raw IP
- * packet, which preserves flow affinity (same flow → same path).
- */
-static int tun_client_multipath(int tun_fd, const char *name,
-                                 const char *host, int port, int peer_idx,
-                                 int hs_timeout, int keepalive, int npaths,
-                                 int first_fd, const session_keys_t *first_keys)
-{
-    int   tcp_fds[MAX_MULTIPATH];
-    int   sp_fds[MAX_MULTIPATH][2];
-    pid_t pids[MAX_MULTIPATH];
-    int   opened = 0;
-
-    /* ── Open N connections + handshake ── */
-    for (int i = 0; i < npaths; i++) {
-        session_keys_t keys;
-
-        if (i == 0 && first_fd >= 0) {
-            /* Reuse the already-authenticated first connection */
-            tcp_fds[i] = first_fd;
-            memcpy(&keys, first_keys, sizeof(keys));
-        } else {
-            /* Stagger connections to avoid server-side fork() storms */
-            if (i > 1) usleep(80000);  /* 80ms between additional paths */
-            tcp_fds[i] = connect_to_host(host, port, TUN_FWMARK);
-            if (tcp_fds[i] < 0) {
-                log_error("tun-client", "path %d/%d: cannot connect", i + 1, npaths);
-                goto cleanup;
-            }
-            if (handshake_client(tcp_fds[i], g_asym_priv, g_asym_peers[peer_idx],
-                                 hs_timeout, &keys) != 0 ||
-                handshake_key_confirm_client(tcp_fds[i], &keys, hs_timeout) != 0) {
-                log_warn("tun-client", "path %d/%d: handshake failed", i + 1, npaths);
-                close(tcp_fds[i]); tcp_fds[i] = -1;
-                goto cleanup;
-            }
-        }
-        /* Create socketpair: sp[0]=parent, sp[1]=child */
-        if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, sp_fds[i]) < 0) {
-            close(tcp_fds[i]); tcp_fds[i] = -1;
-            goto cleanup;
-        }
-
-        pid_t pid = fork();
-        if (pid < 0) {
-            close(sp_fds[i][0]); close(sp_fds[i][1]);
-            close(tcp_fds[i]); tcp_fds[i] = -1;
-            goto cleanup;
-        }
-
-        if (pid == 0) {
-            /* Child: run tunnel over socketpair + TCP */
-            close(sp_fds[i][0]);  /* parent end */
-            close(tun_fd);
-            /* Do NOT close sp_fds[j] or tcp_fds[j] from earlier
-             * iterations — after the parent closed those fds, the
-             * OS may have reused the same fd numbers for the
-             * current path's socketpair or TCP connection. */
-            tunnel_t tun;
-            tunnel_init(&tun, sp_fds[i][1], tcp_fds[i],
-                        keys.enc_key, keys.dec_key);
-            tun.keepalive_sec = keepalive;
-            int r = tunnel_run(&tun);
-            if (r != 0) fprintf(stderr, "[mp-child %d] tunnel_run returned %d (errno=%d)\n", i, r, errno);
-            close(sp_fds[i][1]); close(tcp_fds[i]);
-            _exit(r == 0 ? 0 : 1);
-        }
-
-        /* Parent: keep sp[0], discard sp[1] and tcp_fd (tcp is now owned by child) */
-        close(sp_fds[i][1]);
-        if (i > 0 || first_fd < 0) close(tcp_fds[i]);
-        /* Non-blocking: SEQPACKET reads must not stall the parent poll loop */
-        {
-            int fl = fcntl(sp_fds[i][0], F_GETFL, 0);
-            if (fl >= 0) fcntl(sp_fds[i][0], F_SETFL, fl | O_NONBLOCK);
-        }
-        tcp_fds[i] = -1;
-        pids[i]  = pid;
-        opened++;
-    }
-
-    log_info("tun-client", "multipath: %d/%d paths established", opened, npaths);
-
-    /* ── Parent event loop: TUN ↔ children ── */
-    {
-        struct pollfd fds[1 + MAX_MULTIPATH];
-        while (g_running) {
-            int nfds = 0;
-            fds[nfds].fd = tun_fd; fds[nfds].events = POLLIN; nfds++;
-
-            for (int i = 0; i < opened; i++) {
-                if (sp_fds[i][0] >= 0) {
-                    fds[nfds].fd     = sp_fds[i][0];
-                    fds[nfds].events = POLLIN;
-                    nfds++;
-                }
-            }
-
-            int pr = poll(fds, (nfds_t)nfds, 500);
-            if (pr < 0) { if (errno == EINTR) continue; break; }
-
-            /* TUN → children: hash-routed */
-            if (fds[0].revents & POLLIN) {
-                for (;;) {
-                    uint8_t pkt[FRAME_MAX_PAYLOAD];
-                    ssize_t n = read(tun_fd, pkt, sizeof(pkt));
-                    if (n < 0) {
-                        if (errno == EAGAIN || errno == EWOULDBLOCK) break;
-                        goto mp_out;
-                    }
-                    if (n <= 0) goto mp_out;
-
-                    /* Compute flow hash for path selection */
-                    uint32_t h = 0;
-                    for (ssize_t j = 0; j < n; j++)
-                        h = h * 31 + pkt[j];
-                    int pi = (int)(h % (uint32_t)opened);
-
-                    if (sp_fds[pi][0] >= 0) {
-                        size_t wr = 0;
-                        while (wr < (size_t)n) {
-                            ssize_t w = write(sp_fds[pi][0], pkt + wr,
-                                             (size_t)n - wr);
-                            if (w < 0) {
-                                if (errno == EAGAIN || errno == EINTR) continue;
-                                break;
-                            }
-                            wr += (size_t)w;
-                        }
-                    }
-                }
-            }
-
-            /* Children → TUN */
-            for (int i = 1; i < nfds; i++) {
-                if (!(fds[i].revents & POLLIN)) continue;
-                for (;;) {
-                    uint8_t pkt[FRAME_MAX_PAYLOAD];
-                    ssize_t n = read(fds[i].fd, pkt, sizeof(pkt));
-                    if (n < 0) {
-                        if (errno == EAGAIN || errno == EWOULDBLOCK) break;
-                        /* child died */
-                        close(fds[i].fd);
-                        for (int j = 0; j < opened; j++)
-                            if (sp_fds[j][0] == fds[i].fd)
-                                sp_fds[j][0] = -1;
-                        break;
-                    }
-                    if (n == 0) {
-                        close(fds[i].fd);
-                        for (int j = 0; j < opened; j++)
-                            if (sp_fds[j][0] == fds[i].fd)
-                                sp_fds[j][0] = -1;
-                        break;
-                    }
-                    size_t wr = 0;
-                    while (wr < (size_t)n) {
-                        ssize_t w = write(tun_fd, pkt + wr, (size_t)n - wr);
-                        if (w < 0) {
-                            if (errno == EAGAIN || errno == EINTR) continue;
-                            break;
-                        }
-                        wr += (size_t)w;
-                    }
-                }
-            }
-        }
-    }
-
-mp_out:
-    log_info("tun-client", "multipath stopped");
-
-cleanup:
-    /* Kill children and close remaining fds */
-    for (int i = 0; i < opened; i++) {
-        if (sp_fds[i][0] >= 0) close(sp_fds[i][0]);
-        if (pids[i] > 0) kill(pids[i], SIGTERM);
-    }
-    while (waitpid(-1, NULL, 0) > 0) {}
     return 0;
 }
 
@@ -461,7 +232,17 @@ int mode_tun_client(int listen_port, const char *remote_host, int remote_port,
         }
 
         log_info("tun-client", "trying peer #%d: %s:%d", pi, host, port);
-        int tunnel_fd = connect_to_host(host, port, TUN_FWMARK);
+
+        /* Use MPTCP when -M is specified (kernel manages subflows).
+         * MPTCP is transparent to the application — tunnel_run()
+         * sees a single reliable byte stream regardless of how many
+         * subflows the kernel creates. */
+        int tunnel_fd;
+        if (g_tun_multipath > 1)
+            tunnel_fd = connect_to_host_mptcp(host, port, TUN_FWMARK);
+        else
+            tunnel_fd = connect_to_host(host, port, TUN_FWMARK);
+
         if (tunnel_fd < 0) {
             if (retry_delay == 0) log_error("tun-client", "cannot connect");
             peer_idx = (peer_idx + 1) % peer_count; goto retry;
@@ -472,24 +253,16 @@ int mode_tun_client(int listen_port, const char *remote_host, int remote_port,
             handshake_key_confirm_client(tunnel_fd, &keys, hs_timeout) == 0) {
             log_info("tun-client", "peer #%d authenticated", pi);
 
-            if (g_tun_multipath > 1) {
-                /* Multipath: reuse already-authenticated connection as path 0 */
-                int mp_r = tun_client_multipath(tun_fd, name, host, port, pi,
-                                                 hs_timeout, keepalive,
-                                                 g_tun_multipath,
-                                                 tunnel_fd, &keys);
-                /* tunnel_fd is now owned by multipath child — do NOT close it here */
-                if (mp_r == 0) break;
-                log_warn("tun-client", "multipath dropped, reconnecting...");
-            } else {
-                tunnel_t tun; tunnel_init(&tun, tun_fd, tunnel_fd, keys.enc_key, keys.dec_key);
+            /* Single tunnel_run() — MPTCP multipath is transparent */
+            tunnel_t tun;
+            tunnel_init(&tun, tun_fd, tunnel_fd, keys.enc_key, keys.dec_key);
+            tun.keepalive_sec = keepalive;
 
-                int r = tunnel_run(&tun);
-                secure_memzero(&keys, sizeof(keys));
-                close(tunnel_fd);
-                if (r == 0) break;
-                log_warn("tun-client", "tunnel dropped, reconnecting...");
-            }
+            int r = tunnel_run(&tun);
+            secure_memzero(&keys, sizeof(keys));
+            close(tunnel_fd);
+            if (r == 0) break;
+            log_warn("tun-client", "tunnel dropped, reconnecting...");
         } else {
             log_warn("tun-client", "handshake failed with peer #%d", pi);
             close(tunnel_fd);

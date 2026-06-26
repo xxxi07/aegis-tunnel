@@ -100,6 +100,80 @@ int frame_parse(const uint8_t *buf, size_t buflen,
     return 0;
 }
 
+/* ─── Frame: explicit-nonce variants (for UDP / unreliable transports) ── */
+/*
+ * Embed the nonce in the wire format so the receiver never depends on
+ * counter synchronisation.  A single lost datagram does not invalidate
+ * all subsequent frames.
+ *
+ * Wire format (20 bytes larger than counter-based frames):
+ *   [type:1][flags:1][length:2 BE][nonce:8 LE][payload:N][tag:16]
+ *   └────── 12-byte AD ──────────┘
+ */
+
+int frame_build_explicit(uint8_t *buf, size_t *out_len,
+                          uint8_t type, uint8_t flags,
+                          const uint8_t *d, size_t len,
+                          const uint8_t key[AEGIS_KEY_LEN])
+{
+    if (len > FRAME_MAX_PAYLOAD) return -1;
+
+    /* Header: type + flags + length + nonce = 12 bytes */
+    buf[0] = type;
+    buf[1] = flags;
+    buf[2] = (uint8_t)((len >> 8) & 0xff);
+    buf[3] = (uint8_t)(len & 0xff);
+
+    /* Generate random nonce (8 bytes, little-endian) */
+    uint8_t nonce[AEGIS_NONCE_LEN];
+    memset(nonce, 0, AEGIS_NONCE_LEN);
+    if (random_bytes(nonce, 8) != 0) return -1;
+    memcpy(buf + 4, nonce, 8);
+
+    uint8_t *ct  = buf + FRAME_EXPLICIT_HEADER_LEN;
+    uint8_t *tag = ct + len;
+
+    /* AD = full 12-byte header; AEGIS nonce = random 8 bytes + 8 zero pad */
+    aegis_encrypt(ct, tag, d, len,
+                  buf, FRAME_EXPLICIT_HEADER_LEN,
+                  nonce, key);
+
+    *out_len = FRAME_EXPLICIT_HEADER_LEN + len + AEGIS_TAG_LEN;
+    return 0;
+}
+
+int frame_parse_explicit(const uint8_t *buf, size_t buflen,
+                          uint8_t *type, uint8_t *flags,
+                          uint8_t *d, size_t *dlen,
+                          const uint8_t key[AEGIS_KEY_LEN])
+{
+    if (buflen < FRAME_EXPLICIT_HEADER_LEN + AEGIS_TAG_LEN) return -1;
+
+    *type  = buf[0];
+    *flags = buf[1];
+    size_t payload_len = (size_t)(((uint16_t)buf[2] << 8) | buf[3]);
+
+    if (buflen != FRAME_EXPLICIT_HEADER_LEN + payload_len + AEGIS_TAG_LEN)
+        return -1;
+    if (payload_len > FRAME_MAX_PAYLOAD) return -1;
+
+    /* Extract nonce from the wire */
+    uint8_t nonce[AEGIS_NONCE_LEN];
+    memset(nonce, 0, AEGIS_NONCE_LEN);
+    memcpy(nonce, buf + 4, 8);
+
+    const uint8_t *ct  = buf + FRAME_EXPLICIT_HEADER_LEN;
+    const uint8_t *tag = ct + payload_len;
+
+    int ret = aegis_decrypt(d, ct, payload_len,
+                            buf, FRAME_EXPLICIT_HEADER_LEN,
+                            nonce, key, tag);
+    if (ret != 0) return -1;
+
+    *dlen = payload_len;
+    return 0;
+}
+
 /* ─── Tunnel: initialize context ───────────────────────────────── */
 
 void tunnel_init(tunnel_t *tun,

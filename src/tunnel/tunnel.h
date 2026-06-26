@@ -33,6 +33,17 @@
 #define FRAME_MAX_PAYLOAD  65535
 #define FRAME_MAX_WIRE     (FRAME_HEADER_LEN + FRAME_MAX_PAYLOAD + AEGIS_TAG_LEN)
 
+/*
+ * Explicit-nonce frame (used for unreliable transports like UDP):
+ *   [type:1][flags:1][length:2 BE][nonce:8 LE][payload:N][tag:16]
+ *
+ * The 8-byte nonce is embedded in the wire format so the receiver can
+ * decrypt even when datagrams are lost or reordered.  The 12-byte
+ * header (type+flags+length+nonce) is passed as AD to AEGIS.
+ */
+#define FRAME_EXPLICIT_HEADER_LEN  12   /* type(1) + flags(1) + length(2) + nonce(8) */
+#define FRAME_EXPLICIT_MAX_WIRE    (FRAME_EXPLICIT_HEADER_LEN + FRAME_MAX_PAYLOAD + AEGIS_TAG_LEN)
+
 /* ─── Frame types (shared with handshake.h) ───────────────────── */
 
 #ifndef FRAME_HANDSHAKE
@@ -164,5 +175,35 @@ int  frame_parse(const uint8_t *buf, size_t buflen,
                  uint8_t *d, size_t *dlen,
                  uint64_t nonce_ctr,
                  const uint8_t key[AEGIS_KEY_LEN]);
+
+/*
+ * Build an encrypted frame with an explicit 8-byte nonce embedded
+ * in the wire format.  The nonce is randomly generated and placed
+ * after the length field.  The receiver extracts it from the wire,
+ * so packet loss/reordering does not desynchronise nonce counters.
+ *
+ * Wire format:
+ *   [type:1][flags:1][length:2 BE][nonce:8 LE][payload:N][tag:16]
+ *
+ * Returns 0 on success, -1 on error.
+ * out_len is set to the total wire bytes written.
+ */
+int  frame_build_explicit(uint8_t *buf, size_t *out_len,
+                           uint8_t type, uint8_t flags,
+                           const uint8_t *d, size_t len,
+                           const uint8_t key[AEGIS_KEY_LEN]);
+
+/*
+ * Parse and decrypt a frame with an explicit nonce.
+ * The nonce is extracted from bytes [4..11] and used directly
+ * for AEGIS decryption — no counter state is needed.
+ *
+ * Returns 0 on success, -1 on authentication failure or
+ * malformed frame.
+ */
+int  frame_parse_explicit(const uint8_t *buf, size_t buflen,
+                           uint8_t *type, uint8_t *flags,
+                           uint8_t *d, size_t *dlen,
+                           const uint8_t key[AEGIS_KEY_LEN]);
 
 #endif /* TUNNEL_H */
