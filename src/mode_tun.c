@@ -164,228 +164,48 @@ int mode_tun_server(int listen_port,
     int listen_fd = listen_on_port(listen_port);
     if (listen_fd < 0) { close(tun_fd); return 1; }
 
-    /* Make listen_fd non-blocking for poll() integration */
-    {
-        int fl = fcntl(listen_fd, F_GETFL, 0);
-        if (fl >= 0) fcntl(listen_fd, F_SETFL, fl | O_NONBLOCK);
-    }
-
-    tun_client_t clients[MAX_TUN_CLIENTS];
-    int client_count = 0;
-    memset(clients, 0, sizeof(clients));
-
     log_info("tun-server", "%s (%s/%s) :%d route=%s peers=%d",
              name, tun_ip && tun_ip[0] ? tun_ip : "dhcp", tun_netmask,
              listen_port, tun_route ? tun_route : "(none)", g_peer_count);
 
-    /* ── Parent event loop ── */
+    /* Accept loop — children share tun_fd directly */
+    (void)psk; (void)psk_len;
     while (g_running) {
-        struct pollfd fds[2 + MAX_TUN_CLIENTS];
-        int nfds = 0;
+        struct sockaddr_in ca; socklen_t al = sizeof(ca);
+        int client_fd = accept(listen_fd, (struct sockaddr *)&ca, &al);
+        if (client_fd < 0) { if (errno == EINTR) continue; break; }
+        if (g_active_conns >= g_max_conns) { close(client_fd); continue; }
 
-        /* Slot 0: listen_fd */
-        fds[nfds].fd     = listen_fd;
-        fds[nfds].events = POLLIN;
-        fds[nfds].revents = 0;
-        nfds++;
+        tun_set_fwmark(client_fd, TUN_FWMARK);
 
-        /* Slot 1: tun_fd */
-        fds[nfds].fd     = tun_fd;
-        fds[nfds].events = POLLIN;
-        fds[nfds].revents = 0;
-        nfds++;
+        char ip[INET_ADDRSTRLEN]; inet_ntop(AF_INET, &ca.sin_addr, ip, sizeof(ip));
+        log_info("tun-server", "client %s:%d", ip, ntohs(ca.sin_port));
 
-        /* Slots 2+: each client's local_fd */
-        for (int i = 0; i < client_count; i++) {
-            if (clients[i].local_fd == -1) continue;
-            fds[nfds].fd     = clients[i].local_fd;
-            fds[nfds].events = POLLIN;
-            fds[nfds].revents = 0;
-            nfds++;
+        pid_t pid = fork();
+        if (pid < 0) { close(client_fd); continue; }
+        if (pid == 0) {
+            close(listen_fd); signal(SIGCHLD, SIG_DFL);
+
+            session_keys_t keys;
+            if (try_handshake_server(client_fd, &keys, hs_timeout) < 0)
+                { log_warn("tun-server", "handshake failed"); close(client_fd); _exit(1); }
+            if (handshake_key_confirm_server(client_fd, &keys, hs_timeout) != 0)
+                { secure_memzero(&keys, sizeof(keys)); close(client_fd); _exit(1); }
+
+            tunnel_t tun; tunnel_init(&tun, tun_fd, client_fd, keys.enc_key, keys.dec_key);
+            tun.keepalive_sec = keepalive;
+
+            int r = tunnel_run(&tun);
+            secure_memzero(&keys, sizeof(keys));
+            close(client_fd); _exit(r == 0 ? 0 : 1);
         }
-
-        int ret = poll(fds, (nfds_t)nfds, 500);
-        if (ret < 0) {
-            if (errno == EINTR) continue;
-            perror("poll"); break;
-        }
-
-        for (int i = 0; i < nfds; i++) {
-            if (fds[i].revents == 0) continue;
-
-            /* ── New client connection ── */
-            if (fds[i].fd == listen_fd) {
-                struct sockaddr_in ca; socklen_t al = sizeof(ca);
-                int client_fd = accept(listen_fd, (struct sockaddr *)&ca, &al);
-                if (client_fd < 0) {
-                    if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
-                    continue;
-                }
-                if (client_count >= MAX_TUN_CLIENTS) {
-                    close(client_fd); continue;
-                }
-                tun_set_fwmark(client_fd, TUN_FWMARK);
-
-                char ip[INET_ADDRSTRLEN];
-                inet_ntop(AF_INET, &ca.sin_addr, ip, sizeof(ip));
-                log_info("tun-server", "client %s:%d", ip, ntohs(ca.sin_port));
-
-                /* Anti-DoS: rate-limit handshake attempts per source IP */
-                if (handshake_rate_check(ip, (int64_t)time(NULL)) < 0) {
-                    close(client_fd); continue;
-                }
-
-                /* Parent does the handshake to learn the peer identity */
-                session_keys_t keys;
-                int peer_idx = try_handshake_server(client_fd, &keys, hs_timeout);
-                if (peer_idx < 0) {
-                    log_warn("tun-server", "handshake failed (tried %d peers)", g_peer_count);
-                    close(client_fd); continue;
-                }
-                if (handshake_key_confirm_server(client_fd, &keys, hs_timeout) != 0) {
-                    secure_memzero(&keys, sizeof(keys));
-                    close(client_fd); continue;
-                }
-
-                /* Create socketpair: sp[0] = parent, sp[1] = child */
-                int sp[2];
-                if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, sp) < 0) {
-                    secure_memzero(&keys, sizeof(keys));
-                    close(client_fd); continue;
-                }
-
-                pid_t pid = fork();
-                if (pid < 0) {
-                    secure_memzero(&keys, sizeof(keys));
-                    close(sp[0]); close(sp[1]); close(client_fd); continue;
-                }
-
-                if (pid == 0) {
-                    /* ── Child: run tunnel between socketpair and TCP ── */
-                    close(listen_fd);
-                    close(tun_fd);
-                    close(sp[0]);                    /* parent end */
-                    signal(SIGCHLD, SIG_DFL);
-
-                    tunnel_t tun;
-                    tunnel_init(&tun, sp[1], client_fd, keys.enc_key, keys.dec_key);
-                    tun.keepalive_sec = keepalive;
-
-                    int r = tunnel_run(&tun);
-                    secure_memzero(&keys, sizeof(keys));
-                    close(sp[1]);
-                    close(client_fd);
-                    _exit(r == 0 ? 0 : 1);
-                }
-
-                /* ── Parent: register client ── */
-                secure_memzero(&keys, sizeof(keys));
-                close(sp[1]);                        /* child end */
-                close(client_fd);
-
-                int slot = client_count++;
-                clients[slot].local_fd = sp[0];
-                clients[slot].pid      = pid;
-                clients[slot].peer_ip  = g_peer_tun_ips[peer_idx];
-
-                log_info("tun-server", "peer #%d routed (ip %08x) slot %d",
-                         peer_idx, clients[slot].peer_ip, slot);
-                continue;
-            }
-
-            /* ── TUN → clients: route packets by destination IP ── */
-            if (fds[i].fd == tun_fd) {
-                for (;;) {
-                    uint8_t buf[FRAME_MAX_PAYLOAD];
-                    ssize_t n = read(tun_fd, buf, sizeof(buf));
-                    if (n < 0) {
-                        if (errno == EINTR) continue;
-                        if (errno == EAGAIN || errno == EWOULDBLOCK) break;  /* drained */
-                        break;
-                    }
-                    if (n == 0) break;  /* TUN EOF (shouldn't happen) */
-
-                    uint32_t dst = ip_dst_addr(buf, (size_t)n);
-                    int ci = find_client_by_ip(clients, client_count, dst);
-                    if (ci >= 0) {
-                        /* Send raw IP packet to the correct child */
-                        size_t wr = 0;
-                        while (wr < (size_t)n) {
-                            ssize_t w = write(clients[ci].local_fd, buf + wr, (size_t)n - wr);
-                            if (w < 0) {
-                                if (errno == EINTR) continue;
-                                if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
-                                break;
-                            }
-                            wr += (size_t)w;
-                        }
-                    }
-                    /* else: packet for unknown IP → drop (no client owns it) */
-                }
-                continue;
-            }
-
-            /* ── Client → TUN: forward raw IP packets ── */
-            {
-                int ci = -1;
-                for (int j = 0; j < client_count; j++) {
-                    if (clients[j].local_fd == fds[i].fd) { ci = j; break; }
-                }
-                if (ci < 0) continue;
-
-                for (;;) {
-                    uint8_t buf[FRAME_MAX_PAYLOAD];
-                    ssize_t n = read(clients[ci].local_fd, buf, sizeof(buf));
-                    if (n < 0) {
-                        if (errno == EINTR) continue;
-                        if (errno == EAGAIN || errno == EWOULDBLOCK) break;  /* drained */
-                        /* Pipe closed → client disconnected */
-                        if (errno == EPIPE || errno == ECONNRESET) {
-                            close(clients[ci].local_fd);
-                            clients[ci].local_fd = -1;
-                            log_info("tun-server", "client slot %d disconnected", ci);
-                        }
-                        break;
-                    }
-                    if (n == 0) {
-                        /* EOF → client disconnected */
-                        close(clients[ci].local_fd);
-                        clients[ci].local_fd = -1;
-                        log_info("tun-server", "client slot %d disconnected", ci);
-                        break;
-                    }
-                    /* Write raw IP packet to TUN */
-                    size_t wr = 0;
-                    while (wr < (size_t)n) {
-                        ssize_t w = write(tun_fd, buf + wr, (size_t)n - wr);
-                        if (w < 0) {
-                            if (errno == EINTR) continue;
-                            if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
-                            break;
-                        }
-                        wr += (size_t)w;
-                    }
-                }
-            }
-        }
-
-        /* ── Reap dead children ── */
-        while (waitpid(-1, NULL, WNOHANG) > 0) {}
-    }
-
-    /* ── Cleanup ── */
-    for (int i = 0; i < client_count; i++) {
-        if (clients[i].local_fd != -1) {
-            close(clients[i].local_fd);
-            kill(clients[i].pid, SIGTERM);
-        }
+        g_active_conns++; close(client_fd);
     }
     while (waitpid(-1, NULL, 0) > 0) {}
 
     tun_run_postdown(postdown, name);
     tun_teardown(name, 1 /* server */);
-    close(listen_fd);
-    close(tun_fd);
+    close(listen_fd); close(tun_fd);
     return 0;
 }
 
