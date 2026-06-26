@@ -218,7 +218,8 @@ int mode_tun_server(int listen_port,
  */
 static int tun_client_multipath(int tun_fd, const char *name,
                                  const char *host, int port, int peer_idx,
-                                 int hs_timeout, int keepalive, int npaths)
+                                 int hs_timeout, int keepalive, int npaths,
+                                 int first_fd, const session_keys_t *first_keys)
 {
     int   tcp_fds[MAX_MULTIPATH];
     int   sp_fds[MAX_MULTIPATH][2];
@@ -227,18 +228,25 @@ static int tun_client_multipath(int tun_fd, const char *name,
 
     /* ── Open N connections + handshake ── */
     for (int i = 0; i < npaths; i++) {
-        tcp_fds[i] = connect_to_host(host, port, TUN_FWMARK);
-        if (tcp_fds[i] < 0) {
-            log_error("tun-client", "path %d/%d: cannot connect", i + 1, npaths);
-            goto cleanup;
-        }
         session_keys_t keys;
-        if (handshake_client(tcp_fds[i], g_asym_priv, g_asym_peers[peer_idx],
-                             hs_timeout, &keys) != 0 ||
-            handshake_key_confirm_client(tcp_fds[i], &keys, hs_timeout) != 0) {
-            log_warn("tun-client", "path %d/%d: handshake failed", i + 1, npaths);
-            close(tcp_fds[i]); tcp_fds[i] = -1;
-            goto cleanup;
+
+        if (i == 0 && first_fd >= 0) {
+            /* Reuse the already-authenticated first connection */
+            tcp_fds[i] = first_fd;
+            memcpy(&keys, first_keys, sizeof(keys));
+        } else {
+            tcp_fds[i] = connect_to_host(host, port, TUN_FWMARK);
+            if (tcp_fds[i] < 0) {
+                log_error("tun-client", "path %d/%d: cannot connect", i + 1, npaths);
+                goto cleanup;
+            }
+            if (handshake_client(tcp_fds[i], g_asym_priv, g_asym_peers[peer_idx],
+                                 hs_timeout, &keys) != 0 ||
+                handshake_key_confirm_client(tcp_fds[i], &keys, hs_timeout) != 0) {
+                log_warn("tun-client", "path %d/%d: handshake failed", i + 1, npaths);
+                close(tcp_fds[i]); tcp_fds[i] = -1;
+                goto cleanup;
+            }
         }
         /* Create socketpair: sp[0]=parent, sp[1]=child */
         if (socketpair(AF_UNIX, SOCK_STREAM, 0, sp_fds[i]) < 0) {
@@ -270,9 +278,9 @@ static int tun_client_multipath(int tun_fd, const char *name,
             _exit(r == 0 ? 0 : 1);
         }
 
-        /* Parent: keep sp[0], discard sp[1] and tcp_fd */
+        /* Parent: keep sp[0], discard sp[1] and tcp_fd (tcp is now owned by child) */
         close(sp_fds[i][1]);
-        close(tcp_fds[i]);
+        if (i > 0 || first_fd < 0) close(tcp_fds[i]);
         tcp_fds[i] = -1;
         pids[i]  = pid;
         opened++;
@@ -457,12 +465,12 @@ int mode_tun_client(int listen_port, const char *remote_host, int remote_port,
             log_info("tun-client", "peer #%d authenticated", pi);
 
             if (g_tun_multipath > 1) {
-                /* Multipath: use the already-authenticated connection as path 0 */
+                /* Multipath: reuse already-authenticated connection as path 0 */
                 int mp_r = tun_client_multipath(tun_fd, name, host, port, pi,
                                                  hs_timeout, keepalive,
-                                                 g_tun_multipath);
-                secure_memzero(&keys, sizeof(keys));
-                close(tunnel_fd);
+                                                 g_tun_multipath,
+                                                 tunnel_fd, &keys);
+                /* tunnel_fd is now owned by multipath child — do NOT close it here */
                 if (mp_r == 0) break;
                 log_warn("tun-client", "multipath dropped, reconnecting...");
             } else {
