@@ -151,8 +151,9 @@ int mode_tun_server(int listen_port,
     if (tun_route && tun_route[0]) {
         if (strcmp(tun_route, "0.0.0.0/0") == 0 || strcmp(tun_route, "::/0") == 0)
             tun_add_full_tunnel(name);
-        else
+        else if (!strchr(tun_route, ','))
             tun_add_route(tun_route, name);
+        /* multi-subnet (comma-separated): tun_setup_routing handles it */
     }
     tun_setup_routing(name, tun_route, tun_nat_if, 1 /* server */);
     tun_run_postup(postup, name);

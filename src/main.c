@@ -378,8 +378,19 @@ int main(int argc, char **argv) {
                 if (g_peer_count > 0)
                     log_info("main", "%d peer(s) from config", g_peer_count);
             }
-            /* Parse AllowedIPs first (takes priority over Address auto-derive) */
+            /* Aggregate AllowedIPs from ALL peers for routing + NAT */
             if (!tun_route[0]) {
+                size_t rlen = 0;
+                for (int pi = 0; pi < MAX_PEERS; pi++) {
+                    const char *aip = iniconf_get_indexed(&icfg, "Peer", pi, "AllowedIPs");
+                    if (!aip || !aip[0]) break;
+                    if (pi > 0 && rlen < 62) { tun_route[rlen++] = ','; tun_route[rlen] = '\0'; }
+                    while (*aip && rlen < 62) tun_route[rlen++] = *aip++;
+                    tun_route[rlen] = '\0';
+                }
+            }
+            if (!tun_route[0]) {
+                /* single-peer fallback */
                 const char *v = iniconf_get(&icfg, "Peer", "AllowedIPs");
                 if (v) strncpy(tun_route, v, 63);
             }
